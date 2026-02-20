@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "distort.fullname" . }}-agent
+  labels:
+    {{- include "distort.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "distort.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        {{- include "distort.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+    spec:
+      hostNetwork: true
+      hostIPC: true
+      hostPID: true
+      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /distort-agent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: sys-class-nvme
+              mountPath: /sys/class/nvme
+              readOnly: true
+            - name: sys-class-block
+              mountPath: /sys/class/block
+              readOnly: true
+            - name: sys-kernel-config
+              mountPath: /sys/kernel/config
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+              mountPropagation: Bidirectional
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+      volumes:
+        - name: sys-class-nvme
+          hostPath:
+            path: /sys/class/nvme
+            type: DirectoryOrCreate
+        - name: sys-class-block
+          hostPath:
+            path: /sys/class/block
+            type: Directory
+        - name: sys-kernel-config
+          hostPath:
+            path: /sys/kernel/config
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

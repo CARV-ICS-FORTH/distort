@@ -1,0 +1,14 @@
+apiVersion: v2
+name: distort
+description: A Kubernetes-native storage engine for NVMe-over-Fabrics using RDMA
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - storage
+  - csi
+  - nvme
+  - rdma
+maintainers:
+  - name: chazapis
+    email: chazapis@ics.forth.gr

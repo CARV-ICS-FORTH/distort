@@ -1,0 +1,41 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - storage.distort.io
+  resources:
+  - nvmedeviceclaims
+  - nvmedevices
+  - nvmepartitions
+  - rdmastoragenodes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - storage.distort.io
+  resources:
+  - nvmedeviceclaims/finalizers
+  - nvmedevices/finalizers
+  - nvmepartitions/finalizers
+  - rdmastoragenodes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - storage.distort.io
+  resources:
+  - nvmedeviceclaims/status
+  - nvmedevices/status
+  - nvmepartitions/status
+  - rdmastoragenodes/status
+  verbs:
+  - get
+  - patch
+  - update

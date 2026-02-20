@@ -1,0 +1,126 @@
+\documentclass[sigconf]{acmart}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc, backgrounds}
+
+\begin{document}
+
+\title{Cloud-native Disaggregated Storage over RDMA with DISTORT}
+
+\author{Anonymous Author(s)}
+\affiliation{%
+  \institution{Institution}
+  \city{City}
+  \country{Country}
+}
+
+\begin{abstract}
+As cloud-native architectures become the standard for deploying scalable applications, the demand for high-performance, low-latency storage has surged. Disaggregated storage, particularly NVMe-over-Fabrics (NVMe-oF) using Remote Direct Memory Access (RDMA), offers a promising solution by decoupling storage capacity from compute nodes, maintaining near-local access speeds. However, integrating physical RDMA targets with the dynamic, containerized environments of Kubernetes presents significant orchestration challenges. In this paper, we present DISTORT, a Kubernetes-native storage engine designed to bridge this gap. DISTORT leverages a Custom Resource Definition (CRD)-driven state machine to manage the lifecycle of physical NVMe devices, partition them asynchronously, and expose them as NVMe-oF RDMA targets directly to Kubernetes Pods via a Container Storage Interface (CSI) driver. By offloading the control plane to Kubernetes while maintaining a lightweight data path, DISTORT achieves high-performance, dynamic storage provisioning suitable for data-intensive cloud applications.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+Cloud-native ecosystems, spearheaded by Kubernetes, have revolutionized application deployment through containerization and dynamic orchestration. Traditionally, these environments relied on software-defined storage (SDS) solutions that often introduce overhead via virtualization or user-space file systems. As applications such as machine learning and high-performance databases migrate to the cloud, the overhead of standard SDS becomes a bottleneck.
+
+NVMe-over-Fabrics (NVMe-oF) utilizing RDMA provides microseconds of latency and high throughput, rivaling local NVMe drives. Disaggregating storage using NVMe-oF allows independent scaling of compute and storage resources, improving resource utilization. Yet, orchestrating these high-performance physical targets within Kubernetes without compromising performance or introducing complex middleware is an open challenge.
+
+We introduce DISTORT, a Cloud-native Disaggregated Storage engine over RDMA. DISTORT integrates physical NVMe management directly into the Kubernetes control plane. It introduces an architecture comprising a centralized management controller, a node-level hardware agent, and a standard CSI driver. This design allows Kubernetes to natively declare, partition, and consume bare-metal NVMe storage over RDMA fabrics.
+
+\section{Related Work}
+Recent advancements in distributed storage have focused heavily on integrating high-performance interconnects with cloud-orchestrator frameworks. Systems like SPDK (Storage Performance Development Kit) provide user-space NVMe drivers to bypass kernel overhead, while commercial and open-source CSI drivers (e.g., OpenEBS, Rook/Ceph) offer varying degrees of RDMA support. However, these systems often impose heavy control-plane dependencies or require dedicated storage nodes running complex SDS stacks. DISTORT distinguishes itself by utilizing the Linux kernel's native configfs and NVMe-oF subsystems, orchestrating them purely through Kubernetes Custom Resources, thereby maintaining a zero-overhead data path.
+
+\section{Design}
+DISTORT's architecture is bifurcated into two logical layers: the \textit{NVMe Management Layer} (the "Hardware Control Plane") and the \textit{CSI Layer} (the "Kubernetes Bridge"). This separation of concerns allows the system to decouple physical hardware management from the Kubernetes volume lifecycle using a state-machine-via-CRD approach.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm and 1.5cm,
+    box/.style={rectangle, draw, thick, rounded corners, align=center, minimum width=2.5cm, minimum height=1cm},
+    crd/.style={cylinder, draw, thick, aspect=0.25, shape border rotate=90, align=center, minimum width=2cm, minimum height=1cm, fill=gray!10},
+    arrow/.style={-{Stealth[scale=1.2]}, thick}
+]
+
+% Nodes
+\node[box, fill=blue!10] (csiprov) {CSI \\ Provisioner};
+\node[crd, below=of csiprov] (crd1) {NVMePartition \\ CRD};
+\node[box, fill=green!10, below=of crd1] (agent) {NVMe-Node \\ Agent};
+\node[box, fill=orange!10, right=of csiprov] (mgmt) {Management \\ Controller};
+\node[box, fill=purple!10, right=of agent] (csinode) {CSI-Node \\ Server};
+
+% Hardware representations
+\node[box, dashed, below=0.8cm of agent, minimum width=5.5cm] (hw) {Physical NVMe \& RDMA NIC};
+
+% Background boxes for logical layers
+\begin{scope}[on background layer]
+    \node[draw, dashed, inner sep=0.3cm, fill=yellow!5, fit=(csiprov) (csinode), label=above:\textbf{CSI Layer}] (csilayer) {};
+    \node[draw, dashed, inner sep=0.3cm, fill=red!5, fit=(mgmt) (agent) (crd1), label=above:\textbf{Management Layer}] (mgmtlayer) {};
+\end{scope}
+
+% Arrows
+\draw[arrow] (csiprov) -- node[left, font=\scriptsize] {1. Creates} (crd1);
+\draw[arrow] (mgmt) -- node[right, font=\scriptsize] {2. Schedules Node} (crd1);
+\draw[arrow] (crd1) -- node[left, font=\scriptsize] {3. Triggers} (agent);
+\draw[arrow] (agent) -- node[left, font=\scriptsize] {4. Slices \& Exports} (hw);
+\draw[arrow] (hw.east) -| node[right, near end, font=\scriptsize] {5. RDMA Connect} (csinode.south);
+
+\end{tikzpicture}
+\caption{DISTORT Architectural Layers and Interaction}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{NVMe Management Layer}
+This layer is responsible for physical device discovery, disk partitioning, and kernel-level NVMe-oF target exports. It comprises two main components:
+\begin{itemize}
+    \item \textbf{NVMe-Management-Controller:} Deployed as a centralized replica, it handles administration and placement logic. It reconciles \texttt{NVMeDeviceClaim} objects, allowing cluster administrators to claim specific disks by serial number. Furthermore, when an \texttt{NVMePartition} is requested without a pre-assigned node, this controller selects the optimal \texttt{RDMAStorageNode} based on available free capacity.
+    \item \textbf{NVMe-Node-Agent:} Deployed as a DaemonSet across storage-providing nodes. It performs continuous discovery by scanning the PCIe bus for NVMe controllers and reporting active RDMA-capable NICs. Its execution loop watches for \texttt{NVMePartition} CRDs assigned to its resident node, launching \texttt{parted} to slice the physical media and configuring the kernel to expose the partition as an NVMe-oF target.
+\end{itemize}
+
+\subsection{CSI Layer (Kubernetes Bridge)}
+This layer translates standard PersistentVolumeClaims (PVCs) into concrete storage allocations and subsequently mounts the volumes to application Pods.
+\begin{itemize}
+    \item \textbf{CSI-Provisioner:} A controller that watches for new PVCs. Instead of communicating with a traditional centralized storage array's backend API, it creates an \texttt{NVMePartition} CRD specifying the required capacity and access mode. It then blocks until the management layer updates the partition's status with an RDMA endpoint (NQN and Portal IP), at which point it binds the resulting PersistentVolume (PV).
+    \item \textbf{CSI-Node-Server:} A DaemonSet located on the compute nodes consuming the storage. During the volume staging phase, it executes \texttt{nvme connect} against the NVMe-oF cluster, connecting the Pod to the remote block device (e.g., \texttt{/dev/nvme1n1}). It then bind-mounts this device into the corresponding container's root filesystem.
+\end{itemize}
+
+\section{Implementation}
+DISTORT is entirely implemented in Go (version 1.23+), leveraging the \texttt{controller-runtime} and Kubebuilder frameworks to enforce operator paradigms. 
+
+\subsection{Codebase Layout \& Components}
+The system is compiled into three distinct binary executables situated under the \texttt{cmd/} directory:
+\begin{enumerate}
+    \item \texttt{distort-manager}: The control plane application housing the claims and placement schedulers.
+    \item \texttt{distort-agent}: The privileged hardware-interaction daemon.
+    \item \texttt{distort-csi}: Intended to be deployed per the Container Storage Interface spec, containing the Identity, Controller, and Node server gRPC implementations.
+\end{enumerate}
+
+Building the binaries relies on a standard \texttt{Makefile} utilizing \texttt{go build}. Kubebuilder macros extract RBAC definitions and scheme topologies from Go structural comments, ensuring that API generations (`\texttt{make manifests}`) directly reflect the Go codebase.
+
+\subsection{Hardware Integrations}
+To minimize overhead, the \texttt{distort-agent} bypasses typical storage middleware. 
+\begin{itemize}
+    \item \textbf{Discovery Mapping:} It probes \texttt{/sys/class/nvme} continuously to calculate NUMA topology and total block bytes, translating this into resilient \texttt{NVMeDevice} Custom Resources.
+    \item \textbf{Partition Slicing:} Using the \texttt{os/exec} package, it implements a wrapper over the \texttt{parted} system utility to inject GUID Partition Tables (GPT) and carve primary partitions on demand dynamically based on Kubernetes limits.
+    \item \textbf{NVMe-oF Target Orchestration:} Rather than relying on external Python-based automation suites like \texttt{nvmetcli}, the agent creates Subsystems, Namespaces, and RDMA Ports strictly by writing to the Linux Kernel's ConfigFS mount (\texttt{/sys/kernel/config/nvmet}). This guarantees atomic block-level exports directly from the kernel level.
+\end{itemize}
+Volume teardown employs Kubernetes \textit{Finalizers}, intercepting \texttt{NVMePartition} deletion events to cleanly un-export the Fabric pathway before dropping the raw partition chunks to reclaim space.
+
+\subsection{Deployment Mechanics}
+To package the solution for end users, DISTORT maintains an integrated Helm Chart (\texttt{deploy/charts/distort}). The chart templates encapsulate:
+\begin{itemize}
+    \item \texttt{crds/}: Pre-generated API models.
+    \item \texttt{manager-deployment.yaml}: Deploying the centralized scheduler with leader election.
+    \item \texttt{agent-daemonset.yaml}: A privileged DaemonSet mounting the host's \texttt{/sys}, \texttt{/dev}, and \texttt{/sys/kernel/config} spaces.
+    \item \texttt{csi-daemonset.yaml}: Encapsulating the \texttt{distort-csi} NodeServer alongside standard Kubernetes SIG-Storage sidecars (e.g., \texttt{csi-node-driver-registrar}).
+\end{itemize}
+
+\section{Evaluation}
+% Evaluation section is intentionally left empty for future work.
+
+\section{Conclusion}
+This report presented DISTORT, a novel storage engine designed to seamlessly integrate high-performance, disaggregated NVMe-oF/RDMA storage with Kubernetes. By mapping physical hardware operations to declarative Custom Resources, DISTORT provides dynamic volume provisioning without sacrificing the bare-metal performance characteristics of RDMA, paving the way for data-intensive applications in cloud-native environments.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}
