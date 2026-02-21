@@ -1,0 +1,109 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+VAGRANTFILE_API_VERSION = "2"
+
+# Cluster Configuration
+NUM_WORKERS = 1
+MASTER_IP = "192.168.56.10"
+WORKER_IP_BASE = "192.168.56.1"
+UBUNTU_BOX = "bento/ubuntu-24.04"
+
+# NVMe disk definitions (2 disks per VM, 1GB each)
+NVME_DISKS = [
+  { name: "nvme1.vdi", size: 1024 },
+  { name: "nvme2.vdi", size: 1024 }
+]
+
+# Common setup script for both Master and Worker
+$common_script = <<-SCRIPT
+  export DEBIAN_FRONTEND=noninteractive
+  
+  # Install necessary packages for NVMe management and RDMA
+  apt-get update
+  apt-get install -y nvme-cli parted curl rdma-core linux-modules-extra-$(uname -r)
+
+  # Load SoftRoCE (RXE) kernel module
+  modprobe rdma_rxe
+  echo "rdma_rxe" > /etc/modules-load.d/rdma_rxe.conf
+
+  # Identify the host-only network interface (eth1 usually based on our private_network config)
+  # and bind SoftRoCE to it. 
+  # Note: `eth1` is specifically chosen here because eth0 is Vagrant's NAT, and eth1 connects the nodes.
+  rdma link add rxe_eth1 type rxe netdev eth1
+SCRIPT
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = UBUNTU_BOX
+
+  # Configure K3s Server (Master Node)
+  config.vm.define "distort-master" do |master|
+    master.vm.hostname = "distort-master"
+    master.vm.network "private_network", ip: MASTER_IP
+
+    master.vm.provider "virtualbox" do |vb|
+      vb.memory = "2048"
+      vb.cpus = 2
+      # Add an NVMe controller to the VM
+      vb.customize ["storagectl", :id, "--name", "NVMe Controller", "--add", "pcie", "--controller", "NVMe"]
+      
+      NVME_DISKS.each_with_index do |disk, index|
+        disk_path = ".vagrant/distort-master-#{disk[:name]}"
+        # Ensure disk exists or create it
+        if !File.exist?(disk_path)
+          vb.customize ["createhd", "--filename", disk_path, "--size", disk[:size]]
+        end
+        # Attach disk to the NVMe controller (port 0 and 1)
+        vb.customize ["storageattach", :id, "--storagectl", "NVMe Controller", "--port", index.to_s, "--device", "0", "--type", "hdd", "--medium", disk_path]
+      end
+    end
+
+    master.vm.provision "shell", inline: $common_script
+    master.vm.provision "shell", inline: <<-SCRIPT
+      curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --node-ip #{MASTER_IP} --flannel-iface eth1 --disable traefik" sh -
+      
+      # Save the token to a shared folder so workers can join
+      mkdir -p /vagrant/cluster_info
+      cp /var/lib/rancher/k3s/server/node-token /vagrant/cluster_info/node-token
+      chmod 644 /vagrant/cluster_info/node-token
+    SCRIPT
+  end
+
+  # Configure K3s Agents (Worker Nodes)
+  (1..NUM_WORKERS).each do |i|
+    worker_name = "distort-worker-#{i}"
+    worker_ip = "#{WORKER_IP_BASE}#{i}"
+
+    config.vm.define worker_name do |worker|
+      worker.vm.hostname = worker_name
+      worker.vm.network "private_network", ip: worker_ip
+
+      worker.vm.provider "virtualbox" do |vb|
+        vb.memory = "2048"
+        vb.cpus = 2
+        
+        # Add an NVMe controller to the worker VM
+        vb.customize ["storagectl", :id, "--name", "NVMe Controller", "--add", "pcie", "--controller", "NVMe"]
+        
+        NVME_DISKS.each_with_index do |disk, index|
+          disk_path = ".vagrant/#{worker_name}-#{disk[:name]}"
+          # Ensure disk exists or create it
+          if !File.exist?(disk_path)
+            vb.customize ["createhd", "--filename", disk_path, "--size", disk[:size]]
+          end
+          # Attach disk to the NVMe controller
+          vb.customize ["storageattach", :id, "--storagectl", "NVMe Controller", "--port", index.to_s, "--device", "0", "--type", "hdd", "--medium", disk_path]
+        end
+      end
+
+      worker.vm.provision "shell", inline: $common_script
+      worker.vm.provision "shell", inline: <<-SCRIPT
+        # Wait for master to write the token
+        while [ ! -f /vagrant/cluster_info/node-token ]; do sleep 2; done
+        
+        TOKEN=$(cat /vagrant/cluster_info/node-token)
+        curl -sfL https://get.k3s.io | K3S_URL=https://#{MASTER_IP}:6443 K3S_TOKEN=$TOKEN INSTALL_K3S_EXEC="agent --node-ip #{worker_ip} --flannel-iface eth1" sh -
+      SCRIPT
+    end
+  end
+end
