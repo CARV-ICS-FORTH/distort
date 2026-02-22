@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,6 +29,8 @@ func (r *Reporter) Start(ctx context.Context) error {
 
 	logger.Info("Starting Hardware Reporter", "node", r.NodeName)
 
+	r.report(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -40,12 +43,11 @@ func (r *Reporter) Start(ctx context.Context) error {
 }
 
 func (r *Reporter) report(ctx context.Context) {
-	// TODO: Replace mocks with actual sysfs/PCI scanning logic
-	r.reportNode(ctx)
-	r.reportDevices(ctx)
+	totalCap, freeCap := r.reportDevices(ctx)
+	r.reportNode(ctx, totalCap, freeCap)
 }
 
-func (r *Reporter) reportNode(ctx context.Context) {
+func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity int64) {
 	logger := log.FromContext(ctx)
 
 	nodeCR := &storagev1alpha1.RDMAStorageNode{}
@@ -57,10 +59,23 @@ func (r *Reporter) reportNode(ctx context.Context) {
 		return
 	}
 
-	// Mock data for initial scaffolding
+	// Fetch K8s Node to determine Internal IP for RDMA
+	rdmaIP := "127.0.0.1" // Fallback
+	k8sNode := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, k8sNode); err == nil {
+		for _, addr := range k8sNode.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				rdmaIP = addr.Address
+				break
+			}
+		}
+	} else {
+		logger.Error(err, "Failed to get K8s Node for RDMAIP")
+	}
+
 	nodeCR.Name = r.NodeName
 	nodeCR.Spec.NodeName = r.NodeName
-	nodeCR.Spec.RDMAIP = "192.168.1.100" // Should detect active RDMA interface
+	nodeCR.Spec.RDMAIP = rdmaIP
 	nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
 
 	if !exists {
@@ -76,22 +91,23 @@ func (r *Reporter) reportNode(ctx context.Context) {
 	}
 
 	// Update Status
-	nodeCR.Status.TotalCapacity = resource.MustParse("2Ti") // sum from devices
-	nodeCR.Status.FreeCapacity = resource.MustParse("1Ti")  // sum of free from claimed devices
-	nodeCR.Status.ActiveExports = 0
+	nodeCR.Status.TotalCapacity = *resource.NewQuantity(totalCapacity, resource.BinarySI)
+	nodeCR.Status.FreeCapacity = *resource.NewQuantity(freeCapacity, resource.BinarySI)
+	nodeCR.Status.ActiveExports = 0 // Will be calculated by Manager or updated by CSI
 
 	if err := r.Status().Update(ctx, nodeCR); err != nil {
 		logger.Error(err, "Failed to update RDMAStorageNode Status")
 	}
 }
 
-func (r *Reporter) reportDevices(ctx context.Context) {
+func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 	logger := log.FromContext(ctx)
+	var nodeTotalCap, nodeFreeCap int64
 
 	devices, err := DiscoverNVMe()
 	if err != nil {
 		logger.Error(err, "Failed to discover NVMe devices")
-		return
+		return 0, 0
 	}
 
 	for _, d := range devices {
@@ -106,6 +122,8 @@ func (r *Reporter) reportDevices(ctx context.Context) {
 			logger.Error(err, "Failed to get NVMeDevice", "device", deviceName)
 			continue
 		}
+
+		var devTotal, devFree int64
 
 		if !exists {
 			devCR.Name = deviceName
@@ -131,9 +149,17 @@ func (r *Reporter) reportDevices(ctx context.Context) {
 			if err := r.Status().Update(ctx, devCR); err != nil {
 				logger.Error(err, "Failed to update NVMeDevice status", "device", deviceName)
 			}
+
+			devTotal = d.TotalBytes
+			devFree = d.TotalBytes
 		} else {
-			// In a real environment, you might check if Spec changed.
-			// Currently, we assume Spec properties are immutable physical properties.
+			devTotal = devCR.Spec.TotalCapacity.Value()
+			devFree = devCR.Status.FreeCapacity.Value()
 		}
+
+		nodeTotalCap += devTotal
+		nodeFreeCap += devFree
 	}
+
+	return nodeTotalCap, nodeFreeCap
 }
