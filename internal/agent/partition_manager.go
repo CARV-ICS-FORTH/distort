@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -83,6 +85,9 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	parentDevice := "/dev/nvme0n1" // TODO: Select appropriately from matched NVMeDevice
 	pw := NewPartedWrapper(parentDevice)
 
+	// Ensure label exists just in case (ignores error if already exists, but we can do a fallback)
+	_ = pw.MakeLabel()
+
 	// In a real system you would calculate available start sectors.
 	startMB := int64(1)
 	endMB := startMB + partition.Spec.Size.Value()/(1024*1024)
@@ -99,7 +104,21 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 2. Configure `nvmetcli` (configfs) to export via RDMA.
 	// ============================================
 	nqn := "nqn.2026-02.io.distort:volume-" + partition.Name
-	portalIP := "192.168.1.100" // TODO: Read from Node IP assigned for RDMA
+
+	// Fetch real K8s Node IP for the export portal
+	portalIP := "127.0.0.1"
+	k8sNode := &corev1.Node{}
+	if err := p.Get(ctx, types.NamespacedName{Name: p.NodeName}, k8sNode); err == nil {
+		for _, addr := range k8sNode.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				portalIP = addr.Address
+				break
+			}
+		}
+	} else {
+		logger.Error(err, "Failed to fetch node IP for NVMe-oF portal")
+	}
+
 	portalPort := 4420
 	portID := 1
 

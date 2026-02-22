@@ -156,7 +156,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: distort-csi-sc
-provisioner: distort.io/csi
+provisioner: storage.distort.io
 volumeBindingMode: WaitForFirstConsumer
 `
 			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", scYaml))

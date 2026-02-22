@@ -33,8 +33,8 @@ func ExportNVMeTarget(nqn, blockDevice, portalIP string, portID, portalPort int)
 
 	// 1. Create Subsystem
 	subsysPath := filepath.Join(nvmetPath, "subsystems", nqn)
-	if err := os.MkdirAll(subsysPath, 0755); err != nil {
-		return fmt.Errorf("failed to create subsystem: %w", err)
+	if err := os.Mkdir(subsysPath, 0755); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("failed to create subsystem %s: %w", subsysPath, err)
 	}
 
 	if err := os.WriteFile(filepath.Join(subsysPath, "attr_allow_any_host"), []byte("1"), 0644); err != nil {
@@ -43,7 +43,7 @@ func ExportNVMeTarget(nqn, blockDevice, portalIP string, portID, portalPort int)
 
 	// 2. Create Namespace (NSID 1)
 	nsPath := filepath.Join(subsysPath, "namespaces", "1")
-	if err := os.MkdirAll(nsPath, 0755); err != nil {
+	if err := os.Mkdir(nsPath, 0755); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("failed to create namespace: %w", err)
 	}
 
@@ -57,7 +57,7 @@ func ExportNVMeTarget(nqn, blockDevice, portalIP string, portID, portalPort int)
 
 	// 3. Create Port
 	portPath := filepath.Join(nvmetPath, "ports", strconv.Itoa(portID))
-	if err := os.MkdirAll(portPath, 0755); err != nil {
+	if err := os.Mkdir(portPath, 0755); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("failed to create port: %w", err)
 	}
 
@@ -92,17 +92,26 @@ func UnexportNVMeTarget(nqn string, portID int) error {
 	linkPath := filepath.Join(portPath, "subsystems", nqn)
 
 	// Remove link
-	os.Remove(linkPath)
+	if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove port symlink: %w", err)
+	}
 
 	subsysPath := filepath.Join(nvmetPath, "subsystems", nqn)
 	nsPath := filepath.Join(subsysPath, "namespaces", "1")
 
 	// Disable and remove namespace
-	os.WriteFile(filepath.Join(nsPath, "enable"), []byte("0"), 0644)
-	os.Remove(nsPath)
+	if err := os.WriteFile(filepath.Join(nsPath, "enable"), []byte("0"), 0644); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to disable namespace: %w", err)
+	}
+
+	if err := os.Remove(nsPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove namespace: %w", err)
+	}
 
 	// Remove subsystem
-	os.Remove(subsysPath)
+	if err := os.Remove(subsysPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove subsystem: %w", err)
+	}
 
 	return nil
 }

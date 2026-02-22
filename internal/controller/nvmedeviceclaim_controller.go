@@ -55,6 +55,44 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	finalizerName := "storage.distort.io/claim-cleanup"
+
+	// Examine DeletionTimestamp to determine if object is under deletion
+	if claim.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is not being deleted, so if it does not have our finalizer,
+		// then lets add the finalizer and update the object.
+		if !containsString(claim.GetFinalizers(), finalizerName) {
+			claim.SetFinalizers(append(claim.GetFinalizers(), finalizerName))
+			if err := r.Update(ctx, &claim); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		// The object is being deleted
+		if containsString(claim.GetFinalizers(), finalizerName) {
+			// Find the device and unclaim it
+			if claim.Status.MatchedDevice != "" {
+				var dev storagev1alpha1.NVMeDevice
+				if err := r.Get(ctx, client.ObjectKey{Name: claim.Status.MatchedDevice, Namespace: claim.Namespace}, &dev); err == nil {
+					dev.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
+					if err := r.Status().Update(ctx, &dev); err != nil {
+						logger.Error(err, "unable to free NVMeDevice status", "device", dev.Name)
+						return ctrl.Result{}, err
+					}
+					logger.Info("Successfully freed NVMeDevice", "device", dev.Name)
+				}
+			}
+
+			// Remove our finalizer from the list and update it.
+			claim.SetFinalizers(removeString(claim.GetFinalizers(), finalizerName))
+			if err := r.Update(ctx, &claim); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		// Stop reconciliation as the item is being deleted
+		return ctrl.Result{}, nil
+	}
+
 	// If already bound to a device, nothing to do (simplified).
 	if claim.Status.Active && claim.Status.MatchedDevice != "" {
 		return ctrl.Result{}, nil
@@ -100,4 +138,24 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	logger.Info("No matching NVMeDevice found for serial number", "serial", claim.Spec.SerialNumber)
 	// Optionally requeue if we expect devices to appear later
 	return ctrl.Result{}, nil
+}
+
+// Helper functions to check and remove string from a slice of strings.
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }

@@ -20,6 +20,16 @@ spec:
       hostIPC: true
       hostPID: true
       serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      initContainers:
+        - name: load-modules
+          image: busybox:1.36
+          command: ["chroot", "/host", "sh", "-c", "modprobe nvmet nvmet-rdma nvme-fabrics nvme-core || true"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
       containers:
         - name: agent
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -34,6 +44,8 @@ spec:
           securityContext:
             privileged: true
           volumeMounts:
+            - name: dev
+              mountPath: /dev
             - name: sys-class-nvme
               mountPath: /sys/class/nvme
               readOnly: true
@@ -46,6 +58,10 @@ spec:
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
       volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
         - name: sys-class-nvme
           hostPath:
             path: /sys/class/nvme
@@ -57,6 +73,10 @@ spec:
         - name: sys-kernel-config
           hostPath:
             path: /sys/kernel/config
+            type: Directory
+        - name: host-root
+          hostPath:
+            path: /
             type: Directory
       {{- with .Values.nodeSelector }}
       nodeSelector:

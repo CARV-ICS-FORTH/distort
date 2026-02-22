@@ -45,6 +45,8 @@ spec:
           securityContext:
             privileged: true
           volumeMounts:
+            - name: dev
+              mountPath: /dev
             - name: plugin-dir
               mountPath: /csi
             - name: pods-mount-dir
@@ -53,6 +55,10 @@ spec:
           resources:
             {{- toYaml .Values.csi.resources | nindent 12 }}
       volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
         - name: plugin-dir
           hostPath:
             path: /var/lib/kubelet/plugins/csi.distort.io/

@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "distort.fullname" . }}-csi-controller
+  labels:
+    {{- include "distort.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "distort.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: csi-controller
+  template:
+    metadata:
+      labels:
+        {{- include "distort.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: csi-controller
+    spec:
+      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      containers:
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v3.5.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=5"
+            - "--feature-gates=Topology=true"
+            - "--extra-create-metadata"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-driver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/distort-csi
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --nodeid=$(NODE_ID)
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

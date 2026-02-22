@@ -43,10 +43,16 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	klog.Infof("CreateVolume: Name=%s, SizeBytes=%d", name, requiredBytes)
 
+	ns := req.GetParameters()["csi.storage.k8s.io/pvc/namespace"]
+	if ns == "" {
+		ns = "default"
+	}
+
 	// Create NVMePartition CRD
 	partition := &storagev1alpha1.NVMePartition{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:      name,
+			Namespace: ns,
 		},
 		Spec: storagev1alpha1.NVMePartitionSpec{
 			Size: *resource.NewQuantity(requiredBytes, resource.BinarySI),
@@ -61,7 +67,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			return nil, status.Errorf(codes.Internal, "failed to create partition: %v", err)
 		}
 		// If it already exists, just retrieve it
-		err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name}, partition)
+		err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, partition)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get existing partition: %v", err)
 		}
@@ -69,14 +75,14 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	// Wait for the partition to be Exported
 	// The Mgmt-Controller schedules it -> The Agent slices and exports it.
-	klog.Infof("Waiting for NVMePartition %s to be Exported...", name)
-	err = cs.waitForPartitionReady(ctx, name)
+	klog.Infof("Waiting for NVMePartition %s in namespace %s to be Exported...", name, ns)
+	err = cs.waitForPartitionReady(ctx, name, ns)
 	if err != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "partition failed to become ready: %v", err)
 	}
 
 	// Fetch the updated partition with NQN and Portal IPs
-	err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name}, partition)
+	err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, partition)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get final partition status: %v", err)
 	}
@@ -105,23 +111,26 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 	klog.Infof("DeleteVolume: ID=%s", volID)
 
-	partition := &storagev1alpha1.NVMePartition{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: volID,
-		},
+	var pList storagev1alpha1.NVMePartitionList
+	if err := cs.k8sClient.List(ctx, &pList); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list partitions: %v", err)
 	}
 
-	err := cs.k8sClient.Delete(ctx, partition)
-	if err != nil && client.IgnoreNotFound(err) != nil {
-		klog.Errorf("Failed to delete NVMePartition %s: %v", volID, err)
-		return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
+	for _, p := range pList.Items {
+		if p.Name == volID {
+			if err := cs.k8sClient.Delete(ctx, &p); err != nil && client.IgnoreNotFound(err) != nil {
+				klog.Errorf("Failed to delete NVMePartition %s: %v", volID, err)
+				return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
+			}
+			return &csi.DeleteVolumeResponse{}, nil
+		}
 	}
 
 	// Note: We might want to wait for actual deletion if we use finalizers in the Agent
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
-func (cs *ControllerServer) waitForPartitionReady(ctx context.Context, name string) error {
+func (cs *ControllerServer) waitForPartitionReady(ctx context.Context, name, namespace string) error {
 	// Simple polling for now
 	timeout := time.After(2 * time.Minute)
 	ticker := time.NewTicker(5 * time.Second)
@@ -135,7 +144,7 @@ func (cs *ControllerServer) waitForPartitionReady(ctx context.Context, name stri
 			return ctx.Err()
 		case <-ticker.C:
 			var p storagev1alpha1.NVMePartition
-			if err := cs.k8sClient.Get(ctx, types.NamespacedName{Name: name}, &p); err == nil {
+			if err := cs.k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &p); err == nil {
 				if p.Status.State == storagev1alpha1.NVMePartitionStateExported {
 					return nil // Ready
 				}

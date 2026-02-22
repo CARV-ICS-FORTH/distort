@@ -9,9 +9,11 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/csi"
 )
 
 var (
@@ -45,9 +47,20 @@ func main() {
 
 	setupLog.Info("Starting Distort CSI Driver", "nodeID", nodeId, "endpoint", endpoint)
 
-	// TODO: Initialize CSI Driver (Identity, Controller, Node servers)
-	// driver := csi.NewDriver(nodeId, endpoint)
-	// driver.Run()
+	// Initialize K8s Client
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		setupLog.Error(err, "unable to get kubeconfig")
+		os.Exit(1)
+	}
 
-	select {} // block forever
+	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to create kubernetes client")
+		os.Exit(1)
+	}
+
+	// Initialize CSI Driver (Identity, Controller, Node servers)
+	driver := csi.NewDriver(nodeId, endpoint, k8sClient)
+	driver.Run()
 }

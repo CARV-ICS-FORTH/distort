@@ -40,7 +40,7 @@ type NVMESubsystem struct {
 	} `json:"Paths"`
 }
 
-type NVMESubsysList struct {
+type NVMEHostList []struct {
 	Subsystems []NVMESubsystem `json:"Subsystems"`
 }
 
@@ -84,19 +84,21 @@ func GetDeviceByNQN(nqn string) (string, error) {
 		return "", fmt.Errorf("nvme list-subsys failed: %v, output: %s", err, string(out))
 	}
 
-	var list NVMESubsysList
+	var list NVMEHostList
 	if err := json.Unmarshal(out, &list); err != nil {
 		return "", fmt.Errorf("failed to parse nvme list-subsys JSON: %v", err)
 	}
 
-	for _, sys := range list.Subsystems {
-		if sys.NQN == nqn {
-			for _, p := range sys.Paths {
-				if p.State == "live" && p.Name != "" {
-					// We need to return the block device, not the controller.
-					// e.g., if Name is "nvme1", the block device is likely "nvme1n1"
-					// We assume namespace 1.
-					return "/dev/" + p.Name + "n1", nil
+	for _, host := range list {
+		for _, sys := range host.Subsystems {
+			if sys.NQN == nqn {
+				for _, p := range sys.Paths {
+					if p.State == "live" && p.Name != "" {
+						// We need to return the block device, not the controller.
+						// e.g., if Name is "nvme1", the block device is likely "nvme1n1"
+						// We assume namespace 1.
+						return "/dev/" + p.Name + "n1", nil
+					}
 				}
 			}
 		}

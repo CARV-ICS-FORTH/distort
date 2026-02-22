@@ -2,6 +2,11 @@ package csi
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -61,6 +66,18 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Errorf(codes.Internal, "Failed to locate block device for NQN %s: %v", nqn, err)
 	}
 
+	// Wait for udev to create the block device node
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(devPath); err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if _, err := os.Stat(devPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Block device %s did not appear in time: %v", devPath, err)
+	}
+
 	klog.Infof("Mapped NQN %s to local block device %s", nqn, devPath)
 
 	// 3. Mount the device to req.GetStagingTargetPath()
@@ -69,12 +86,11 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.InvalidArgument, "Staging target path must be provided")
 	}
 
-	// Format and mount. Real CSI uses `k8s.io/mount-utils`
-	// For scaffolding sake, we simulate ext4 creation if needed.
-	// We'll skip real formatting here as it requires `mkfs.ext4`, but note the implementation structure.
 	klog.Infof("Staging volume %s (device %s) to %s", volID, devPath, stagingTargetPath)
 
-	// A proper implementation uses `mounter.FormatAndMount(devPath, stagingTargetPath, "ext4", nil)`
+	if err := formatAndMount(devPath, stagingTargetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to format and mount: %v", err)
+	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
@@ -92,11 +108,12 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 	klog.Infof("NodeUnstageVolume: ID=%s Path=%s", volID, stagingTargetPath)
 
-	// 1. Unmount the staging path (skipped in scaffold)
-	// mounter.Unmount(stagingTargetPath)
+	// 1. Unmount the staging path
+	if err := unmount(stagingTargetPath); err != nil {
+		klog.Warningf("Failed to unmount staging path: %v", err)
+	}
 
-	// 2. Execute `nvme disconnect -n <NQN>` (we derive NQN from our standard scheme)
-	// Ideally we look it up or pass it in context. For this scaffold, we rebuild it:
+	// 2. Execute `nvme disconnect -n <NQN>`
 	nqn := "nqn.2026-02.io.distort:volume-" + volID
 
 	if err := DisconnectRDMA(nqn); err != nil {
@@ -107,20 +124,17 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 }
 
 func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	// Publish volume mounts from the Staging path to the Pod's target path
 	volID := req.GetVolumeId()
 	source := req.GetStagingTargetPath()
 	target := req.GetTargetPath()
 
 	klog.Infof("NodePublishVolume: ID=%s Source=%s Target=%s", volID, source, target)
 
-	// 1. Ensure target directory exists (skipped in mock)
-	// os.MkdirAll(target, 0750)
+	if err := bindMount(source, target); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	}
 
-	// 2. Bind mount from StagingTargetPath to TargetPath
-	// mounter.Mount(source, target, "", []string{"bind"})
 	klog.Infof("Bind mounted %s to %s", source, target)
-
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -130,9 +144,60 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	klog.Infof("NodeUnpublishVolume: ID=%s Target=%s", volID, target)
 
-	// 1. Unmount the TargetPath
-	// mounter.Unmount(target)
-	klog.Infof("Unmounted %s", target)
+	if err := unmount(target); err != nil {
+		klog.Warningf("Failed to unmount target path: %v", err)
+	}
 
+	klog.Infof("Unmounted %s", target)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func formatAndMount(source, target string) error {
+	os.MkdirAll(target, 0750)
+
+	// Check if it's already mounted by trying to mount it.
+	klog.Infof("Trying to mount %s to %s", source, target)
+	cmd := exec.Command("mount", source, target)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		return nil // Successfully mounted, was already formatted
+	} else if strings.Contains(string(out), "already mounted") {
+		return nil // Already mounted
+	}
+
+	// Formatting
+	klog.Infof("Formatting %s as ext4", source)
+	cmd = exec.Command("mkfs.ext4", "-F", source)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("formatting failed: %v, output: %s", err, string(out))
+	}
+
+	// Mount again
+	cmd = exec.Command("mount", source, target)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %v, output: %s", err, string(out))
+	}
+	return nil
+}
+
+func bindMount(source, target string) error {
+	os.MkdirAll(target, 0750)
+	cmd := exec.Command("mount", "--bind", source, target)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(out), "already mounted") {
+			return nil
+		}
+		return fmt.Errorf("bind mount failed: %v, output: %s", err, string(out))
+	}
+	return nil
+}
+
+func unmount(target string) error {
+	cmd := exec.Command("umount", target)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(out), "not mounted") {
+			return nil
+		}
+		return fmt.Errorf("unmount failed: %v, output: %s", err, string(out))
+	}
+	return nil
 }

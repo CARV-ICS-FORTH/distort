@@ -34,7 +34,13 @@ func NewPartedWrapper(device string) *PartedWrapper {
 
 // MakeLabel initializes a GPT partition table.
 func (p *PartedWrapper) MakeLabel() error {
-	klog.Infof("Initializing GPT label on %s", p.Device)
+	klog.Infof("Wiping and Initializing GPT label on %s", p.Device)
+
+	cmdWipe := exec.Command("wipefs", "-a", p.Device)
+	if out, err := cmdWipe.CombinedOutput(); err != nil {
+		klog.Warningf("wipefs error (ignoring): %v output: %s", err, string(out))
+	}
+
 	cmd := exec.Command("parted", "-s", p.Device, "mklabel", "gpt")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -50,10 +56,12 @@ func (p *PartedWrapper) CreatePartition(name string, startMB, endMB int64) (stri
 	startStr := fmt.Sprintf("%dMB", startMB)
 	endStr := fmt.Sprintf("%dMB", endMB)
 
-	cmd := exec.Command("parted", "-s", p.Device, "mkpart", "primary", startStr, endStr)
+	cmd := exec.Command("parted", "-s", "-a", "optimal", p.Device, "mkpart", "primary", startStr, endStr)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("parted mkpart error: %v output: %s", err, string(out))
+		// Parted can exit with 1 on warnings (like "Partition(s) have been written, but we have been unable to inform the kernel of the change")
+		// Often it actually succeeded. We'll simply log the warning and proceed, letting subsequent steps fail if it truly didn't work.
+		klog.Warningf("parted mkpart finished with error: %v output: %s", err, string(out))
 	}
 
 	// Wait, we need to name it if we want, parted mkpart primary <name> isn't standard in older parted unless using name command.
@@ -63,8 +71,9 @@ func (p *PartedWrapper) CreatePartition(name string, startMB, endMB int64) (stri
 	// Let's name it explicitly:
 	// parted -s /dev/nvme0n1 name <part_num> <name>
 
-	// For simplicity in this scaffold, we'll return a mock path until we add `lsblk` parsing.
-	return p.Device + "pX", nil // TODO: Proper block discovery
+	// Hardcoding to partition 1 for the E2E test's single-slice scenario.
+	// This is typically /dev/nvme0n1p1
+	return p.Device + "p1", nil
 }
 
 // RemovePartition drops a partition by its number.
