@@ -1,4 +1,4 @@
-# Build the manager binary
+# Build the binaries
 FROM golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
@@ -14,18 +14,23 @@ RUN go mod download
 # Copy the Go source (relies on .dockerignore to filter)
 COPY . .
 
-# Build
-# the GOARCH has no default value to allow the binary to be built according to the host where the command
-# was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
-# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
-# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+# Build all three components
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-manager cmd/distort-manager/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-agent cmd/distort-agent/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-csi cmd/distort-csi/main.go
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# Use ubuntu as base image for the final stages since the agent needs
+# access to system binaries like parted and nvme-cli.
+FROM ubuntu:24.04
 WORKDIR /
-COPY --from=builder /workspace/manager .
-USER 65532:65532
+COPY --from=builder /workspace/bin/distort-manager /usr/local/bin/
+COPY --from=builder /workspace/bin/distort-agent /usr/local/bin/
+COPY --from=builder /workspace/bin/distort-csi /usr/local/bin/
 
-ENTRYPOINT ["/manager"]
+# Install runtime dependencies required by the agent and CSI
+RUN apt-get update && apt-get install -y nvme-cli parted e2fsprogs xfsprogs kmod && rm -rf /var/lib/apt/lists/*
+
+# Manager should run non-privileged but agent/csi need root
+USER 0:0
+
+ENTRYPOINT ["/usr/local/bin/distort-manager"]

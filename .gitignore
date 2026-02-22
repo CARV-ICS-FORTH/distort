@@ -28,3 +28,9 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+kubeconfig.yaml
+
+# Vagrant untracked files
+vagrant/.vagrant/
+vagrant/cluster_info/
+vagrant/distort-img.tar

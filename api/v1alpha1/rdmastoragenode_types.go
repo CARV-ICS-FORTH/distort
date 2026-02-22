@@ -78,6 +78,7 @@ type RDMAStorageNodeStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".spec.nodeName",description="Node Name"
 // +kubebuilder:printcolumn:name="RDMA IP",type="string",JSONPath=".spec.rdmaIP",description="RDMA Portal IP"
 // +kubebuilder:printcolumn:name="Transport",type="string",JSONPath=".spec.transport",description="Transport Type"

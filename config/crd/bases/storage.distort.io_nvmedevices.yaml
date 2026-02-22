@@ -12,7 +12,7 @@ spec:
     listKind: NVMeDeviceList
     plural: nvmedevices
     singular: nvmedevice
-  scope: Namespaced
+  scope: Cluster
   versions:
   - additionalPrinterColumns:
     - description: Node where attached

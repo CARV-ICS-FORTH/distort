@@ -12,7 +12,7 @@ spec:
     listKind: RDMAStorageNodeList
     plural: rdmastoragenodes
     singular: rdmastoragenode
-  scope: Namespaced
+  scope: Cluster
   versions:
   - additionalPrinterColumns:
     - description: Node Name

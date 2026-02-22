@@ -1,30 +1,12 @@
 //go:build e2e
 // +build e2e
 
-/*
-Copyright 2026, FORTH-ICS.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -33,307 +15,241 @@ import (
 	"distort/test/utils"
 )
 
-// namespace where the project is deployed in
-const namespace = "distort-system"
+var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, func() {
+	SetDefaultEventuallyTimeout(5 * time.Minute)
+	SetDefaultEventuallyPollingInterval(5 * time.Second)
 
-// serviceAccountName created for the project
-const serviceAccountName = "distort-controller-manager"
-
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "distort-controller-manager-metrics-service"
-
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "distort-metrics-binding"
-
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
-
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
-	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
-	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
-	})
-
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
-	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
-		}
-	})
-
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
-
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				// Get the name of the controller-manager pod
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
-
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
-
-				// Validate the pod's status
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
+	Context("Layer 1: Agent & Hardware Independence", func() {
+		It("Discovery Check: Should discover NVMe devices and RDMA storage nodes", func() {
+			By("waiting for NVMeDevice CRDs to be populated")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nvmedevices", "-o", "jsonpath={.items[*].metadata.name}")
+				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
+				// Should find at least 2 NVMe devices (from master and worker)
+				devices := strings.Fields(out)
+				g.Expect(len(devices)).To(BeNumerically(">=", 2))
+			}).Should(Succeed())
+
+			By("waiting for RDMAStorageNode CRDs to be populated")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "rdmastoragenodes", "-o", "jsonpath={.items[*].metadata.name}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				nodes := strings.Fields(out)
+				g.Expect(len(nodes)).To(BeNumerically(">=", 1))
+			}).Should(Succeed())
 		})
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=distort-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
+		It("Partitioning Engine & NVMe-oF Exporting: Should slice a drive and export it", func() {
+			By("Creating a raw NVMePartition CRD specifically for distort-worker-1")
+			partitionYaml := `
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: e2e-test-partition
+spec:
+  size: 500Mi
+  nodeName: distort-worker-1
+`
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", partitionYaml))
 			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
-
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
-
-			By("getting the service account token")
-			token, err := serviceAccountToken()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
 
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
+			By("Waiting for the NVMePartition to reach Exported state")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nvmepartition", "e2e-test-partition", "-o", "jsonpath={.status.state}")
+				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
-			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
+				g.Expect(out).To(Equal("Exported"))
+			}).Should(Succeed())
 
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
-			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+			By("Using SSH to verify physical partition creation via lsblk")
+			cmd = exec.Command("sh", "-c", "cd vagrant && vagrant ssh distort-worker-1 -c 'lsblk | grep nvme'")
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			// e.g. nvme0n1p1 or nvme1n1p1
+			Expect(out).To(ContainSubstring("p1"))
 
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
+			By("Using SSH to verify NVMe-oF subsystem export")
+			cmd = exec.Command("sh", "-c", "cd vagrant && vagrant ssh distort-worker-1 -c 'sudo ls /sys/kernel/config/nvmet/subsystems'")
+			out, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("nqn."))
 
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
-							],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
+			By("Cleaning up the test partition")
+			cmd = exec.Command("kubectl", "delete", "nvmepartition", "e2e-test-partition")
 			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
 
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
+	Context("Layer 2: Management Controllers", func() {
+		It("Claim Binding: Should bind an NVMeDeviceClaim to a device by serial number", func() {
+			// Get a valid serial number from the discovered devices
+			cmd := exec.Command("kubectl", "get", "nvmedevices", "-o", "jsonpath={.items[0].spec.serialNumber}")
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).NotTo(BeEmpty())
+			serialNum := out
+
+			By("Creating an NVMeDeviceClaim for serial: " + serialNum)
+			claimYaml := fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: e2e-test-claim
+spec:
+  serialNumber: %s
+`, serialNum)
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", claimYaml))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the claim is set to Active")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nvmedeviceclaim", "e2e-test-claim", "-o", "jsonpath={.status.active}")
+				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
+				g.Expect(out).To(Equal("true"))
+			}).Should(Succeed())
 
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
+			By("Cleaning up the claim")
+			cmd = exec.Command("kubectl", "delete", "nvmedeviceclaim", "e2e-test-claim")
+			_, _ = utils.Run(cmd)
 		})
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
+		It("Capacity Scheduling: Should selectively schedule generic NVMePartitions based on capacity", func() {
+			By("Creating a generic NVMePartition without a nodeName")
+			partitionYaml := `
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: e2e-schedule-partition
+spec:
+  size: 200Mi
+`
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", partitionYaml))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+			By("Waiting for the Manager to assign a valid nodeName")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nvmepartition", "e2e-schedule-partition", "-o", "jsonpath={.spec.nodeName}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).NotTo(BeEmpty())
+				g.Expect(out).To(MatchRegexp(`distort-(worker|master).*`))
+			}).Should(Succeed())
+
+			By("Cleaning up the partition")
+			cmd = exec.Command("kubectl", "delete", "nvmepartition", "e2e-schedule-partition")
+			_, _ = utils.Run(cmd)
+		})
+	})
+
+	Context("Layer 3: CSI & Full Stack", func() {
+		It("CSI Provisioning, Client Mounting & Persistence", func() {
+			By("Installing the StorageClass")
+			scYaml := `
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: distort-csi-sc
+provisioner: distort.io/csi
+volumeBindingMode: WaitForFirstConsumer
+`
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", scYaml))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Creating a PVC")
+			pvcYaml := `
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: e2e-distort-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi
+  storageClassName: distort-csi-sc
+`
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", pvcYaml))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Creating a consumer Pod to trigger provisioning")
+			podYaml := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: e2e-distort-pod
+spec:
+  containers:
+  - name: e2e-container
+    image: busybox
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: distort-vol
+      mountPath: /data
+  volumes:
+  - name: distort-vol
+    persistentVolumeClaim:
+      claimName: e2e-distort-pvc
+`
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", podYaml))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Waiting for the PVC to bound, reflecting NVMePartition creation and export")
+			Eventually(func(g Gomega) {
+				cmd = exec.Command("kubectl", "get", "pvc", "e2e-distort-pvc", "-o", "jsonpath={.status.phase}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Bound"))
+			}).Should(Succeed())
+
+			By("Waiting for the consumer Pod to reach Running state (proves nvme connect & mount)")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", "e2e-distort-pod", "-o", "jsonpath={.status.phase}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Running"))
+			}).Should(Succeed())
+
+			By("Writing data into the persistent volume")
+			cmd = exec.Command("kubectl", "exec", "e2e-distort-pod", "--", "sh", "-c", "echo 'distort-rocks' > /data/test.txt")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Recreating the consumer Pod")
+			cmd = exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--force", "--grace-period=0")
+			_, _ = utils.Run(cmd)
+
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", podYaml))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", "e2e-distort-pod", "-o", "jsonpath={.status.phase}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Running"))
+			}).Should(Succeed())
+
+			By("Reading data from the persistent volume to verify persistence")
+			cmd = exec.Command("kubectl", "exec", "e2e-distort-pod", "--", "sh", "-c", "cat /data/test.txt")
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("distort-rocks"))
+
+			By("Cleaning up")
+			exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--force", "--grace-period=0").Run()
+			exec.Command("kubectl", "delete", "pvc", "e2e-distort-pvc").Run()
+			exec.Command("kubectl", "delete", "sc", "distort-csi-sc").Run()
+		})
 	})
 })
-
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
-
-	// Temporary file to store the token request
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
-	if err != nil {
-		return "", err
-	}
-
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		// Execute kubectl command to create the token
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		// Parse the JSON output to extract the token
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
-	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
-}

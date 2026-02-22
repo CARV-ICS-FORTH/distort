@@ -80,6 +80,7 @@ type NVMeDeviceStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".spec.nodeName",description="Node where attached"
 // +kubebuilder:printcolumn:name="PCI",type="string",JSONPath=".spec.pciAddress",description="PCIe Address"
 // +kubebuilder:printcolumn:name="Capacity",type="string",JSONPath=".spec.totalCapacity",description="Total Capacity"

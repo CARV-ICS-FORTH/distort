@@ -33,7 +33,7 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
-            - /distort-csi
+            - /usr/local/bin/distort-csi
           args:
             - --endpoint=unix:///csi/csi.sock
             - --nodeid=$(NODE_ID)
@@ -50,8 +50,6 @@ spec:
             - name: pods-mount-dir
               mountPath: /var/lib/kubelet/pods
               mountPropagation: "Bidirectional"
-            - name: host-dev
-              mountPath: /dev
           resources:
             {{- toYaml .Values.csi.resources | nindent 12 }}
       volumes:
@@ -67,10 +65,6 @@ spec:
           hostPath:
             path: /var/lib/kubelet/pods
             type: DirectoryOrCreate
-        - name: host-dev
-          hostPath:
-            path: /dev
-            type: Directory
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
