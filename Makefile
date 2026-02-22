@@ -72,8 +72,8 @@ get-kubeconfig:
 
 .PHONY: test-env-reset
 test-env-reset: ## Reset the hardware state on Vagrant nodes
-	cd vagrant && vagrant ssh distort-worker-1 -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo rm -rf /sys/kernel/config/nvmet/ports/* /sys/kernel/config/nvmet/subsystems/* || true"
-	cd vagrant && vagrant ssh distort-master -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo rm -rf /sys/kernel/config/nvmet/ports/* /sys/kernel/config/nvmet/subsystems/* || true"
+	cd vagrant && vagrant ssh distort-worker-1 -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo bash /vagrant/clean-nvmet.sh"
+	cd vagrant && vagrant ssh distort-master -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo bash /vagrant/clean-nvmet.sh"
 
 .PHONY: test-env-deploy
 test-env-deploy: docker-build get-kubeconfig manifests ## Build image, load into Vagrant, and deploy Helm chart
