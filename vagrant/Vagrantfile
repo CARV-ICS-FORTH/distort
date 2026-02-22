@@ -30,11 +30,40 @@ $common_script = <<-SCRIPT
   # Identify the host-only network interface (eth1 usually based on our private_network config)
   # and bind SoftRoCE to it. 
   # Note: `eth1` is specifically chosen here because eth0 is Vagrant's NAT, and eth1 connects the nodes.
-  rdma link add rxe_eth1 type rxe netdev eth1
+  cat >/etc/systemd/system/rdma-link.service <<EOF
+[Unit]
+Description=Add RDMA Link on Boot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rdma link add rxe_eth1 type rxe netdev eth1
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl enable rdma-link.service
+  systemctl start rdma-link.service
 SCRIPT
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.vm.box = UBUNTU_BOX
+
+  # Trigger to clean up the controller before the VM boots
+  config.trigger.before [:up, :reload] do |trigger|
+    trigger.ruby do |env, machine|
+      vm_id = machine.id
+      if vm_id
+        # Check if the controller exists
+        check = `VBoxManage showvminfo #{vm_id} --machinereadable`
+        if check.include?('"NVMe Controller"')
+          puts "Removing existing NVMe Controller..."
+          system("VBoxManage storagectl #{vm_id} --name \"NVMe Controller\" --remove")
+        end
+      end
+    end
+  end
 
   # Configure K3s Server (Master Node)
   config.vm.define "distort-master" do |master|
@@ -44,6 +73,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     master.vm.provider "virtualbox" do |vb|
       vb.memory = "2048"
       vb.cpus = 2
+
       # Add an NVMe controller to the VM
       vb.customize ["storagectl", :id, "--name", "NVMe Controller", "--add", "pcie", "--controller", "NVMe"]
       
