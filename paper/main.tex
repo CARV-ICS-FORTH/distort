@@ -32,6 +32,15 @@ Recent advancements in distributed storage have focused heavily on integrating h
 \section{Design}
 DISTORT's architecture is bifurcated into two logical layers: the \textit{NVMe Management Layer} (the "Hardware Control Plane") and the \textit{CSI Layer} (the "Kubernetes Bridge"). This separation of concerns allows the system to decouple physical hardware management from the Kubernetes volume lifecycle using a state-machine-via-CRD approach.
 
+\subsection{Custom Resource Definitions (CRDs)}
+At the core of DISTORT's declarative model are four Custom Resource Definitions that mirror the physical and logical state of the storage fabric:
+\begin{enumerate}
+    \item \textbf{NVMeDevice:} Represents a discovered physical NVMe storage controller on a worker node, including attributes like serial number, NUMA alignment, and block capacity.
+    \item \textbf{NVMeDeviceClaim:} Allows administrators or automated provisioners to reserve specific \texttt{NVMeDevice} instances for dedicated workloads.
+    \item \textbf{NVMePartition:} Represents a logical slice of an \texttt{NVMeDevice}. It dictates the required capacity and, once scheduled, tracks the NVMe-oF network endpoint details (NQN, Portal IP, Port) required for client connections.
+    \item \textbf{RDMAStorageNode:} Represents a worker node's capability to participate in the storage fabric, providing health status and available network interfaces for RDMA traffic.
+\end{enumerate}
+
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}[
@@ -114,8 +123,34 @@ To package the solution for end users, DISTORT maintains an integrated Helm Char
     \item \texttt{csi-daemonset.yaml}: Encapsulating the \texttt{distort-csi} NodeServer alongside standard Kubernetes SIG-Storage sidecars (e.g., \texttt{csi-node-driver-registrar}).
 \end{itemize}
 
-\section{Evaluation}
-% Evaluation section is intentionally left empty for future work.
+\subsection{Testing and Validation Methodology}
+To ensure the robustness of the storage engine across the entire stack—from hardware discovery to CSI volume provisioning—DISTORT employs a comprehensive end-to-end (E2E) testing framework. The environment is simulated using Vagrant and VirtualBox, provisioning a multi-node K3s cluster. Each virtual node is equipped with multiple virtual NVMe drives and configured with SoftRoCE (\texttt{rdma\_rxe}) to emulate RDMA fabrics without requiring specialized hardware.
+
+The validation suite is built upon the Ginkgo BDD (Behavior-Driven Development) testing framework and orchestrates tests across three functional layers:
+\begin{enumerate}
+    \item \textbf{Hardware Discovery:} Asserts that the \texttt{distort-agent} accurately detects virtual NVMe disks and publishes corresponding \texttt{NVMeDevice} CRDs.
+    \item \textbf{Controller Logic:} Validates the \texttt{distort-manager}'s scheduling decisions, ensuring \texttt{NVMePartition} resources are placed on nodes with sufficient capacity.
+    \item \textbf{CSI Provisioning \& Persistence:} Tests the full lifecycle: dynamic PVC creation, NVMe-oF target export via kernel ConfigFS, RDMA connection from the client pod, `ext4` filesystem formatting, and data persistence guarantees upon pod restarts.
+\end{enumerate}
+
+\section{Evaluation Methodology}
+While a comprehensive performance evaluation is left for future work, we outline a rigorous methodology to assess DISTORT's efficacy. The primary goal of DISTORT is to provide the operational flexibility of cloud-native storage while preserving the near bare-metal performance characteristics of RDMA-backed NVMe.
+
+\subsection{Performance Baselines}
+DISTORT should be evaluated against three distinct storage configurations to contextualize its performance profile:
+\begin{enumerate}
+    \item \textbf{Local Bare-Metal NVMe:} Represents the theoretical maximum achievable throughput and the absolute minimum latency. This serves as the upper-bound baseline.
+    \item \textbf{Standard Network Block Device (NBD / iSCSI):} Provides a traditional, non-RDMA network storage baseline over TCP/IP, highlighting the latency benefits of the fabric interconnect.
+    \item \textbf{Commercial/SDS CSI Solutions (e.g., Ceph RBD, OpenEBS):} Represents popular software-defined storage deployments in Kubernetes, demonstrating the overhead introduced by user-space file systems and complex control planes compared to DISTORT's lightweight native configfs approach.
+\end{enumerate}
+
+\subsection{Metrics and Workloads}
+The primary evaluation tool will be \texttt{fio} (Flexible I/O Tester), deployed as Kubernetes Pods consuming DISTORT-provisioned volumes. The targeted metrics include:
+\begin{itemize}
+    \item \textbf{Throughput (IOPS \& Bandwidth):} Measured using varying block sizes (e.g., 4KB for IOPS, 1MB for bandwidth) under highly concurrent random read/write workloads.
+    \item \textbf{Latency Distributions:} Analyzing 99th and 99.9th percentile latencies critical for performance-sensitive applications like distributed databases.
+    \item \textbf{Control Plane Overhead:} Measuring the end-to-end time required to dynamically provision and attach a volume (from PVC creation to Pod `Running` state) to ensure the CRD-driven orchestration scales effectively under cluster churn.
+\end{itemize}
 
 \section{Conclusion}
 This report presented DISTORT, a novel storage engine designed to seamlessly integrate high-performance, disaggregated NVMe-oF/RDMA storage with Kubernetes. By mapping physical hardware operations to declarative Custom Resources, DISTORT provides dynamic volume provisioning without sacrificing the bare-metal performance characteristics of RDMA, paving the way for data-intensive applications in cloud-native environments.
