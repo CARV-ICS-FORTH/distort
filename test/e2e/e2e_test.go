@@ -39,6 +39,18 @@ var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, func() {
 				nodes := strings.Fields(out)
 				g.Expect(len(nodes)).To(BeNumerically(">=", 1))
 			}).Should(Succeed())
+
+			By("verifying RDMAStorageNode CRDs report 0 capacity initially")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "rdmastoragenodes", "-o", "jsonpath={.items[*].status.totalCapacity}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				capacities := strings.Fields(out)
+				g.Expect(len(capacities)).To(BeNumerically(">=", 1))
+				for _, cap := range capacities {
+					g.Expect(cap).To(Equal("0"))
+				}
+			}).Should(Succeed())
 		})
 
 		It("Partitioning Engine & NVMe-oF Exporting: Should slice a drive and export it", func() {
@@ -112,6 +124,20 @@ spec:
 				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(out).To(Equal("true"))
+			}).Should(Succeed())
+
+			By("Verifying the claimed device capacity is added to the RDMAStorageNode")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nvmedeviceclaim", "e2e-test-claim", "-o", "jsonpath={.status.nodeName}")
+				nodeName, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(nodeName).NotTo(BeEmpty())
+
+				cmd = exec.Command("kubectl", "get", "rdmastoragenode", nodeName, "-o", "jsonpath={.status.totalCapacity}")
+				capacity, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(capacity).NotTo(Equal("0"))
+				g.Expect(capacity).NotTo(BeEmpty())
 			}).Should(Succeed())
 
 			By("Cleaning up the claim")
