@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= distort:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -82,7 +82,7 @@ test-env-deploy: docker-build get-kubeconfig manifests ## Build image, load into
 	cd vagrant && vagrant ssh distort-master -c "sudo k3s ctr images import /vagrant/distort-img.tar"
 	cd vagrant && vagrant ssh distort-worker-1 -c "sudo k3s ctr images import /vagrant/distort-img.tar"
 	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl apply -f config/crd/bases/
-	helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set image.repository=controller --set image.tag=latest
+	helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set image.repository=distort --set image.tag=latest
 
 .PHONY: test-e2e
 test-e2e: get-kubeconfig manifests generate fmt vet ## Run the unified Ginkgo E2E tests against Vagrant K3s
