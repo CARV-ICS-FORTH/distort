@@ -18,7 +18,9 @@ package agent
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -73,7 +75,17 @@ func (p *PartedWrapper) CreatePartition(name string, startMB, endMB int64) (stri
 
 	// Hardcoding to partition 1 for the E2E test's single-slice scenario.
 	// This is typically /dev/nvme0n1p1
-	return p.Device + "p1", nil
+	partPath := p.Device + "p1"
+
+	klog.Infof("Waiting for udev to create %s...", partPath)
+	for i := 0; i < 15; i++ {
+		if _, err := os.Stat(partPath); err == nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	return partPath, nil
 }
 
 // RemovePartition drops a partition by its number.
