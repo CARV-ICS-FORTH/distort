@@ -157,8 +157,10 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 			devFree = devCR.Status.FreeCapacity.Value()
 		}
 
-		nodeTotalCap += devTotal
-		nodeFreeCap += devFree
+		if devCR.Status.State == storagev1alpha1.NVMeDeviceStateClaimed {
+			nodeTotalCap += devTotal
+			nodeFreeCap += devFree
+		}
 	}
 
 	return nodeTotalCap, nodeFreeCap
