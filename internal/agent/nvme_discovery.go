@@ -59,6 +59,17 @@ func DiscoverNVMe() ([]HardwareNVMe, error) {
 		devName := entry.Name()
 		devPath := filepath.Join(sysClassNVMe, devName)
 
+		// Read Transport and filter out non-PCIe devices (like nvme-of network targets)
+		transport := "pcie" // default
+		if b, err := os.ReadFile(filepath.Join(devPath, "transport")); err == nil {
+			transport = strings.TrimSpace(string(b))
+		}
+
+		if transport != "pcie" {
+			klog.V(4).Infof("Skipping non-PCIe NVMe device %s (transport: %s)", devName, transport)
+			continue
+		}
+
 		hwDev := HardwareNVMe{
 			Name: devName,
 		}

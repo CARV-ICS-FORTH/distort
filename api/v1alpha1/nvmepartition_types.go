@@ -49,6 +49,11 @@ type NVMePartitionSpec struct {
 	// +optional
 	NodeName string `json:"nodeName,omitempty"`
 
+	// ParentDeviceSerialNumber is the serial number of the NVMeDevice this partition is allocated from.
+	// Populated by the mutating scheduler (Mgmt Controller).
+	// +optional
+	ParentDeviceSerialNumber string `json:"parentDeviceSerialNumber,omitempty"`
+
 	// AccessMode indicates the PVC access mode (e.g., ReadWriteOnce, ReadOnlyMany).
 	// +optional
 	AccessMode string `json:"accessMode,omitempty"`

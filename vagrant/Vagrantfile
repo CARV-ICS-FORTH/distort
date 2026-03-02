@@ -86,6 +86,10 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
         # Attach disk to the NVMe controller (port 0 and 1)
         vb.customize ["storageattach", :id, "--storagectl", "NVMe Controller", "--port", index.to_s, "--device", "0", "--type", "hdd", "--medium", disk_path]
       end
+
+      # Change the NVMe Serial Number (Must be unique per VM/Disk)
+      custom_serial = "SN-distort-master"
+      vb.customize ["setextradata", :id, "VBoxInternal/Devices/nvme/0/Config/SerialNumber", custom_serial]
     end
 
     master.vm.provision "shell", inline: $common_script
@@ -124,6 +128,10 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
           # Attach disk to the NVMe controller
           vb.customize ["storageattach", :id, "--storagectl", "NVMe Controller", "--port", index.to_s, "--device", "0", "--type", "hdd", "--medium", disk_path]
         end
+
+        # Change the NVMe Serial Number (Must be unique per VM/Disk)
+        custom_serial = "SN-#{worker_name}"
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/nvme/0/Config/SerialNumber", custom_serial]
       end
 
       worker.vm.provision "shell", inline: $common_script

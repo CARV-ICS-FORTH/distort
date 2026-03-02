@@ -63,6 +63,7 @@ metadata:
 spec:
   size: 500Mi
   nodeName: distort-worker-1
+  parentDeviceSerialNumber: SN-distort-worker-1
 `
 			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", partitionYaml))
 			_, err := utils.Run(cmd)
@@ -140,9 +141,7 @@ spec:
 				g.Expect(capacity).NotTo(BeEmpty())
 			}).Should(Succeed())
 
-			By("Cleaning up the claim")
-			cmd = exec.Command("kubectl", "delete", "nvmedeviceclaim", "e2e-test-claim")
-			_, _ = utils.Run(cmd)
+			// Keep the claim active for subsequent tests (Scheduling & CSI Provisioning)
 		})
 
 		It("Capacity Scheduling: Should selectively schedule generic NVMePartitions based on capacity", func() {
@@ -276,6 +275,7 @@ spec:
 			exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--force", "--grace-period=0").Run()
 			exec.Command("kubectl", "delete", "pvc", "e2e-distort-pvc").Run()
 			exec.Command("kubectl", "delete", "sc", "distort-csi-sc").Run()
+			exec.Command("kubectl", "delete", "nvmedeviceclaim", "e2e-test-claim").Run()
 		})
 	})
 })

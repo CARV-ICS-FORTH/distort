@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,13 +50,22 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			}
 
 			// 2. Remove the partition from the block device
-			// Mocking parent device + partition number.
-			pw := NewPartedWrapper("/dev/nvme0n1")
-			if err := pw.RemovePartition(1); err != nil {
-				logger.Error(err, "Failed to remove partition via parted")
+			if partition.Spec.ParentDeviceSerialNumber != "" {
+				devices, err := DiscoverNVMe()
+				if err == nil {
+					for _, d := range devices {
+						if d.SerialNumber == partition.Spec.ParentDeviceSerialNumber {
+							pw := NewPartedWrapper("/dev/" + d.Name + "n1")
+							if err := pw.RemovePartition(1); err != nil {
+								logger.Error(err, "Failed to remove partition via parted")
+							}
+							break
+						}
+					}
+				} else {
+					logger.Error(err, "Failed to discover NVMe devices to remove partition")
+				}
 			}
-
-			// Remove the finalizer so Kubernetes can delete the object
 			controllerutil.RemoveFinalizer(&partition, partitionFinalizer)
 			if err := p.Update(ctx, &partition); err != nil {
 				return ctrl.Result{}, err
@@ -82,7 +92,36 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// ============================================
 	// 1. Execute `parted` to create the slice.
 	// ============================================
-	parentDevice := "/dev/nvme0n1" // TODO: Select appropriately from matched NVMeDevice
+	if partition.Spec.ParentDeviceSerialNumber == "" {
+		err := fmt.Errorf("NVMePartition %s is missing ParentDeviceSerialNumber", partition.Name)
+		logger.Error(err, "Cannot provision partition")
+		partition.Status.State = storagev1alpha1.NVMePartitionStateFailed
+		_ = p.Status().Update(ctx, &partition)
+		return ctrl.Result{}, err
+	}
+
+	devices, err := DiscoverNVMe()
+	if err != nil {
+		logger.Error(err, "Failed to discover NVMe devices to find parent")
+		return ctrl.Result{}, err
+	}
+
+	var parentDevice string
+	for _, d := range devices {
+		if d.SerialNumber == partition.Spec.ParentDeviceSerialNumber {
+			parentDevice = "/dev/" + d.Name + "n1"
+			break
+		}
+	}
+
+	if parentDevice == "" {
+		err := fmt.Errorf("NVMe device with serial %s not found on node", partition.Spec.ParentDeviceSerialNumber)
+		logger.Error(err, "Failed to resolve parent device")
+		partition.Status.State = storagev1alpha1.NVMePartitionStateFailed
+		_ = p.Status().Update(ctx, &partition)
+		return ctrl.Result{}, err
+	}
+
 	pw := NewPartedWrapper(parentDevice)
 
 	// Ensure label exists just in case (ignores error if already exists, but we can do a fallback)

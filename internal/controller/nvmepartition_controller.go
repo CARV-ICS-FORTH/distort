@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,6 +46,7 @@ func (r *NVMePartitionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmepartitions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmepartitions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=storage.distort.io,resources=rdmastoragenodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedevices,verbs=get;list;watch
 
 // Reconcile assigns unassigned NVMePartitions to optimal RDMAStorageNodes based on available free capacity.
 func (r *NVMePartitionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -60,44 +62,49 @@ func (r *NVMePartitionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("Finding suitable RDMAStorageNode for NVMePartition", "partition", partition.Name, "requestedSize", partition.Spec.Size.String())
+	logger.Info("Finding suitable NVMeDevice for NVMePartition", "partition", partition.Name, "requestedSize", partition.Spec.Size.String())
 
-	// List all RDMAStorageNodes
-	var nodeList storagev1alpha1.RDMAStorageNodeList
-	if err := r.List(ctx, &nodeList); err != nil {
-		logger.Error(err, "unable to list RDMAStorageNodes")
+	// List all NVMeDevices
+	var deviceList storagev1alpha1.NVMeDeviceList
+	if err := r.List(ctx, &deviceList); err != nil {
+		logger.Error(err, "unable to list NVMeDevices")
 		return ctrl.Result{}, err
 	}
 
-	var bestNode *storagev1alpha1.RDMAStorageNode
+	var bestDevice *storagev1alpha1.NVMeDevice
 	var maxFree int64 = -1
 
-	for i := range nodeList.Items {
-		node := &nodeList.Items[i]
+	for i := range deviceList.Items {
+		device := &deviceList.Items[i]
 
-		// Ensure the node has enough free capacity
-		if node.Status.FreeCapacity.Cmp(partition.Spec.Size) >= 0 {
-			freeBytes := node.Status.FreeCapacity.Value()
-			// Simple strategy: pick the node with the most free capacity
+		// Only consider Claimed devices
+		if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed {
+			continue
+		}
+
+		// Ensure the device has enough free capacity
+		if device.Status.FreeCapacity.Cmp(partition.Spec.Size) >= 0 {
+			freeBytes := device.Status.FreeCapacity.Value()
+			// Simple strategy: pick the device with the most free capacity
 			if freeBytes > maxFree {
 				maxFree = freeBytes
-				bestNode = node
+				bestDevice = device
 			}
 		}
 	}
 
-	if bestNode == nil {
-		logger.Info("No suitable RDMAStorageNode found with enough free capacity", "partition", partition.Name)
-		// We could wait and requeue, but there's no state change to trigger this unless a node updates.
-		// So we won't requeue immediately, but rely on node watch events (if configured) or manual intervention.
-		return ctrl.Result{}, nil
+	if bestDevice == nil {
+		logger.Info("No suitable NVMeDevice found with enough free capacity", "partition", partition.Name)
+		// Requeue periodically in case a new device is claimed or capacity frees up.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	logger.Info("Assigning NVMePartition to RDMAStorageNode", "partition", partition.Name, "node", bestNode.Name)
+	logger.Info("Assigning NVMePartition to NVMeDevice", "partition", partition.Name, "node", bestDevice.Spec.NodeName, "device", bestDevice.Spec.SerialNumber)
 
-	partition.Spec.NodeName = bestNode.Name
+	partition.Spec.NodeName = bestDevice.Spec.NodeName
+	partition.Spec.ParentDeviceSerialNumber = bestDevice.Spec.SerialNumber
 	if err := r.Update(ctx, &partition); err != nil {
-		logger.Error(err, "unable to update NVMePartition with selected node", "partition", partition.Name)
+		logger.Error(err, "unable to update NVMePartition with selected node and device", "partition", partition.Name)
 		return ctrl.Result{}, err
 	}
 

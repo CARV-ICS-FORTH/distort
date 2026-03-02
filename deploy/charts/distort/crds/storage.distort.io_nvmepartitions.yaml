@@ -72,6 +72,11 @@ spec:
                   NodeName is the node where this partition should be created.
                   Often left empty by the CSI provisioner and populated by the mutating scheduler.
                 type: string
+              parentDeviceSerialNumber:
+                description: |-
+                  ParentDeviceSerialNumber is the serial number of the NVMeDevice this partition is allocated from.
+                  Populated by the mutating scheduler (Mgmt Controller).
+                type: string
               size:
                 anyOf:
                 - type: integer

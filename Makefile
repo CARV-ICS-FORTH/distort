@@ -71,9 +71,10 @@ get-kubeconfig:
 	chmod 600 kubeconfig.yaml
 
 .PHONY: test-env-reset
-test-env-reset: ## Reset the hardware state on Vagrant nodes
+test-env-reset: ## Reset the Vagrant test environment (wipe partitions, reload configfs)
 	cd vagrant && vagrant ssh distort-worker-1 -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo bash /vagrant/clean-nvmet.sh"
 	cd vagrant && vagrant ssh distort-master -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo bash /vagrant/clean-nvmet.sh"
+	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl delete nvmedeviceclaim,nvmepartition --all || true
 
 .PHONY: test-env-deploy
 test-env-deploy: docker-build get-kubeconfig manifests ## Build image, load into Vagrant, and deploy Helm chart
@@ -83,6 +84,8 @@ test-env-deploy: docker-build get-kubeconfig manifests ## Build image, load into
 	cd vagrant && vagrant ssh distort-worker-1 -c "sudo k3s ctr images import /vagrant/distort-img.tar"
 	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl apply -f config/crd/bases/
 	helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set image.repository=distort --set image.tag=latest
+	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl rollout restart -n distort-system deployment distort-manager distort-csi-controller
+	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl rollout restart -n distort-system daemonset distort-agent distort-csi-node
 
 .PHONY: test-e2e
 test-e2e: get-kubeconfig manifests generate fmt vet ## Run the unified Ginkgo E2E tests against Vagrant K3s
