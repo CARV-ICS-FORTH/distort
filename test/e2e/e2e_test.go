@@ -167,6 +167,25 @@ spec:
 				g.Expect(out).To(MatchRegexp(`distort-(worker|master).*`))
 			}).Should(Succeed())
 
+			By("Verifying FreeCapacity decreased on the RDMAStorageNode")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nvmepartition", "e2e-schedule-partition", "-o", "jsonpath={.spec.nodeName}")
+				nodeName, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(nodeName).NotTo(BeEmpty())
+
+				cmd = exec.Command("kubectl", "get", "rdmastoragenode", nodeName, "-o", "jsonpath={.status.totalCapacity}")
+				totalCap, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				cmd = exec.Command("kubectl", "get", "rdmastoragenode", nodeName, "-o", "jsonpath={.status.freeCapacity}")
+				freeCap, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				g.Expect(freeCap).NotTo(Equal(totalCap))
+				g.Expect(freeCap).NotTo(BeEmpty())
+			}).Should(Succeed())
+
 			By("Cleaning up the partition")
 			cmd = exec.Command("kubectl", "delete", "nvmepartition", "e2e-schedule-partition")
 			_, _ = utils.Run(cmd)
