@@ -143,6 +143,12 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	- $(CONTAINER_TOOL) buildx rm distort-builder
 	rm Dockerfile.cross
 
+.PHONY: docker-build-push-multiarch
+docker-build-push-multiarch: ## Build and push docker image for amd64 and arm64 architectures
+	- $(CONTAINER_TOOL) buildx create --name distort-builder --use || true
+	$(CONTAINER_TOOL) buildx build --push --platform=linux/amd64,linux/arm64 --tag ${IMG} .
+	- $(CONTAINER_TOOL) buildx rm distort-builder || true
+
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
