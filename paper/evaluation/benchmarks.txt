@@ -1,0 +1,1612 @@
+root@tie0:~/distort-main# lscpu
+Architecture:                x86_64
+  CPU op-mode(s):            32-bit, 64-bit
+  Address sizes:             48 bits physical, 48 bits virtual
+  Byte Order:                Little Endian
+CPU(s):                      64
+  On-line CPU(s) list:       0-63
+Vendor ID:                   AuthenticAMD
+  BIOS Vendor ID:            Advanced Micro Devices, Inc.
+  Model name:                AMD EPYC 7551P 32-Core Processor
+    BIOS Model name:         AMD EPYC 7551P 32-Core Processor                Unknown CPU @ 2.0GHz
+    BIOS CPU family:         107
+    CPU family:              23
+    Model:                   1
+    Thread(s) per core:      2
+    Core(s) per socket:      32
+    Socket(s):               1
+    Stepping:                2
+    Frequency boost:         enabled
+    CPU(s) scaling MHz:      63%
+    CPU max MHz:             2000.0000
+    CPU min MHz:             1200.0000
+    BogoMIPS:                3991.90
+    Flags:                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse
+                              sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc
+                              cpuid extd_apicid amd_dcm aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_
+                             2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a
+                              misalignsse 3dnowprefetch osvw skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr
+                             _llc mwaitx cpb hw_pstate ssbd ibpb vmmcall fsgsbase bmi1 avx2 smep bmi2 rdseed adx smap clf
+                             lushopt sha_ni xsaveopt xsavec xgetbv1 xsaves clzero xsaveerptr arat npt lbrv svm_lock nrip_
+                             save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vm
+                             load vgif overflow_recov succor smca ibpb_exit_to_user
+Virtualization features:     
+  Virtualization:            AMD-V
+Caches (sum of all):         
+  L1d:                       1 MiB (32 instances)
+  L1i:                       2 MiB (32 instances)
+  L2:                        16 MiB (32 instances)
+  L3:                        64 MiB (8 instances)
+NUMA:                        
+  NUMA node(s):              4
+  NUMA node0 CPU(s):         0-7,32-39
+  NUMA node1 CPU(s):         8-15,40-47
+  NUMA node2 CPU(s):         16-23,48-55
+  NUMA node3 CPU(s):         24-31,56-63
+Vulnerabilities:             
+  Gather data sampling:      Not affected
+  Indirect target selection: Not affected
+  Itlb multihit:             Not affected
+  L1tf:                      Not affected
+  Mds:                       Not affected
+  Meltdown:                  Not affected
+  Mmio stale data:           Not affected
+  Reg file data sampling:    Not affected
+  Retbleed:                  Mitigation; untrained return thunk; SMT vulnerable
+  Spec rstack overflow:      Mitigation; Safe RET
+  Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+  Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+  Spectre v2:                Mitigation; Retpolines; IBPB conditional; STIBP disabled; RSB filling; PBRSB-eIBRS Not affec
+                             ted; BHI Not affected
+  Srbds:                     Not affected
+  Tsa:                       Not affected
+  Tsx async abort:           Not affected
+  Vmscape:                   Mitigation; IBPB before exit to userspace
+root@tie0:~/distort-main# free
+               total        used        free      shared  buff/cache   available
+Mem:       263968064     8470492   253782392       19708     3172136   255497572
+Swap:              0           0           0
+root@tie0:~/distort-main# nvme list
+Node                  Generic               SN                   Model                                    Namespace  Usage                      Format           FW Rev  
+--------------------- --------------------- -------------------- ---------------------------------------- ---------- -------------------------- ---------------- --------
+/dev/nvme0n1          /dev/ng0n1            a3995e9fb82a0dd4ee97 Linux                                    0x1        102.40  GB / 102.40  GB    512   B +  0 B   6.8.0-10
+/dev/nvme1n1          /dev/ng1n1            S4EUNG0M143871A      Samsung SSD 970 EVO Plus 250GB           0x1        116.26  GB / 250.06  GB    512   B +  0 B   1B2QEXM7
+root@tie0:~/distort-main# lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT | grep nvme
+nvme1n1     Samsung SSD 970 EVO Plus 250GB 232.9G disk 
+├─nvme1n1p1                                    1G part /boot/efi
+└─nvme1n1p2                                231.8G part /
+nvme0n1     Linux                           95.4G disk /var/lib/kubelet/pods/d58317d2-9398-4a9c-aaa4-dc4828968cc4/volumes/kubernetes.io~csi/pvc-3926ac1d-45de-4ef4-92a8-8ef605c96500/mount
+
+
+
+
+root@tie1:~# nvme list
+Node                  Generic               SN                   Model                                    Namespace  Usage                      Format           FW Rev  
+--------------------- --------------------- -------------------- ---------------------------------------- ---------- -------------------------- ---------------- --------
+/dev/nvme0n1          /dev/ng0n1            S4EUNG0M143962X      Samsung SSD 970 EVO Plus 250GB           0x1        118.69  GB / 250.06  GB    512   B +  0 B   1B2QEXM7
+/dev/nvme1n1          /dev/ng1n1            S7DPNJ0Y847773T      Samsung SSD 990 PRO 4TB                  0x1         99.97  GB /   4.00  TB    512   B +  0 B   4B2QJXD7
+root@tie1:~# lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT | grep nvme
+nvme0n1     Samsung SSD 970 EVO Plus 250GB 232.9G disk 
+├─nvme0n1p1                                    1G part /boot/efi
+└─nvme0n1p2                                231.8G part /
+nvme1n1     Samsung SSD 990 PRO 4TB          3.6T disk /mnt/nvme
+└─nvme1n1p1                                 95.4G part 
+
+
+
+
+root@tie1:/mnt# ./nvme_test2.sh /dev/nvme1n1
+Testing target: /dev/nvme1n1
+
+Running 4K Random Read IOPS test...
+Running 4K Random Write IOPS test...
+Running 1M Sequential Read Bandwidth test...
+Running 1M Sequential Write Bandwidth test...
+
+==============================
+           RESULTS
+==============================
+
+4K Random Read:
+  IOPS        : 887212
+  Avg Lat (us): 570.98
+  P99 Lat (us): 1073.15
+
+4K Random Write:
+  IOPS        : 846046
+  Avg Lat (us): 600.24
+  P99 Lat (us): 1044.48
+
+1M Sequential Read:
+  BW (MiB/s)  : 3559.67
+  Avg Lat (us): 8865.60
+  P99 Lat (us): 8978.43
+
+1M Sequential Write:
+  BW (MiB/s)  : 3379.14
+  Avg Lat (us): 9334.05
+  P99 Lat (us): 18219.01
+
+==============================
+root@tie1:/mnt# ./nvme_test2.sh /dev/nvme1n1
+Testing target: /dev/nvme1n1
+
+Running 4K Random Read IOPS test...
+Running 4K Random Write IOPS test...
+Running 1M Sequential Read Bandwidth test...
+Running 1M Sequential Write Bandwidth test...
+
+==============================
+           RESULTS
+==============================
+
+4K Random Read:
+  IOPS        : 887389
+  Avg Lat (us): 571.02
+  P99 Lat (us): 1036.29
+
+4K Random Write:
+  IOPS        : 845185
+  Avg Lat (us): 600.61
+  P99 Lat (us): 1044.48
+
+1M Sequential Read:
+  BW (MiB/s)  : 3559.77
+  Avg Lat (us): 8878.36
+  P99 Lat (us): 8978.43
+
+1M Sequential Write:
+  BW (MiB/s)  : 3377.97
+  Avg Lat (us): 9347.44
+  P99 Lat (us): 18219.01
+
+==============================
+
+
+
+
+
+
+
+
+root@tie1:/mnt# mkfs.xfs -f /dev/nvme1n1
+meta-data=/dev/nvme1n1           isize=512    agcount=4, agsize=244188662 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=1
+         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                       bsize=4096   blocks=976754646, imaxpct=5
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=476930, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+Discarding blocks...Done.
+root@tie1:/mnt# mkdir nvme
+root@tie1:/mnt# mount -o noatime,nodiratime /dev/nvme1n1 /mnt/nvme
+root@tie1:/mnt# dd if=/dev/zero of=/mnt/nvme/fiofile bs=1M count=100000 oflag=direct
+
+
+root@tie1:/mnt# ./nvme_test_fs2.sh /mnt/nvme/fiofile 
+Dropping caches...
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 887271
+  Avg Lat (us): 569.59
+  P99 Lat (us): 847.87
+
+4K Random Write:
+  IOPS        : 842382
+  Avg Lat (us): 599.90
+  P99 Lat (us): 872.45
+
+1M Sequential Read:
+  MiB/s       : 2481.42
+  Avg Lat (us): 12742.93
+  P99 Lat (us): 13041.66
+
+1M Sequential Write:
+  MiB/s       : 3377.76
+  Avg Lat (us): 9336.83
+  P99 Lat (us): 18219.01
+
+================================
+root@tie1:/mnt# ./nvme_test_fs2.sh /mnt/nvme/fiofile 
+Dropping caches...
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 887277
+  Avg Lat (us): 569.65
+  P99 Lat (us): 684.03
+
+4K Random Write:
+  IOPS        : 841978
+  Avg Lat (us): 600.10
+  P99 Lat (us): 798.72
+
+1M Sequential Read:
+  MiB/s       : 2479.14
+  Avg Lat (us): 12774.03
+  P99 Lat (us): 13041.66
+
+1M Sequential Write:
+  MiB/s       : 3377.77
+  Avg Lat (us): 9340.39
+  P99 Lat (us): 18219.01
+
+================================
+root@tie1:/mnt# ./nvme_test_fs2.sh /mnt/nvme/fiofile 
+Dropping caches...
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 887035
+  Avg Lat (us): 569.74
+  P99 Lat (us): 708.61
+
+4K Random Write:
+  IOPS        : 838991
+  Avg Lat (us): 602.25
+  P99 Lat (us): 839.68
+
+1M Sequential Read:
+  MiB/s       : 2495.89
+  Avg Lat (us): 12682.07
+  P99 Lat (us): 13041.66
+
+1M Sequential Write:
+  MiB/s       : 3377.54
+  Avg Lat (us): 9346.25
+  P99 Lat (us): 18219.01
+
+================================
+
+
+
+
+
+
+
+root@tie1:/mnt#   ctr images pull docker.io/library/ubuntu:24.04
+root@tie1:/mnt#  ctr run --rm   --mount type=bind,src=/mnt,dst=/data,options=rbind:rw   --tty  --net-host docker.io/library/ubuntu:24.04 nvme-test /bin/bash
+root@tie1:/# apt-get update && apt-get install fio jq
+
+root@tie1:/data# ./nvme_test_fs2.sh /data/nvme/fiofile 
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 887026
+  Avg Lat (us): 569.96
+  P99 Lat (us): 790.53
+
+4K Random Write:
+  IOPS        : 845084
+  Avg Lat (us): 597.91
+  P99 Lat (us): 782.34
+
+1M Sequential Read:
+  MiB/s       : 2453.85
+  Avg Lat (us): 12915.05
+  P99 Lat (us): 13172.74
+
+1M Sequential Write:
+  MiB/s       : 3378.74
+  Avg Lat (us): 9344.62
+  P99 Lat (us): 18219.01
+
+================================
+root@tie1:/data# ./nvme_test_fs2.sh /data/nvme/fiofile 
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 878817
+  Avg Lat (us): 575.01
+  P99 Lat (us): 684.03
+
+4K Random Write:
+  IOPS        : 841915
+  Avg Lat (us): 600.25
+  P99 Lat (us): 913.41
+
+1M Sequential Read:
+  MiB/s       : 2467.96
+  Avg Lat (us): 12834.28
+  P99 Lat (us): 13041.66
+
+1M Sequential Write:
+  MiB/s       : 3377.57
+  Avg Lat (us): 9345.84
+  P99 Lat (us): 18219.01
+
+================================
+root@tie1:/data# ./nvme_test_fs2.sh /data/nvme/fiofile 
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 887596
+  Avg Lat (us): 569.48
+  P99 Lat (us): 700.42
+
+4K Random Write:
+  IOPS        : 843258
+  Avg Lat (us): 599.35
+  P99 Lat (us): 880.64
+
+1M Sequential Read:
+  MiB/s       : 2469.36
+  Avg Lat (us): 12837.18
+  P99 Lat (us): 13172.74
+
+1M Sequential Write:
+  MiB/s       : 3377.91
+  Avg Lat (us): 9325.14
+  P99 Lat (us): 18219.01
+
+================================
+
+
+
+
+
+
+
+Install Kubernetes, OpenEBS
+
+helm install openebs --namespace openebs openebs/openebs --set engines.local.zfs.enabled=false --create-namespace
+
+
+
+# kubectl get nodes -o wide
+NAME   STATUS   ROLES           AGE   VERSION   INTERNAL-IP     EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION     CONTAINER-RUNTIME
+tie0   Ready    control-plane   19h   v1.35.1   192.168.5.130   <none>        Ubuntu 24.04.3 LTS   6.8.0-85-generic   containerd://2.2.1
+tie1   Ready    <none>          19h   v1.35.1   192.168.5.131   <none>        Ubuntu 24.04.3 LTS   6.8.0-83-generic   containerd://2.2.1
+tie2   Ready    <none>          18m   v1.35.1   192.168.5.132   <none>        Ubuntu 24.04.3 LTS   6.8.0-83-generic   containerd://2.2.1
+
+
+
+# kubectl get pods -A -o wide
+NAMESPACE      NAME                                              READY   STATUS    RESTARTS      AGE   IP              NODE   NOMINATED NODE   READINESS GATES
+kube-flannel   kube-flannel-ds-2dxtp                             1/1     Running   1 (19h ago)   19h   192.168.5.130   tie0   <none>           <none>
+kube-flannel   kube-flannel-ds-bxwsq                             1/1     Running   0             18m   192.168.5.132   tie2   <none>           <none>
+kube-flannel   kube-flannel-ds-v5h22                             1/1     Running   1 (19h ago)   19h   192.168.5.131   tie1   <none>           <none>
+kube-system    coredns-7d764666f9-4p7fl                          1/1     Running   1 (19h ago)   19h   10.244.0.183    tie0   <none>           <none>
+kube-system    coredns-7d764666f9-zpkgg                          1/1     Running   1 (19h ago)   19h   10.244.0.184    tie0   <none>           <none>
+kube-system    etcd-tie0                                         1/1     Running   2 (19h ago)   19h   192.168.5.130   tie0   <none>           <none>
+kube-system    kube-apiserver-tie0                               1/1     Running   2 (19h ago)   19h   192.168.5.130   tie0   <none>           <none>
+kube-system    kube-controller-manager-tie0                      1/1     Running   1 (19h ago)   19h   192.168.5.130   tie0   <none>           <none>
+kube-system    kube-proxy-6rc25                                  1/1     Running   0             18m   192.168.5.132   tie2   <none>           <none>
+kube-system    kube-proxy-9qsr5                                  1/1     Running   1 (19h ago)   19h   192.168.5.130   tie0   <none>           <none>
+kube-system    kube-proxy-xkhw2                                  1/1     Running   1 (19h ago)   19h   192.168.5.131   tie1   <none>           <none>
+kube-system    kube-scheduler-tie0                               1/1     Running   2 (19h ago)   19h   192.168.5.130   tie0   <none>           <none>
+openebs        openebs-agent-core-78ff45c5cf-dvdqh               2/2     Running   0             26m   10.244.1.9      tie1   <none>           <none>
+openebs        openebs-agent-ha-node-79jc8                       1/1     Running   0             14m   192.168.5.130   tie0   <none>           <none>
+openebs        openebs-agent-ha-node-kpzm2                       1/1     Running   0             26m   192.168.5.131   tie1   <none>           <none>
+openebs        openebs-agent-ha-node-n8jwd                       1/1     Running   0             18m   192.168.5.132   tie2   <none>           <none>
+openebs        openebs-alloy-9p6bz                               2/2     Running   0             14m   10.244.0.186    tie0   <none>           <none>
+openebs        openebs-alloy-dvwwb                               2/2     Running   0             18m   10.244.2.26     tie2   <none>           <none>
+openebs        openebs-alloy-npfv9                               2/2     Running   0             26m   10.244.1.3      tie1   <none>           <none>
+openebs        openebs-api-rest-7d586fcd5d-vjprj                 1/1     Running   0             26m   10.244.1.8      tie1   <none>           <none>
+openebs        openebs-csi-controller-64ccd8f68d-ll7gr           6/6     Running   0             26m   192.168.5.131   tie1   <none>           <none>
+openebs        openebs-csi-node-7gsr8                            2/2     Running   0             26m   192.168.5.131   tie1   <none>           <none>
+openebs        openebs-csi-node-b6j57                            2/2     Running   0             14m   192.168.5.130   tie0   <none>           <none>
+openebs        openebs-csi-node-pz6n4                            2/2     Running   0             18m   192.168.5.132   tie2   <none>           <none>
+openebs        openebs-etcd-0                                    1/1     Running   6 (17m ago)   26m   10.244.1.18     tie1   <none>           <none>
+openebs        openebs-etcd-1                                    1/1     Running   0             26m   10.244.0.191    tie0   <none>           <none>
+openebs        openebs-etcd-2                                    1/1     Running   3 (14m ago)   26m   10.244.2.31     tie2   <none>           <none>
+openebs        openebs-localpv-provisioner-6f9447fcc9-8vr4b      1/1     Running   0             26m   10.244.1.2      tie1   <none>           <none>
+openebs        openebs-loki-0                                    2/2     Running   0             26m   10.244.1.21     tie1   <none>           <none>
+openebs        openebs-loki-1                                    2/2     Running   0             26m   10.244.0.190    tie0   <none>           <none>
+openebs        openebs-loki-2                                    2/2     Running   0             26m   10.244.2.30     tie2   <none>           <none>
+openebs        openebs-lvm-localpv-controller-5996c4fbfc-2pcwl   5/5     Running   0             26m   10.244.1.6      tie1   <none>           <none>
+openebs        openebs-lvm-localpv-node-gl5cs                    2/2     Running   0             26m   10.244.1.10     tie1   <none>           <none>
+openebs        openebs-lvm-localpv-node-hbmwc                    2/2     Running   0             18m   10.244.2.28     tie2   <none>           <none>
+openebs        openebs-lvm-localpv-node-r5xc7                    2/2     Running   0             14m   10.244.0.187    tie0   <none>           <none>
+openebs        openebs-minio-0                                   1/1     Running   0             26m   10.244.1.19     tie1   <none>           <none>
+openebs        openebs-minio-1                                   1/1     Running   0             26m   10.244.1.16     tie1   <none>           <none>
+openebs        openebs-minio-2                                   1/1     Running   0             26m   10.244.1.20     tie1   <none>           <none>
+openebs        openebs-nats-0                                    3/3     Running   0             26m   10.244.1.7      tie1   <none>           <none>
+openebs        openebs-nats-1                                    3/3     Running   0             26m   10.244.0.185    tie0   <none>           <none>
+openebs        openebs-nats-2                                    3/3     Running   0             26m   10.244.2.27     tie2   <none>           <none>
+openebs        openebs-obs-callhome-6b94998b96-zlczj             2/2     Running   4 (15m ago)   26m   10.244.1.5      tie1   <none>           <none>
+openebs        openebs-operator-diskpool-64b7488945-6w82f        1/1     Running   0             26m   10.244.1.4      tie1   <none>           <none>
+
+
+
+root@tie1:/var/openebs/local# mkfs.xfs -f /dev/nvme1n1
+meta-data=/dev/nvme1n1           isize=512    agcount=4, agsize=244188662 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=1
+         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                       bsize=4096   blocks=976754646, imaxpct=5
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=476930, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+Discarding blocks...Done.
+root@tie1:/var/openebs/local# cd ..
+root@tie1:/var/openebs# mount -o noatime,nodiratime /dev/nvme1n1 /var/openebs/local
+
+
+
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hostpath-pvc-tie1
+spec:
+  storageClassName: openebs-hostpath # Uses the existing default SC
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ubuntu-hostpath-tie1
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: tie1
+  containers:
+  - name: ubuntu
+    image: ubuntu:24.04
+    command: ["sleep"]
+    args: ["infinity"]
+    volumeMounts:
+    - mountPath: /data
+      name: storage-volume
+  volumes:
+  - name: storage-volume
+    persistentVolumeClaim:
+      claimName: hostpath-pvc-tie1
+
+
+
+
+root@ubuntu-hostpath-tie1:/data# dd if=/dev/zero of=fiofile bs=1M count=100000 oflag=direct
+100000+0 records in
+100000+0 records out
+104857600000 bytes (105 GB, 98 GiB) copied, 47.6556 s, 2.2 GB/s
+root@ubuntu-hostpath-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 878464
+  Avg Lat (us): 575.17
+  P99 Lat (us): 700.42
+
+4K Random Write:
+  IOPS        : 843413
+  Avg Lat (us): 598.96
+  P99 Lat (us): 724.99
+
+1M Sequential Read:
+  MiB/s       : 2395.33
+  Avg Lat (us): 13218.37
+  P99 Lat (us): 13565.95
+
+1M Sequential Write:
+  MiB/s       : 3376.94
+  Avg Lat (us): 9337.54
+  P99 Lat (us): 18219.01
+
+================================
+root@ubuntu-hostpath-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 882029
+  Avg Lat (us): 572.89
+  P99 Lat (us): 708.61
+
+4K Random Write:
+  IOPS        : 838980
+  Avg Lat (us): 602.15
+  P99 Lat (us): 790.53
+
+1M Sequential Read:
+  MiB/s       : 2493.15
+  Avg Lat (us): 12676.42
+  P99 Lat (us): 13041.66
+
+1M Sequential Write:
+  MiB/s       : 3376.84
+  Avg Lat (us): 9360.76
+  P99 Lat (us): 18219.01
+
+================================
+root@ubuntu-hostpath-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 881410
+  Avg Lat (us): 573.26
+  P99 Lat (us): 724.99
+
+4K Random Write:
+  IOPS        : 839687
+  Avg Lat (us): 601.67
+  P99 Lat (us): 757.76
+
+1M Sequential Read:
+  MiB/s       : 2482.29
+  Avg Lat (us): 12729.82
+  P99 Lat (us): 13041.66
+
+1M Sequential Write:
+  MiB/s       : 3377.51
+  Avg Lat (us): 9362.70
+  P99 Lat (us): 18219.01
+
+================================
+
+
+
+
+
+
+
+
+
+
+root@tie1:~# pvcreate /dev/nvme1n1
+WARNING: xfs signature detected on /dev/nvme1n1 at offset 0. Wipe it? [y/n]: y
+  Wiping xfs signature on /dev/nvme1n1.
+  Physical volume "/dev/nvme1n1" successfully created.
+root@tie1:~# vgcreate openebs-nvme-vg /dev/nvme1n1
+  Volume group "openebs-nvme-vg" successfully created
+
+
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-lvm
+provisioner: local.csi.openebs.io
+parameters:
+  volgroup: "openebs-nvme-vg"
+  storage: "lvm"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lvm-pvc-tie1
+spec:
+  storageClassName: openebs-lvm
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ubuntu-lvm-tie1
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: tie1
+  containers:
+  - name: ubuntu
+    image: ubuntu:24.04
+    command: ["sleep"]
+    args: ["infinity"]
+    volumeMounts:
+    - mountPath: /data
+      name: storage-volume
+  volumes:
+  - name: storage-volume
+    persistentVolumeClaim:
+      claimName: lvm-pvc-tie1
+
+
+
+root@ubuntu-lvm-tie1:/data# dd if=/dev/zero of=fiofile bs=1M count=80000 oflag=direct
+80000+0 records in
+80000+0 records out
+83886080000 bytes (84 GB, 78 GiB) copied, 37.3436 s, 2.2 GB/s
+
+
+
+
+
+
+root@ubuntu-lvm-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 801650
+  Avg Lat (us): 629.94
+  P99 Lat (us): 823.30
+
+4K Random Write:
+  IOPS        : 721790
+  Avg Lat (us): 699.53
+  P99 Lat (us): 913.41
+
+1M Sequential Read:
+  MiB/s       : 2430.20
+  Avg Lat (us): 13001.12
+  P99 Lat (us): 13303.81
+
+1M Sequential Write:
+  MiB/s       : 3377.77
+  Avg Lat (us): 9319.27
+  P99 Lat (us): 17956.86
+
+================================
+root@ubuntu-lvm-tie1:/data# 
+root@ubuntu-lvm-tie1:/data# 
+root@ubuntu-lvm-tie1:/data# 
+root@ubuntu-lvm-tie1:/data# 
+root@ubuntu-lvm-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 826081
+  Avg Lat (us): 611.31
+  P99 Lat (us): 1028.10
+
+4K Random Write:
+  IOPS        : 719307
+  Avg Lat (us): 702.02
+  P99 Lat (us): 905.22
+
+1M Sequential Read:
+  MiB/s       : 2423.94
+  Avg Lat (us): 13055.67
+  P99 Lat (us): 13303.81
+
+1M Sequential Write:
+  MiB/s       : 3376.07
+  Avg Lat (us): 9359.28
+  P99 Lat (us): 18219.01
+
+================================
+root@ubuntu-lvm-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 802970
+  Avg Lat (us): 628.91
+  P99 Lat (us): 823.30
+
+4K Random Write:
+  IOPS        : 733152
+  Avg Lat (us): 688.71
+  P99 Lat (us): 880.64
+
+1M Sequential Read:
+  MiB/s       : 2414.49
+  Avg Lat (us): 13097.14
+  P99 Lat (us): 13434.88
+
+1M Sequential Write:
+  MiB/s       : 3377.07
+  Avg Lat (us): 9318.69
+  P99 Lat (us): 18219.01
+
+================================
+root@ubuntu-lvm-tie1:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 793330
+  Avg Lat (us): 636.58
+  P99 Lat (us): 815.10
+
+4K Random Write:
+  IOPS        : 750091
+  Avg Lat (us): 673.29
+  P99 Lat (us): 847.87
+
+1M Sequential Read:
+  MiB/s       : 2212.03
+  Avg Lat (us): 14281.84
+  P99 Lat (us): 14876.67
+
+1M Sequential Write:
+  MiB/s       : 3377.21
+  Avg Lat (us): 9326.54
+  P99 Lat (us): 18219.01
+
+================================
+
+
+
+
+
+root@tie0:~/test-yaml# modprobe nvme_fabrics
+root@tie0:~/test-yaml# modprobe nvme_rdma
+root@tie0:~/test-yaml# echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+root@tie0:~# sysctl -w vm.nr_hugepages=1024
+vm.nr_hugepages = 1024
+
+root@tie1:~# modprobe nvme_fabrics
+root@tie1:~# modprobe nvme_rdma
+root@tie1:~# echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+root@tie1:~# sysctl -w vm.nr_hugepages=1024
+vm.nr_hugepages = 1024
+
+root@tie0:~# kubectl label node tie1 openebs.io/engine=mayastor
+kubectl label node tie2 openebs.io/engine=mayastor
+node/tie1 labeled
+node/tie2 labeled
+
+
+apiVersion: "openebs.io/v1beta3"
+kind: DiskPool
+metadata:
+  name: pool-tie1
+  namespace: openebs
+spec:
+  node: tie1
+  disks: ["aio:///dev/disk/by-id/nvme-eui.0025384851439fec"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mayastor-pvc-tie0
+spec:
+  storageClassName: openebs-single-replica # Uses the existing default SC
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-mayastor-tie0
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: tie0
+  containers:
+  - name: ubuntu
+    image: ubuntu:24.04
+    command: ["sleep"]
+    args: ["infinity"]
+    volumeMounts:
+    - mountPath: /data
+      name: storage-volume
+  volumes:
+  - name: storage-volume
+    persistentVolumeClaim:
+      claimName: mayastor-pvc-tie0
+
+
+root@pod-mayastor-tie0:/data# dd if=/dev/zero of=fiofile bs=1M count=80000 oflag=direct
+80000+0 records in
+80000+0 records out
+83886080000 bytes (84 GB, 78 GiB) copied, 161.076 s, 521 MB/s
+
+
+
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 82614
+  Avg Lat (us): 6101.19
+  P99 Lat (us): 10813.44
+
+4K Random Write:
+  IOPS        : 91434
+  Avg Lat (us): 5513.91
+  P99 Lat (us): 12648.45
+
+1M Sequential Read:
+  MiB/s       : 1031.73
+  Avg Lat (us): 30023.55
+  P99 Lat (us): 43778.05
+
+1M Sequential Write:
+  MiB/s       : 892.45
+  Avg Lat (us): 34714.37
+  P99 Lat (us): 48496.64
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 117877
+  Avg Lat (us): 4276.00
+  P99 Lat (us): 8978.43
+
+4K Random Write:
+  IOPS        : 91137
+  Avg Lat (us): 5531.66
+  P99 Lat (us): 12648.45
+
+1M Sequential Read:
+  MiB/s       : 1023.83
+  Avg Lat (us): 30252.57
+  P99 Lat (us): 42729.47
+
+1M Sequential Write:
+  MiB/s       : 886.52
+  Avg Lat (us): 34955.17
+  P99 Lat (us): 49020.93
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 130198
+  Avg Lat (us): 3871.43
+  P99 Lat (us): 7962.62
+
+4K Random Write:
+  IOPS        : 95982
+  Avg Lat (us): 5252.36
+  P99 Lat (us): 11468.80
+
+1M Sequential Read:
+  MiB/s       : 1314.52
+  Avg Lat (us): 23565.48
+  P99 Lat (us): 37486.59
+
+1M Sequential Write:
+  MiB/s       : 877.86
+  Avg Lat (us): 35301.01
+  P99 Lat (us): 47448.06
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 105664
+  Avg Lat (us): 4769.42
+  P99 Lat (us): 10027.01
+
+4K Random Write:
+  IOPS        : 85417
+  Avg Lat (us): 5901.75
+  P99 Lat (us): 13565.95
+
+1M Sequential Read:
+  MiB/s       : 1053.69
+  Avg Lat (us): 29402.90
+  P99 Lat (us): 42205.18
+
+1M Sequential Write:
+  MiB/s       : 900.85
+  Avg Lat (us): 34399.87
+  P99 Lat (us): 47972.35
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 118394
+  Avg Lat (us): 4257.22
+  P99 Lat (us): 9109.50
+
+4K Random Write:
+  IOPS        : 68172
+  Avg Lat (us): 7394.11
+  P99 Lat (us): 15532.03
+
+1M Sequential Read:
+  MiB/s       : 1051.82
+  Avg Lat (us): 29457.49
+  P99 Lat (us): 42729.47
+
+1M Sequential Write:
+  MiB/s       : 891.18
+  Avg Lat (us): 34757.53
+  P99 Lat (us): 49545.22
+
+================================
+
+
+
+root@tie0:~# helm delete -n openebs openebs
+
+root@tie0:~# helm install -n openebs openebs openebs/openebs --version=4.4.0 --set engines.local.zfs.enabled=false --set mayastor.io_engine.target.nvmf.rdma.enabled=true --set mayastor.io_engine.target.nvmf.iface="subnet:192.168.5.0/24"
+
+
+
+
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 268186
+  Avg Lat (us): 1880.21
+  P99 Lat (us): 3522.56
+
+4K Random Write:
+  IOPS        : 272487
+  Avg Lat (us): 1851.28
+  P99 Lat (us): 3653.63
+
+1M Sequential Read:
+  MiB/s       : 3546.46
+  Avg Lat (us): 8735.96
+  P99 Lat (us): 9633.79
+
+1M Sequential Write:
+  MiB/s       : 3373.44
+  Avg Lat (us): 9189.43
+  P99 Lat (us): 17956.86
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 248547
+  Avg Lat (us): 2028.54
+  P99 Lat (us): 3948.54
+
+4K Random Write:
+  IOPS        : 184322
+  Avg Lat (us): 2735.61
+  P99 Lat (us): 4423.68
+
+1M Sequential Read:
+  MiB/s       : 3547.43
+  Avg Lat (us): 8737.22
+  P99 Lat (us): 9764.86
+
+1M Sequential Write:
+  MiB/s       : 3374.01
+  Avg Lat (us): 9188.48
+  P99 Lat (us): 17956.86
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 265038
+  Avg Lat (us): 1902.54
+  P99 Lat (us): 3555.33
+
+4K Random Write:
+  IOPS        : 241951
+  Avg Lat (us): 2084.65
+  P99 Lat (us): 3817.47
+
+1M Sequential Read:
+  MiB/s       : 3541.63
+  Avg Lat (us): 8747.66
+  P99 Lat (us): 9764.86
+
+1M Sequential Write:
+  MiB/s       : 3371.94
+  Avg Lat (us): 9194.19
+  P99 Lat (us): 17956.86
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 268795
+  Avg Lat (us): 1876.09
+  P99 Lat (us): 3719.17
+
+4K Random Write:
+  IOPS        : 182800
+  Avg Lat (us): 2758.50
+  P99 Lat (us): 4423.68
+
+1M Sequential Read:
+  MiB/s       : 3551.46
+  Avg Lat (us): 8727.47
+  P99 Lat (us): 9502.72
+
+1M Sequential Write:
+  MiB/s       : 3373.88
+  Avg Lat (us): 9188.26
+  P99 Lat (us): 17956.86
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 265654
+  Avg Lat (us): 1898.13
+  P99 Lat (us): 3653.63
+
+4K Random Write:
+  IOPS        : 232179
+  Avg Lat (us): 2172.34
+  P99 Lat (us): 3915.78
+
+1M Sequential Read:
+  MiB/s       : 3542.70
+  Avg Lat (us): 8744.03
+  P99 Lat (us): 9764.86
+
+1M Sequential Write:
+  MiB/s       : 3374.84
+  Avg Lat (us): 9185.85
+  P99 Lat (us): 17432.58
+
+================================
+root@pod-mayastor-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 228407
+  Avg Lat (us): 2207.50
+  P99 Lat (us): 4046.85
+
+4K Random Write:
+  IOPS        : 226587
+  Avg Lat (us): 2225.96
+  P99 Lat (us): 3948.54
+
+1M Sequential Read:
+  MiB/s       : 3543.90
+  Avg Lat (us): 8742.96
+  P99 Lat (us): 9764.86
+
+1M Sequential Write:
+  MiB/s       : 3369.21
+  Avg Lat (us): 9201.55
+  P99 Lat (us): 17956.86
+
+================================
+
+root@pod-mayastor-tie0:/# mount | grep data
+/dev/nvme2n1 on /data type ext4 (rw,relatime,stripe=32)
+
+
+
+
+
+
+root@tie0:~# helm upgrade --install --create-namespace --namespace piraeus-datastore piraeus-operator oci://ghcr.io/piraeusdatastore/piraeus-operator/piraeus --set installCRDs=true --wait
+root@tie0:~# helm upgrade --install --namespace piraeus-datastore linstor-cluster oci://ghcr.io/piraeusdatastore/helm-charts/linstor-cluster
+
+
+root@tie1:~# pvcreate /dev/nvme1n1
+  Physical volume "/dev/nvme1n1" successfully created.
+root@tie1:~# vgcreate vg_nvme /dev/nvme1n1
+  Volume group "vg_nvme" successfully created
+root@tie1:~# lvcreate -L 800G -T vg_nvme/thinpool
+  Thin pool volume with chunk size 512.00 KiB can address at most 127.00 TiB of data.
+  WARNING: Pool zeroing and 512.00 KiB large chunk size slows down thin provisioning.
+  WARNING: Consider disabling zeroing (-Zn) or using smaller chunk size (<512.00 KiB).
+  Logical volume "thinpool" created.
+
+
+root@linstor-controller-778b875b56-dkzbm:/# linstor storage-pool create lvmthin tie1 nvme-pool vg_nvme/thinpool
+SUCCESS:
+    Successfully set property key(s): StorDriver/StorPoolName
+SUCCESS:
+Description:
+    New storage pool 'nvme-pool' on node 'tie1' registered.
+Details:
+    Storage pool 'nvme-pool' on node 'tie1' UUID is: 1da82ca3-60a7-4e8f-9731-5f368cd79220
+SUCCESS:
+    (tie1) Changes applied to storage pool 'nvme-pool' of node 'tie1'
+SUCCESS:
+    Storage pool updated on 'tie1'
+root@linstor-controller-778b875b56-dkzbm:/# linstor storage-pool list
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+┊ StoragePool          ┊ Node ┊ Driver   ┊ PoolName         ┊ FreeCapacity ┊ TotalCapacity ┊ CanSnapshots ┊ State ┊ SharedName                ┊
+╞═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
+┊ DfltDisklessStorPool ┊ tie0 ┊ DISKLESS ┊                  ┊              ┊               ┊ False        ┊ Ok    ┊ tie0;DfltDisklessStorPool ┊
+┊ DfltDisklessStorPool ┊ tie1 ┊ DISKLESS ┊                  ┊              ┊               ┊ False        ┊ Ok    ┊ tie1;DfltDisklessStorPool ┊
+┊ DfltDisklessStorPool ┊ tie2 ┊ DISKLESS ┊                  ┊              ┊               ┊ False        ┊ Ok    ┊ tie2;DfltDisklessStorPool ┊
+┊ nvme-pool            ┊ tie1 ┊ LVM_THIN ┊ vg_nvme/thinpool ┊      800 GiB ┊       800 GiB ┊ True         ┊ Ok    ┊ tie1;nvme-pool            ┊
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource-group create fast-rdma-group \
+  --storage-pool nvme-pool \
+  --place-count 1
+SUCCESS:
+Description:
+    New resource group 'fast-rdma-group' created.
+Details:
+    Resource group 'fast-rdma-group' UUID is: 40b41e9c-e845-4807-a8b3-52dbf4119337
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource-group list
+╭────────────────────────────────────────────────────────────────────╮
+┊ ResourceGroup   ┊ SelectFilter              ┊ VlmNrs ┊ Description ┊
+╞════════════════════════════════════════════════════════════════════╡
+┊ DfltRscGrp      ┊ PlaceCount: 2             ┊        ┊             ┊
+╞┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄╡
+┊ fast-rdma-group ┊ PlaceCount: 1             ┊        ┊             ┊
+┊                 ┊ StoragePool(s): nvme-pool ┊        ┊             ┊
+╰────────────────────────────────────────────────────────────────────╯
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource-group set-property fast-rdma-group \
+  DrbdOptions/Net/transport rdma
+SUCCESS:
+    Successfully set property key(s): DrbdOptions/Net/transport
+SUCCESS:
+Description:
+    Resource group 'fast-rdma-group' modified.
+Details:
+    Resource group 'fast-rdma-group' UUID is: 40b41e9c-e845-4807-a8b3-52dbf4119337
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource-group list-properties fast-rdma-group
+╭───────────────────────────────────╮
+┊ Key                       ┊ Value ┊
+╞═══════════════════════════════════╡
+┊ DrbdOptions/Net/transport ┊ rdma  ┊
+╰───────────────────────────────────╯
+
+
+
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource-definition create vol1 --resource-group fast-rdma-group
+SUCCESS:
+Description:
+    New resource definition 'vol1' created.
+Details:
+    Resource definition 'vol1' UUID is: e02cced0-51be-4015-b879-f190e7660983
+root@linstor-controller-778b875b56-dkzbm:/# linstor volume-definition create vol1 500G
+SUCCESS:
+    New volume definition with number '0' of resource definition 'vol1' created.
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource create --auto-place 1 vol1
+SUCCESS:
+    Successfully set property key(s): StorPoolName
+SUCCESS:
+Description:
+    Resource 'vol1' successfully autoplaced on 1 nodes
+Details:
+    Used nodes (storage pool name): 'tie1 (nvme-pool)'
+INFO:
+    Updated vol1 DRBD auto verify algorithm to 'sha256'
+SUCCESS:
+    (tie1) Volume number 0 of resource 'vol1' [LVM-Thin] created
+SUCCESS:
+    (tie1) Resource 'vol1' [DRBD] adjusted.
+SUCCESS:
+    Created resource 'vol1' on 'tie1'
+SUCCESS:
+    (tie1) Resource 'vol1' [DRBD] adjusted.
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource create tie0 vol1 --drbd-diskless
+SUCCESS:
+Description:
+    New resource 'vol1' on node 'tie0' registered.
+Details:
+    Resource 'vol1' on node 'tie0' UUID is: c5c7b5dc-505d-4fb0-9a82-c34da47216fb
+SUCCESS:
+Description:
+    Volume with number '0' on resource 'vol1' on node 'tie0' successfully registered
+Details:
+    Volume UUID is: 0e699b48-d0e4-4434-9900-22ef8cfae635
+ERROR:
+    (tie1) Failed to adjust DRBD resource vol1
+Show reports:
+    linstor error-reports show 69A16015-FE329-000000
+ERROR:
+Description:
+    (tie0) Failed to restore resource file from backup of resource 'vol1'
+Correction:
+    - Check whether enough free space is available for the creation of the file
+    - Check whether the application has write access to the target directory
+    - Check whether the storage is operating flawlessly
+Details:
+    The error reported by the runtime environment or operating system is:
+    /var/lib/linstor.d/.backup/vol1.res
+Show reports:
+    linstor error-reports show 69A16019-30A06-000000
+root@linstor-controller-778b875b56-dkzbm:/# linstor resource list
+╭──────────────────────────────────────────────────────────────────────────────────────╮
+┊ ResourceName ┊ Node ┊ Layers       ┊ Usage  ┊ Conns ┊    State ┊ CreatedOn           ┊
+╞══════════════════════════════════════════════════════════════════════════════════════╡
+┊ vol1         ┊ tie0 ┊ DRBD,STORAGE ┊ Unused ┊ Ok    ┊ Diskless ┊                     ┊
+┊ vol1         ┊ tie1 ┊ DRBD,STORAGE ┊ Unused ┊ Ok    ┊ UpToDate ┊ 2026-02-27 16:06:00 ┊
+╰──────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+wget https://pkg.linbit.com//downloads/drbd/9/drbd-9.3.0.tar.gz
+tar -zxvf drbd-9.3.0.tar.gz 
+cd drbd-9.3.0/
+ls
+make
+make install
+
+
+
+insmod /lib/modules/6.8.0-101-generic/updates/drbd.ko
+insmod /lib/modules/6.8.0-101-generic/updates/drbd_transport_rdma.ko
+
+
+
+
+
+
+
+
+
+
+
+helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set image.repository=chazapis/distort --set image.tag=20260303
+
+
+
+root@tie0:~/distort-test# cat nvmedeviceclaim.yaml 
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: e2e-test-claim
+spec:
+  serialNumber: S7DPNJ0Y847773T
+root@tie0:~/distort-test# cat storageclass.yaml 
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: distort-csi-sc
+provisioner: storage.distort.io
+volumeBindingMode: WaitForFirstConsumer
+root@tie0:~/distort-test# cat pod.yaml 
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: distort-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: distort-csi-sc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-distort-tie0
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: tie0
+  containers:
+  - name: ubuntu
+    image: ubuntu:24.04
+    command: ["sleep"]
+    args: ["infinity"]
+    volumeMounts:
+    - mountPath: /data
+      name: storage-volume
+  volumes:
+  - name: storage-volume
+    persistentVolumeClaim:
+      claimName: distort-pvc
+
+
+
+
+
+
+
+
+
+root@pod-distort-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 137391
+  Avg Lat (us): 3675.58
+  P99 Lat (us): 4227.07
+
+4K Random Write:
+  IOPS        : 142743
+  Avg Lat (us): 3556.40
+  P99 Lat (us): 5275.65
+
+1M Sequential Read:
+  MiB/s       : 3547.44
+  Avg Lat (us): 8946.30
+  P99 Lat (us): 11468.80
+
+1M Sequential Write:
+  MiB/s       : 3344.25
+  Avg Lat (us): 9442.75
+  P99 Lat (us): 18219.01
+
+================================
+root@pod-distort-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 135630
+  Avg Lat (us): 3727.60
+  P99 Lat (us): 4358.14
+
+4K Random Write:
+  IOPS        : 137992
+  Avg Lat (us): 3677.02
+  P99 Lat (us): 7045.12
+
+1M Sequential Read:
+  MiB/s       : 3531.81
+  Avg Lat (us): 8964.38
+  P99 Lat (us): 12517.38
+
+1M Sequential Write:
+  MiB/s       : 3308.85
+  Avg Lat (us): 9561.19
+  P99 Lat (us): 18219.01
+
+================================
+root@pod-distort-tie0:/data# 
+root@pod-distort-tie0:/data# 
+root@pod-distort-tie0:/data# 
+root@pod-distort-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 135973
+  Avg Lat (us): 3713.16
+  P99 Lat (us): 4358.14
+
+4K Random Write:
+  IOPS        : 138694
+  Avg Lat (us): 3657.15
+  P99 Lat (us): 6520.83
+
+1M Sequential Read:
+  MiB/s       : 3543.80
+  Avg Lat (us): 8951.41
+  P99 Lat (us): 12255.23
+
+1M Sequential Write:
+  MiB/s       : 3300.20
+  Avg Lat (us): 9587.71
+  P99 Lat (us): 18219.01
+
+================================
+root@pod-distort-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 135572
+  Avg Lat (us): 3725.16
+  P99 Lat (us): 4358.14
+
+4K Random Write:
+  IOPS        : 137119
+  Avg Lat (us): 3697.18
+  P99 Lat (us): 6586.37
+
+1M Sequential Read:
+  MiB/s       : 3546.24
+  Avg Lat (us): 8944.09
+  P99 Lat (us): 10813.44
+
+1M Sequential Write:
+  MiB/s       : 3311.30
+  Avg Lat (us): 9552.21
+  P99 Lat (us): 18219.01
+
+================================
+root@pod-distort-tie0:/data# ./nvme_test_fs2.sh fiofile
+Dropping caches...
+tee: /proc/sys/vm/drop_caches: Read-only file system
+Running 4K Random Read...
+Running 4K Random Write...
+Running 1M Sequential Read...
+Running 1M Sequential Write...
+
+====== FILESYSTEM RESULTS ======
+
+4K Random Read:
+  IOPS        : 133611
+  Avg Lat (us): 3779.54
+  P99 Lat (us): 4358.14
+
+4K Random Write:
+  IOPS        : 138027
+  Avg Lat (us): 3672.53
+  P99 Lat (us): 6651.90
+
+1M Sequential Read:
+  MiB/s       : 3551.03
+  Avg Lat (us): 8918.34
+  P99 Lat (us): 9240.58
+
+1M Sequential Write:
+  MiB/s       : 3274.28
+  Avg Lat (us): 9648.34
+  P99 Lat (us): 18219.01
+
+================================
+
