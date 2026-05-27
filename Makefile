@@ -211,3 +211,13 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ Documentation
+
+.PHONY: docs-serve docs-build
+docs-serve: ## Run Hugo documentation site locally.
+	cd docs && hugo server -D
+
+docs-build: ## Build Hugo documentation site static files.
+	cd docs && hugo --minify
+

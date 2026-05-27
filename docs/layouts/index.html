@@ -1,0 +1,41 @@
+{{ define "main" }}
+<div class="homepage-container">
+  <!-- Hero Section -->
+  <section class="hero-section">
+    <h1 class="hero-title">DISTORT</h1>
+    <p class="hero-subtitle">High-Performance Disaggregated Storage over RDMA natively orchestrated in Kubernetes</p>
+  </section>
+
+  <!-- Quick Info Cards -->
+  <section class="features-grid">
+    <div class="feature-card">
+      <div class="feature-card-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+      </div>
+      <h3 class="feature-card-title">Near-Local Performance</h3>
+      <p class="feature-card-text">Decouples storage capacity from compute nodes using NVMe-over-Fabrics (NVMe-oF) with RDMA, delivering microseconds of latency and extreme high throughput.</p>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-card-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+      </div>
+      <h3 class="feature-card-title">Kubernetes-Native Schedulers</h3>
+      <p class="feature-card-text">Driven by a declarative Custom Resource Definition (CRD) state machine to coordinate device discovery, node health, partition claims, and volume bindings.</p>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-card-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="22" y1="12" x2="18" y2="12"></line><line x1="6" y1="12" x2="2" y2="12"></line><line x1="12" y1="6" x2="12" y2="2"></line><line x1="12" y1="22" x2="12" y2="18"></line></svg>
+      </div>
+      <h3 class="feature-card-title">SPDK User-Space Polling</h3>
+      <p class="feature-card-text">Supports fully uncompromised storage pathways. Bypasses the traditional Linux kernel block layer to eliminate context switches and interrupt overhead completely.</p>
+    </div>
+  </section>
+
+  <!-- Renders standard landing content -->
+  <section class="home-markdown-content page-content">
+    {{ .Content }}
+  </section>
+</div>
+{{ end }}
