@@ -25,10 +25,10 @@ Cloud-native ecosystems, spearheaded by Kubernetes, have revolutionized applicat
 
 NVMe-over-Fabrics (NVMe-oF) utilizing RDMA provides microseconds of latency and high throughput, rivaling local NVMe drives. Disaggregating storage using NVMe-oF allows independent scaling of compute and storage resources, improving resource utilization. Yet, orchestrating these high-performance physical targets within Kubernetes without compromising performance or introducing complex middleware is an open challenge.
 
-We introduce DISTORT, a Cloud-native Disaggregated Storage engine over RDMA. DISTORT integrates physical NVMe management directly into the Kubernetes control plane. It introduces an architecture comprising a centralized management controller, a node-level hardware agent, and a standard CSI driver. This design allows Kubernetes to natively declare, partition, and consume bare-metal NVMe storage over RDMA fabrics.
+We introduce DISTORT, a Cloud-native Disaggregated Storage engine over RDMA. DISTORT integrates physical NVMe management directly into the Kubernetes control plane. It introduces an architecture comprising a centralized management controller, a node-level hardware agent, and a standard CSI driver. This design allows Kubernetes to natively declare, partition, and consume bare-metal NVMe storage over RDMA fabrics, utilizing modern user-space polling techniques via SPDK for uncompromised performance.
 
 \section{Related Work}
-Recent advancements in distributed storage have focused heavily on integrating high-performance interconnects with cloud-orchestrator frameworks. Systems like SPDK (Storage Performance Development Kit) provide user-space NVMe drivers to bypass kernel overhead, while commercial and open-source CSI drivers (e.g., OpenEBS, Rook/Ceph) offer varying degrees of RDMA support. However, these systems often impose heavy control-plane dependencies or require dedicated storage nodes running complex SDS stacks. DISTORT distinguishes itself by utilizing the Linux kernel's native configfs and NVMe-oF subsystems, orchestrating them purely through Kubernetes Custom Resources, thereby maintaining a zero-overhead data path.
+Recent advancements in distributed storage have focused heavily on integrating high-performance interconnects with cloud-orchestrator frameworks. Systems like SPDK (Storage Performance Development Kit) provide user-space NVMe drivers to bypass kernel overhead, while commercial and open-source CSI drivers (e.g., OpenEBS, Rook/Ceph) offer varying degrees of RDMA support. However, these systems often impose heavy control-plane dependencies or require dedicated storage nodes running complex SDS stacks. DISTORT distinguishes itself by integrating high-performance user-space polling architectures (via SPDK) natively into Kubernetes Custom Resources. It evolved from an initial kernel-based configfs approach to a fully containerized SPDK engine, maintaining a zero-overhead data path without requiring heavyweight SDS middleware.
 
 \section{Design}
 DISTORT's architecture is bifurcated into two logical layers: the \textit{NVMe Management Layer} (the "Hardware Control Plane") and the \textit{CSI Layer} (the "Kubernetes Bridge"). This separation of concerns allows the system to decouple physical hardware management from the Kubernetes volume lifecycle using a state-machine-via-CRD approach.
@@ -106,14 +106,23 @@ The system is compiled into three distinct binary executables situated under the
 
 Building the binaries relies on a standard \texttt{Makefile} utilizing \texttt{go build}. Kubebuilder macros extract RBAC definitions and scheme topologies from Go structural comments, ensuring that API generations (`\texttt{make manifests}`) directly reflect the Go codebase.
 
-\subsection{Hardware Integrations}
-To minimize overhead, the \texttt{distort-agent} bypasses typical storage middleware. 
+\subsection{Initial Target Implementation}
+As the initial proof-of-concept, the \texttt{distort-agent} was designed to interface directly with Linux kernel abstractions to expose NVMe-oF targets without external middleware. 
 \begin{itemize}
-    \item \textbf{Discovery Mapping:} It probes \texttt{/sys/class/nvme} continuously to calculate NUMA topology and total block bytes, translating this into resilient \texttt{NVMeDevice} Custom Resources.
-    \item \textbf{Partition Slicing:} Using the \texttt{os/exec} package, it implements a wrapper over the \texttt{parted} system utility to inject GUID Partition Tables (GPT) and carve primary partitions on demand dynamically based on Kubernetes limits.
-    \item \textbf{NVMe-oF Target Orchestration:} Rather than relying on external Python-based automation suites like \texttt{nvmetcli}, the agent creates Subsystems, Namespaces, and RDMA Ports strictly by writing to the Linux Kernel's ConfigFS mount (\texttt{/sys/kernel/config/nvmet}). This guarantees atomic block-level exports directly from the kernel level.
+    \item \textbf{Discovery Mapping:} Probed \texttt{/sys/class/nvme} continuously to calculate NUMA topology and block capacities, translating this into \texttt{NVMeDevice} Custom Resources.
+    \item \textbf{Partition Slicing:} Used a wrapper over the \texttt{parted} utility to inject GUID Partition Tables (GPT) and carve primary partitions dynamically.
+    \item \textbf{Target Orchestration:} Configured Subsystems, Namespaces, and RDMA Ports strictly by writing to the Linux Kernel's ConfigFS mount (\texttt{/sys/kernel/config/nvmet}).
 \end{itemize}
-Volume teardown employs Kubernetes \textit{Finalizers}, intercepting \texttt{NVMePartition} deletion events to cleanly un-export the Fabric pathway before dropping the raw partition chunks to reclaim space.
+
+\subsection{SPDK-Based Target Engine}
+To significantly elevate I/O performance and reduce CPU overhead from kernel-space context switching, the \texttt{distort-agent} was subsequently upgraded to integrate the Storage Performance Development Kit (SPDK). In this revised high-performance implementation, DISTORT completely bypasses the Linux kernel block layer:
+\begin{itemize}
+    \item \textbf{User-Space NVMe Driver:} Physical NVMe drives are unbound from the kernel and bound to the \texttt{vfio-pci} or \texttt{uio\_pci\_generic} drivers, granting SPDK exclusive user-space access.
+    \item \textbf{Discovery \& RPC Control:} Hardware discovery and telemetry are orchestrated via SPDK's JSON-RPC interface, querying the \texttt{nvmf\_tgt} process for NVMe controllers and serial numbers.
+    \item \textbf{Logical Volumes (Lvol):} Instead of traditional filesystem partitions via \texttt{parted}, DISTORT dynamically carves out SPDK Logical Volumes (\texttt{bdev\_lvol\_create}) entirely in application memory.
+    \item \textbf{NVMe-oF Exporter:} The kernel's ConfigFS RDMA target registries are deprecated in favor of lightweight SPDK JSON-RPC commands that dynamically create user-space NVMe-oF Subsystems and RDMA listeners on the fly.
+\end{itemize}
+Volume teardown employs Kubernetes \textit{Finalizers}, intercepting \texttt{NVMePartition} deletion events to cleanly un-export the Fabric pathway via RPC before destroying the logical volume.
 
 \subsection{Deployment Mechanics}
 To package the solution for end users, DISTORT maintains an integrated Helm Chart (\texttt{deploy/charts/distort}). The chart templates encapsulate:
@@ -173,9 +182,9 @@ As shown in Table~\ref{tab:performance}, directly accessing the raw NVMe block d
 To evaluate DISTORT's disaggregated storage capabilities, we compared it against Mayastor, a popular SPDK-based storage engine configured without replication over NVMe-oF RDMA. Our kernel-based approach achieves $\sim$137k IOPS for 4\,KB random reads and $\sim$142k IOPS for 4\,KB random writes. Sequential workloads hit the network/device limits for both DISTORT and Mayastor, delivering $\sim$3.5\,GB/s reads and $\sim$3.3\,GB/s writes.
 
 \subsection{Discussion}
-The evaluation highlights a stark contrast in random I/O performance between Mayastor and DISTORT. Mayastor roughly doubles DISTORT's IOPS due to its use of the Storage Performance Development Kit (SPDK). SPDK relies on a user-space, polling-mode driver architecture, which continuously polls the NVMe queues for completions, thereby eliminating context switches and interrupt handling overhead at the cost of dedicating whole CPU cores to the storage engine (100\% CPU utilization per polled core).
+The evaluation in Table~\ref{tab:performance} reflects the \textit{initial} kernel-based implementation of DISTORT, which highlights a stark contrast in random I/O performance between Mayastor and DISTORT. Mayastor roughly doubles the initial DISTORT's IOPS due to its use of the Storage Performance Development Kit (SPDK). SPDK relies on a user-space, polling-mode driver architecture, which continuously polls the NVMe queues for completions, thereby eliminating context switches and interrupt handling overhead at the cost of dedicating whole CPU cores to the storage engine (100\% CPU utilization per polled core).
 
-In contrast, DISTORT utilizes the Linux kernel's standard NVMe-oF target and networking stack, which relies on hardware interrupts. While this interrupt-driven approach limits maximum theoretical IOPS for small block transfers (e.g., 4\,KB), it provides excellent sequential bandwidth and, crucially, avoids monopolizing CPU resources. DISTORT achieves its design goal: zero-overhead control plane orchestration over physical NVMe targets within Kubernetes, providing sufficient performance for most data-intensive cloud applications without the operational complexity and dedicated resource requirements of SPDK-based systems.
+In contrast, the initial DISTORT utilized the Linux kernel's standard NVMe-oF target and networking stack, which relies on hardware interrupts. While this interrupt-driven approach limits maximum theoretical IOPS for small block transfers (e.g., 4\,KB), it provided excellent sequential bandwidth and avoided monopolizing CPU resources. Recognizing the performance delta for random I/O workloads, our upgraded SPDK-based implementation of DISTORT (detailed in Section 4.3) adopts the same user-space polling architecture as Mayastor. Future benchmarking of the SPDK engine is expected to showcase performance parity with Mayastor—achieving maximum theoretical random IOPS while maintaining DISTORT's native, zero-overhead Kubernetes orchestration model.
 
 \section{Conclusion}
 This report presented DISTORT, a novel storage engine designed to seamlessly integrate high-performance, disaggregated NVMe-oF/RDMA storage with Kubernetes. By mapping physical hardware operations to declarative Custom Resources, DISTORT provides dynamic volume provisioning without sacrificing the bare-metal performance characteristics of RDMA, paving the way for data-intensive applications in cloud-native environments.

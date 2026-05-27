@@ -111,8 +111,12 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 	}
 
 	for _, d := range devices {
+		serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
+		if serial == "" {
+			serial = "unknown"
+		}
 		// Device name is usually nodeName-serial
-		deviceName := r.NodeName + "-" + strings.ToLower(d.SerialNumber)
+		deviceName := r.NodeName + "-" + serial
 
 		devCR := &storagev1alpha1.NVMeDevice{}
 		err := r.Get(ctx, types.NamespacedName{Name: deviceName}, devCR)

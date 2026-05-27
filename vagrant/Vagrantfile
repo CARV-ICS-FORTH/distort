@@ -23,6 +23,16 @@ $common_script = <<-SCRIPT
   apt-get update
   apt-get install -y nvme-cli parted curl rdma-core linux-modules-extra-$(uname -r)
 
+  # SPDK Requirements: vfio-pci, uio_pci_generic and Hugepages
+  modprobe vfio-pci
+  modprobe uio_pci_generic
+  echo "vfio-pci" >> /etc/modules-load.d/spdk.conf
+  echo "uio_pci_generic" >> /etc/modules-load.d/spdk.conf
+  
+  # Allocate 1024 hugepages of 2MB (2GB total) for SPDK DMA
+  sysctl -w vm.nr_hugepages=1024
+  echo "vm.nr_hugepages=1024" > /etc/sysctl.d/99-spdk-hugepages.conf
+
   # Load SoftRoCE (RXE) kernel module
   modprobe rdma_rxe
   echo "rdma_rxe" > /etc/modules-load.d/rdma_rxe.conf
@@ -71,7 +81,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     master.vm.network "private_network", ip: MASTER_IP
 
     master.vm.provider "virtualbox" do |vb|
-      vb.memory = "2048"
+      vb.memory = "4096"
       vb.cpus = 2
 
       # Add an NVMe controller to the VM
@@ -113,7 +123,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       worker.vm.network "private_network", ip: worker_ip
 
       worker.vm.provider "virtualbox" do |vb|
-        vb.memory = "2048"
+        vb.memory = "4096"
         vb.cpus = 2
         
         # Add an NVMe controller to the worker VM

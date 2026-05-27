@@ -49,21 +49,22 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				}
 			}
 
-			// 2. Remove the partition from the block device
+			// 2. Remove the SPDK Logical Volume from the Lvstore
 			if partition.Spec.ParentDeviceSerialNumber != "" {
 				devices, err := DiscoverNVMe()
 				if err == nil {
 					for _, d := range devices {
 						if d.SerialNumber == partition.Spec.ParentDeviceSerialNumber {
-							pw := NewPartedWrapper("/dev/" + d.Name + "n1")
-							if err := pw.RemovePartition(1); err != nil {
-								logger.Error(err, "Failed to remove partition via parted")
+							storeName := "lvs_" + d.Name
+							lvolBdevName := storeName + "/" + partition.Name
+							if err := DeleteLvol(lvolBdevName); err != nil {
+								logger.Error(err, "Failed to remove SPDK Lvol")
 							}
 							break
 						}
 					}
 				} else {
-					logger.Error(err, "Failed to discover NVMe devices to remove partition")
+					logger.Error(err, "Failed to discover NVMe devices to remove Lvol")
 				}
 			}
 			controllerutil.RemoveFinalizer(&partition, partitionFinalizer)
@@ -90,7 +91,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	logger.Info("Provisioning partition on local node", "partition", partition.Name, "size", partition.Spec.Size.String())
 
 	// ============================================
-	// 1. Execute `parted` to create the slice.
+	// 1. Execute SPDK RPC to create the Logical Volume
 	// ============================================
 	if partition.Spec.ParentDeviceSerialNumber == "" {
 		err := fmt.Errorf("NVMePartition %s is missing ParentDeviceSerialNumber", partition.Name)
@@ -109,7 +110,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	var parentDevice string
 	for _, d := range devices {
 		if d.SerialNumber == partition.Spec.ParentDeviceSerialNumber {
-			parentDevice = "/dev/" + d.Name + "n1"
+			parentDevice = d.Name
 			break
 		}
 	}
@@ -122,18 +123,18 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	pw := NewPartedWrapper(parentDevice)
+	storeName := "lvs_" + parentDevice
+	if err := EnsureLvstore(parentDevice, storeName); err != nil {
+		logger.Error(err, "Failed to ensure SPDK Lvstore exists")
+		partition.Status.State = storagev1alpha1.NVMePartitionStateFailed
+		_ = p.Status().Update(ctx, &partition)
+		return ctrl.Result{}, err
+	}
 
-	// Ensure label exists just in case (ignores error if already exists, but we can do a fallback)
-	_ = pw.MakeLabel()
-
-	// In a real system you would calculate available start sectors.
-	startMB := int64(1)
-	endMB := startMB + partition.Spec.Size.Value()/(1024*1024)
-
-	blockPath, err := pw.CreatePartition(partition.Name, startMB, endMB)
+	sizeMB := partition.Spec.Size.Value() / (1024 * 1024)
+	blockPath, err := CreateLvol(storeName, partition.Name, sizeMB)
 	if err != nil {
-		logger.Error(err, "Failed to create block partition")
+		logger.Error(err, "Failed to create SPDK Lvol")
 		partition.Status.State = storagev1alpha1.NVMePartitionStateFailed
 		_ = p.Status().Update(ctx, &partition)
 		return ctrl.Result{}, err

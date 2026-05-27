@@ -77,18 +77,18 @@ spec:
 				g.Expect(out).To(Equal("Exported"))
 			}).Should(Succeed())
 
-			By("Using SSH to verify physical partition creation via lsblk")
-			cmd = exec.Command("sh", "-c", "cd vagrant && vagrant ssh distort-worker-1 -c 'lsblk | grep nvme'")
+			By("Using SPDK RPC to verify Logical Volume creation")
+			cmd = exec.Command("sh", "-c", "POD=$(kubectl get pod -n distort-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=distort-worker-1 -o jsonpath='{.items[0].metadata.name}') && kubectl exec -n distort-system $POD -- /opt/spdk/scripts/rpc.py bdev_get_bdevs")
 			out, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			// e.g. nvme0n1p1 or nvme1n1p1
-			Expect(out).To(ContainSubstring("p1"))
+			// Must find e2e-test-partition LVol running inside SPDK
+			Expect(out).To(ContainSubstring("e2e-test-partition"))
 
-			By("Using SSH to verify NVMe-oF subsystem export")
-			cmd = exec.Command("sh", "-c", "cd vagrant && vagrant ssh distort-worker-1 -c 'sudo ls /sys/kernel/config/nvmet/subsystems'")
+			By("Using SPDK RPC to verify NVMe-oF subsystem export")
+			cmd = exec.Command("sh", "-c", "POD=$(kubectl get pod -n distort-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=distort-worker-1 -o jsonpath='{.items[0].metadata.name}') && kubectl exec -n distort-system $POD -- /opt/spdk/scripts/rpc.py nvmf_get_subsystems")
 			out, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(out).To(ContainSubstring("nqn."))
+			Expect(out).To(ContainSubstring("nqn.2026-02.io.distort:volume-e2e-test-partition"))
 
 			By("Cleaning up the test partition")
 			cmd = exec.Command("kubectl", "delete", "nvmepartition", "e2e-test-partition")
