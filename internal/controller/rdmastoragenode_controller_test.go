@@ -51,7 +51,11 @@ var _ = Describe("RDMAStorageNode Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: storagev1alpha1.RDMAStorageNodeSpec{
+						NodeName:  "test-node",
+						RDMAIP:    "127.0.0.1",
+						Transport: storagev1alpha1.RDMATransportRoCEv2,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

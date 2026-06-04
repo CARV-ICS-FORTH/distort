@@ -82,6 +82,15 @@ func (r *NVMePartitionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			continue
 		}
 
+		// Ensure target backend matches
+		requestedBackend := partition.Spec.TargetBackend
+		if requestedBackend == "" {
+			requestedBackend = "spdk"
+		}
+		if device.Status.ActiveBackend != "" && device.Status.ActiveBackend != requestedBackend {
+			continue
+		}
+
 		// Ensure the device has enough free capacity
 		if device.Status.FreeCapacity.Cmp(partition.Spec.Size) >= 0 {
 			freeBytes := device.Status.FreeCapacity.Value()

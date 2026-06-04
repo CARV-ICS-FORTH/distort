@@ -167,3 +167,71 @@ If you need to wipe your partitions, clean up the RDMA targets, delete active CR
 ```bash
 make test-env-reset
 ```
+
+---
+
+## Developing Plugins for Target Backends and Volume Managers
+
+DISTORT features an extensible plugin-based architecture for both **Target Backends** (the target export technology) and **Volume Managers** (the storage carving engines). Each plugin is self-contained and resides under `internal/agent/plugins/`.
+
+### 1. The Plugin Interfaces
+
+Plugins are defined by two Go interfaces inside `internal/agent/plugins/interface.go`:
+
+```go
+type TargetBackend interface {
+    Name() string
+    SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error
+    ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error)
+    UnexportVolume(ctx context.Context, nqn string) error
+}
+
+type VolumeManager interface {
+    Name() string
+    SetupStorage(ctx context.Context, devicePath string, deviceName string) error
+    CreateVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, sizeBytes int64) (string, error)
+    DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string) error
+}
+```
+
+### 2. Registering a Plugin
+
+Plugins must register themselves within their file using a standard Go `init()` registration block.
+
+```go
+package plugins
+
+type MyCustomBackend struct{}
+
+func init() {
+    RegisterTargetBackend(&MyCustomBackend{})
+}
+
+func (m *MyCustomBackend) Name() string {
+    return "custom-backend"
+}
+// Implement other interface methods...
+```
+
+Because the `agent` package imports the `plugins` package, your plugin is automatically loaded and compiled into the `distort-agent` binary.
+
+### 3. Step-by-Step: Adding a New Plugin
+
+To add a new volume manager (e.g. `lvm`):
+
+1. **Create the file**: Create `internal/agent/plugins/vol_lvm.go`.
+2. **Implement the interface**: Implement `VolumeManager` methods. For instance, `SetupStorage` will initialize a Volume Group (`vgcreate`), `CreateVolume` will run `lvcreate`, and `DeleteVolume` will run `lvremove`.
+3. **Register the plugin**: Call `RegisterVolumeManager(&LVMVolumeManager{})` in an `init()` block.
+4. **Use it in a StorageClass**: Define a new StorageClass specifying your plugin name under `volume-manager`:
+   ```yaml
+   apiVersion: storage.k8s.io/v1
+   kind: StorageClass
+   metadata:
+     name: distort-kernel-lvm
+   provisioner: storage.distort.io
+   parameters:
+     target-backend: "kernel"
+     volume-manager: "lvm"
+   ```
+5. **Add tests**: Update your E2E validation matrix to assert volume operations on the new volume manager.
+

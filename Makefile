@@ -72,8 +72,8 @@ get-kubeconfig:
 
 .PHONY: test-env-reset
 test-env-reset: ## Reset the Vagrant test environment (wipe partitions, reload configfs)
-	cd vagrant && vagrant ssh distort-worker-1 -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo bash /vagrant/clean-nvmet.sh"
-	cd vagrant && vagrant ssh distort-master -c "sudo wipefs -a /dev/nvme0n1 /dev/nvme0n2 || true && sudo bash /vagrant/clean-nvmet.sh"
+	cd vagrant && vagrant ssh distort-worker-1 -c "sudo bash /vagrant/clean-node.sh"
+	cd vagrant && vagrant ssh distort-master -c "sudo bash /vagrant/clean-node.sh"
 	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl delete nvmedeviceclaim,nvmepartition --all || true
 
 .PHONY: test-env-deploy
@@ -89,6 +89,7 @@ test-env-deploy: docker-build get-kubeconfig manifests ## Build image, load into
 
 .PHONY: test-e2e
 test-e2e: get-kubeconfig manifests generate fmt vet ## Run the unified Ginkgo E2E tests against Vagrant K3s
+	bash vagrant/verify-env.sh
 	KUBECONFIG=$(PWD)/kubeconfig.yaml go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 
 .PHONY: lint

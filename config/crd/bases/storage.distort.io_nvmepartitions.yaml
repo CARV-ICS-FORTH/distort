@@ -84,6 +84,28 @@ spec:
                 description: Size is the requested capacity for the volume.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+              targetBackend:
+                default: spdk
+                description: TargetBackend specifies the export technology (e.g.,
+                  "spdk" or "kernel").
+                enum:
+                - spdk
+                - kernel
+                type: string
+              targetOptions:
+                additionalProperties:
+                  type: string
+                description: TargetOptions provides backend-specific customization
+                  flags (e.g., spdk core masks).
+                type: object
+              volumeManager:
+                default: partition
+                description: VolumeManager specifies the volume manager (e.g., "partition"
+                  or "lvm").
+                enum:
+                - partition
+                - lvm
+                type: string
             required:
             - size
             type: object

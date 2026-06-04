@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -48,6 +49,21 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		ns = "default"
 	}
 
+	targetBackend := req.GetParameters()["target-backend"]
+	if targetBackend == "" {
+		targetBackend = "spdk"
+	}
+	volumeManager := req.GetParameters()["volume-manager"]
+	if volumeManager == "" {
+		volumeManager = "partition"
+	}
+	targetOptions := make(map[string]string)
+	for k, v := range req.GetParameters() {
+		if strings.HasPrefix(k, "spdk-") || k == "spdk-core-mask" {
+			targetOptions[k] = v
+		}
+	}
+
 	// Create NVMePartition CRD
 	partition := &storagev1alpha1.NVMePartition{
 		ObjectMeta: metav1.ObjectMeta{
@@ -55,7 +71,10 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			Namespace: ns,
 		},
 		Spec: storagev1alpha1.NVMePartitionSpec{
-			Size: *resource.NewQuantity(requiredBytes, resource.BinarySI),
+			Size:          *resource.NewQuantity(requiredBytes, resource.BinarySI),
+			TargetBackend: targetBackend,
+			VolumeManager: volumeManager,
+			TargetOptions: targetOptions,
 			// NodeName is intentionally omitted here; the mutating scheduler (Mgmt-Controller) handles it.
 		},
 	}

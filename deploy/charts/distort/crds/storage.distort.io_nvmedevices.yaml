@@ -94,6 +94,10 @@ spec:
           status:
             description: status defines the observed state of NVMeDevice
             properties:
+              activeBackend:
+                description: ActiveBackend tracks which target technology currently
+                  owns this controller ("spdk", "kernel", or "none").
+                type: string
               conditions:
                 description: Conditions represent the current state of the NVMeDevice
                   resource.

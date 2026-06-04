@@ -1,17 +1,20 @@
 package agent
 
 import (
-	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
-	"time"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/agent/plugins"
 )
 
-// HardwareNVMe represents a discovered physical NVMe namespace mapped into SPDK.
+// HardwareNVMe represents a discovered physical NVMe namespace mapped into SPDK or Kernel.
 type HardwareNVMe struct {
-	Name         string // e.g. Nvme0n1
+	Name         string // e.g. nvme0 or Nvme0n1
 	PCIAddress   string // e.g. 0000:01:00.0
 	SerialNumber string
 	Model        string
@@ -19,7 +22,132 @@ type HardwareNVMe struct {
 	NUMANode     int
 }
 
-// SpdkBdev represents an SPDK Block Device from bdev_get_bdevs
+const sysClassNVMe = "/sys/class/nvme"
+const sysClassBlock = "/sys/class/block"
+
+// DiscoverNVMe scans both the Linux sysfs tree (for kernel-bound NVMe devices)
+// and SPDK JSON-RPC (for SPDK-bound NVMe devices), returning a unified list.
+func DiscoverNVMe() ([]HardwareNVMe, error) {
+	var devices []HardwareNVMe
+	seenSerials := make(map[string]bool)
+
+	// 1. Scan kernel-bound devices from sysfs
+	kernelDevs, err := discoverKernelNVMe()
+	if err == nil {
+		for _, d := range kernelDevs {
+			serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
+			if serial != "" && !seenSerials[serial] {
+				devices = append(devices, d)
+				seenSerials[serial] = true
+			}
+		}
+	} else {
+		klog.Warningf("Failed to discover kernel NVMe devices: %v", err)
+	}
+
+	// 2. Scan SPDK-bound devices if SPDK is running
+	spdkDevs, err := discoverSPDKNVMe()
+	if err == nil {
+		for _, d := range spdkDevs {
+			serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
+			if serial != "" && !seenSerials[serial] {
+				devices = append(devices, d)
+				seenSerials[serial] = true
+			}
+		}
+	} else {
+		klog.Warningf("Failed to discover SPDK NVMe devices: %v", err)
+	}
+
+	return devices, nil
+}
+
+func discoverKernelNVMe() ([]HardwareNVMe, error) {
+	var devices []HardwareNVMe
+
+	entries, err := os.ReadDir(sysClassNVMe)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return devices, nil
+		}
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "nvme") {
+			continue
+		}
+
+		devName := entry.Name()
+		devPath := filepath.Join(sysClassNVMe, devName)
+
+		// Read Transport and filter out non-PCIe devices (like nvme-of network targets)
+		transport := "pcie" // default
+		if b, err := os.ReadFile(filepath.Join(devPath, "transport")); err == nil {
+			transport = strings.TrimSpace(string(b))
+		}
+
+		if transport != "pcie" {
+			continue
+		}
+
+		hwDev := HardwareNVMe{
+			Name: devName,
+		}
+
+		// Read Model
+		if b, err := os.ReadFile(filepath.Join(devPath, "model")); err == nil {
+			hwDev.Model = strings.TrimSpace(string(b))
+		}
+
+		// Read Serial Number
+		if b, err := os.ReadFile(filepath.Join(devPath, "serial")); err == nil {
+			hwDev.SerialNumber = strings.TrimSpace(string(b))
+		}
+
+		// Read NUMA Node
+		if b, err := os.ReadFile(filepath.Join(devPath, "numa_node")); err == nil {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				hwDev.NUMANode = parsed
+			}
+		}
+
+		// Determine PCI Address by resolving the device symlink
+		link, err := os.Readlink(filepath.Join(devPath, "device"))
+		if err == nil {
+			hwDev.PCIAddress = filepath.Base(link)
+		}
+
+		// Calculate total bytes from matching namespace blocks
+		hwDev.TotalBytes = calculateTotalBytes(devName)
+
+		devices = append(devices, hwDev)
+	}
+
+	return devices, nil
+}
+
+func calculateTotalBytes(nvmeName string) int64 {
+	var total int64
+	entries, err := os.ReadDir(sysClassBlock)
+	if err != nil {
+		return 0
+	}
+
+	for _, entry := range entries {
+		bName := entry.Name()
+		if strings.HasPrefix(bName, nvmeName+"n") {
+			sizePath := filepath.Join(sysClassBlock, bName, "size")
+			if b, err := os.ReadFile(sizePath); err == nil {
+				if blocks, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil {
+					total += blocks * 512
+				}
+			}
+		}
+	}
+	return total
+}
+
 type SpdkBdev struct {
 	Name           string `json:"name"`
 	ProductName    string `json:"product_name"`
@@ -37,7 +165,6 @@ type SpdkBdev struct {
 	} `json:"driver_specific"`
 }
 
-// SpdkNVMeController represents a Controller from bdev_nvme_get_controllers
 type SpdkNVMeController struct {
 	Name  string `json:"name"`
 	Ctrlr struct {
@@ -46,106 +173,19 @@ type SpdkNVMeController struct {
 	} `json:"ctrlr"`
 }
 
-// EnsureSPDK verifies `nvmf_tgt` is running and the physical PCIe NVMe drives are attached to it.
-func EnsureSPDK() error {
-	// Start nvmf_tgt if not running
+func discoverSPDKNVMe() ([]HardwareNVMe, error) {
 	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
-		klog.Info("Starting nvmf_tgt daemon in the background...")
-		// Use core 0 with -m 0x1
-		cmd := exec.Command("bash", "-c", "ulimit -l unlimited && nvmf_tgt -m 0x1")
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("failed to start nvmf_tgt: %v", err)
-		}
-		go func() {
-			if err := cmd.Wait(); err != nil {
-				klog.Errorf("nvmf_tgt exited with error: %v", err)
-			}
-		}()
-		// Give SPDK time to initialize DPDK EAL and start the JSON-RPC listener
-		time.Sleep(3 * time.Second)
-	}
-
-	// Unbind NVMe drives from linux kernel and bind to vfio-pci
-	klog.V(4).Info("Running spdk_setup.sh to bind NVMe devices to user-space...")
-	exec.Command("modprobe", "uio_pci_generic").Run()
-	setupCmd := exec.Command("bash", "-c", "FORCE=1 /opt/spdk/scripts/setup.sh")
-	if out, err := setupCmd.CombinedOutput(); err != nil {
-		klog.Warningf("spdk_setup.sh might have failed: %v, output: %s", err, string(out))
-	}
-
-	return attachLocalNVMe()
-}
-
-func attachLocalNVMe() error {
-	// Find NVMe PCI addresses using lspci
-	cmd := exec.Command("bash", "-c", "lspci -D | grep 'Non-Volatile memory controller' | awk '{print $1}'")
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to run lspci: %v", err)
-	}
-
-	addrs := strings.Split(strings.TrimSpace(string(out)), "\n")
-
-	// Get currently attached controllers to avoid re-attaching
-	var controllers []SpdkNVMeController
-	if err := CallSPDKRPC("bdev_nvme_get_controllers", &controllers); err != nil {
-		return err
-	}
-
-	attached := make(map[string]bool)
-	for _, c := range controllers {
-		attached[c.Name] = true
-	}
-
-	for i, pciAddr := range addrs {
-		if pciAddr == "" {
-			continue
-		}
-		name := fmt.Sprintf("Nvme%d", i)
-		if attached[name] {
-			continue
-		}
-
-		klog.Infof("Attaching Physical NVMe controller %s at %s to SPDK", name, pciAddr)
-		if err := CallSPDKRPC("bdev_nvme_attach_controller", nil, "-b", name, "-t", "PCIe", "-a", pciAddr); err != nil {
-			klog.Warningf("Failed to attach NVMe %s: %v", pciAddr, err)
-		}
-	}
-	return nil
-}
-
-// DiscoverNVMe asks SPDK for local NVMe bdevs via JSON-RPC
-func DiscoverNVMe() ([]HardwareNVMe, error) {
-	if err := EnsureSPDK(); err != nil {
-		return nil, err
-	}
-
-	var controllers []SpdkNVMeController
-	if err := CallSPDKRPC("bdev_nvme_get_controllers", &controllers); err != nil {
-		return nil, err
-	}
-
-	ctrlrMap := make(map[string]SpdkNVMeController)
-	for _, c := range controllers {
-		ctrlrMap[c.Name] = c
+		return nil, nil // SPDK not running
 	}
 
 	var bdevs []SpdkBdev
-	if err := CallSPDKRPC("bdev_get_bdevs", &bdevs); err != nil {
+	if err := plugins.CallSPDKRPC("bdev_get_bdevs", &bdevs); err != nil {
 		return nil, err
 	}
 
 	var devices []HardwareNVMe
 	for _, bdev := range bdevs {
-		// We only care about physical NVMe bdevs, not logical volumes (lvols)
 		if bdev.DriverSpecific == nil || len(bdev.DriverSpecific.NVMe) == 0 {
-			continue
-		}
-
-		// Match the base controller name (e.g. Nvme0n1 -> Nvme0)
-		baseName := strings.Split(bdev.Name, "n")[0]
-		_, idx := ctrlrMap[baseName]
-		if !idx {
 			continue
 		}
 
@@ -155,7 +195,7 @@ func DiscoverNVMe() ([]HardwareNVMe, error) {
 			SerialNumber: strings.TrimSpace(bdev.DriverSpecific.NVMe[0].CtrlrData.SerialNumber),
 			Model:        strings.TrimSpace(bdev.DriverSpecific.NVMe[0].CtrlrData.ModelNumber),
 			TotalBytes:   bdev.NumBlocks * bdev.BlockSize,
-			NUMANode:     -1, // NUMA info typically requires more complex DPDK topology queries
+			NUMANode:     -1,
 		}
 		devices = append(devices, hwDev)
 	}

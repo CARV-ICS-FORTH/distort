@@ -71,6 +71,10 @@ type NVMeDeviceStatus struct {
 	// FreeCapacity is the remaining unallocated capacity on the device.
 	FreeCapacity resource.Quantity `json:"freeCapacity,omitempty"`
 
+	// ActiveBackend tracks which target technology currently owns this controller ("spdk", "kernel", or "none").
+	// +optional
+	ActiveBackend string `json:"activeBackend,omitempty"`
+
 	// Conditions represent the current state of the NVMeDevice resource.
 	// +listType=map
 	// +listMapKey=type

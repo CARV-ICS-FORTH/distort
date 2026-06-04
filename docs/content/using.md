@@ -81,19 +81,52 @@ Once hardware claims are active, developers can request volume allocations using
 
 ### 1. Define a StorageClass
 
-Create a standard Kubernetes `StorageClass` pointing to the DISTORT CSI driver (`storage.distort.io`):
+DISTORT supports multiple backends and volume carving configurations. These are specified through standard Kubernetes StorageClass parameters.
 
+#### StorageClass Parameters
+
+| Parameter | Type | Allowed Values | Default | Description |
+|---|---|---|---|---|
+| `target-backend` | String | `spdk`, `kernel` | `spdk` | The target export technology to run on the storage nodes. |
+| `volume-manager` | String | `partition` (or `lvm` in future) | `partition` | The volume carving method to slice physical drives. |
+| `spdk-core-mask` | String | CPU mask (e.g., `0x1`, `0x3`) | `0x1` | Core affinity mask to pass to the SPDK target daemon (SPDK only). |
+
+> [!WARNING]
+> **Data Destruction on Backend Swap:**
+> Physical NVMe devices are locked to the target backend driver (SPDK's user-space vfio-pci vs Kernel's nvme driver) of their first provisioned volume.
+> If you allocate volumes from different StorageClasses with conflicting backends on the same node, they must target separate disks. Reconfiguring a disk to shift between SPDK and kernel backends requires wiping all partition tables and is highly destructive.
+> Because of this, DISTORT does not register a default StorageClass upon installation.
+
+#### Example StorageClass Configurations
+
+**Option A: SPDK User-Space Target with Logical Volumes (Sane Default)**
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: distort-rdma
-# Provisioner name defined by the DISTORT CSI template
+  name: distort-spdk-partition
 provisioner: storage.distort.io
-volumeBindingMode: Immediate
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  target-backend: "spdk"
+  volume-manager: "partition"
+  spdk-core-mask: "0x1"
 ```
 
-Apply the StorageClass:
+**Option B: Linux Kernel Target with Partitions**
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: distort-kernel-partition
+provisioner: storage.distort.io
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  target-backend: "kernel"
+  volume-manager: "partition"
+```
+
+Apply the chosen StorageClass:
 
 ```bash
 kubectl apply -f storageclass.yaml

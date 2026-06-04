@@ -57,6 +57,22 @@ type NVMePartitionSpec struct {
 	// AccessMode indicates the PVC access mode (e.g., ReadWriteOnce, ReadOnlyMany).
 	// +optional
 	AccessMode string `json:"accessMode,omitempty"`
+
+	// TargetBackend specifies the export technology (e.g., "spdk" or "kernel").
+	// +kubebuilder:validation:Enum=spdk;kernel
+	// +kubebuilder:default=spdk
+	// +optional
+	TargetBackend string `json:"targetBackend,omitempty"`
+
+	// VolumeManager specifies the volume manager (e.g., "partition" or "lvm").
+	// +kubebuilder:validation:Enum=partition;lvm
+	// +kubebuilder:default=partition
+	// +optional
+	VolumeManager string `json:"volumeManager,omitempty"`
+
+	// TargetOptions provides backend-specific customization flags (e.g., spdk core masks).
+	// +optional
+	TargetOptions map[string]string `json:"targetOptions,omitempty"`
 }
 
 // NVMePartitionStatus defines the observed state of NVMePartition.
