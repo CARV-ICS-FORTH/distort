@@ -31,6 +31,7 @@ const (
 	RDMATransportInfiniBand RDMATransportType = "InfiniBand"
 	// RDMATransportTCP represents TCP transport (standard NVMe/TCP fallback if RDMA fails).
 	RDMATransportTCP RDMATransportType = "TCP"
+	RDMATrasportBXI  RDMATransportType = "BXI"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
