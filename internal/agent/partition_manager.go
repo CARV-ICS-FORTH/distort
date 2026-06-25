@@ -51,7 +51,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	vmName := partition.Spec.VolumeManager
 	if vmName == "" || vmName == "partition" {
-		if targetBackendName == "spdk" {
+		if targetBackendName == "spdk" || targetBackendName == "bxi" {
 			vmName = "spdk-lvol"
 		} else {
 			vmName = "parted"

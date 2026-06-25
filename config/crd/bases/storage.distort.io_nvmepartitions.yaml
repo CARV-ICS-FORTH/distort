@@ -87,10 +87,11 @@ spec:
               targetBackend:
                 default: spdk
                 description: TargetBackend specifies the export technology (e.g.,
-                  "spdk" or "kernel").
+                  "spdk", "kernel", or "bxi").
                 enum:
                 - spdk
                 - kernel
+                - bxi
                 type: string
               targetOptions:
                 additionalProperties:

@@ -58,8 +58,8 @@ type NVMePartitionSpec struct {
 	// +optional
 	AccessMode string `json:"accessMode,omitempty"`
 
-	// TargetBackend specifies the export technology (e.g., "spdk" or "kernel").
-	// +kubebuilder:validation:Enum=spdk;kernel
+	// TargetBackend specifies the export technology (e.g., "spdk", "kernel", or "bxi").
+	// +kubebuilder:validation:Enum=spdk;kernel;bxi
 	// +kubebuilder:default=spdk
 	// +optional
 	TargetBackend string `json:"targetBackend,omitempty"`

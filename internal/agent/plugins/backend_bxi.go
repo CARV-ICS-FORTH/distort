@@ -31,7 +31,7 @@ func EnsureBXISPDKRunning(coreMask string, portalsPID string) error {
 		}
 
 		// Inject BXI specific environment variables (ROLE and PORTALS_PID) required by the custom DPDK build
-		cmdStr := fmt.Sprintf("ROLE=target PORTALS_PID=%s ulimit -l unlimited && nvmf_tgt -m %s", portalsPID, coreMask)
+		cmdStr := fmt.Sprintf("ROLE=target PORTALS_PID=%s ulimit -l unlimited && /spdk/build/bin/nvmf_tgt -m %s", portalsPID, coreMask)
 		cmd := exec.Command("bash", "-c", cmdStr)
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start BXI nvmf_tgt: %v", err)
@@ -85,10 +85,10 @@ func (b *BXIBackend) SetupDevice(ctx context.Context, pciAddress string, deviceN
 }
 
 func EnsureBXITransport() error {
-	// Create the Portals transport. Safe if it already exists.
-	err := CallSPDKRPC("nvmf_create_transport", nil, "-t", "portals")
+	// Create the RDMA transport. Safe if it already exists.
+	err := CallSPDKRPC("nvmf_create_transport", nil, "-t", "RDMA", "-u", "8192", "-m", "4", "-c", "0")
 	if err != nil {
-		klog.V(4).Infof("nvmf_create_transport portals returned: %v (might already exist)", err)
+		klog.V(4).Infof("nvmf_create_transport RDMA returned: %v (might already exist)", err)
 	}
 	return nil
 }
@@ -104,13 +104,15 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName string, blockP
 
 	portalsPID := options["portals-pid"]
 	if portalsPID == "" {
-		portalsPID = fmt.Sprintf("%d", portalPort)
-		if portalsPID == "0" {
-			portalsPID = "11" // Hard fallback for BXI default
-		}
+		portalsPID = "11" // Hard fallback for BXI default env vars if needed
 	}
 
-	klog.Infof("Exporting %s as NVMe-oF target %s on BXI NID %s (PID %s) via SPDK", blockPath, nqn, bxiNID, portalsPID)
+	rdmaPort := fmt.Sprintf("%d", portalPort)
+	if rdmaPort == "0" {
+		rdmaPort = "4420"
+	}
+
+	klog.Infof("Exporting %s as NVMe-oF target %s on IP %s (RDMA Port %s, BXI PID %s) via SPDK", blockPath, nqn, bxiNID, rdmaPort, portalsPID)
 
 	// Check if already exported (subsystem exists)
 	var subsystems []struct {
@@ -129,7 +131,7 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName string, blockP
 	}
 
 	// 1. Create Subsystem
-	err := CallSPDKRPC("nvmf_create_subsystem", nil, nqn, "-a", "-s", "distort")
+	err := CallSPDKRPC("nvmf_create_subsystem", nil, nqn, "-a", "-s", "distort", "-d", "SPDK_Controller1")
 	if err != nil {
 		return "", fmt.Errorf("failed to create SPDK subsystem %s: %w", nqn, err)
 	}
@@ -142,11 +144,11 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName string, blockP
 	}
 
 	// 3. Add Listener
-	// Map the transport address (-a) to the BXI NID and the service ID (-s) to the PORTALS_PID
-	err = CallSPDKRPC("nvmf_subsystem_add_listener", nil, nqn, "-t", "portals", "-a", bxiNID, "-s", portalsPID)
+	// Map the transport address (-a) to the BXI NID and use RDMA transport
+	err = CallSPDKRPC("nvmf_subsystem_add_listener", nil, nqn, "-t", "rdma", "-a", bxiNID, "-s", rdmaPort)
 	if err != nil {
 		_ = CallSPDKRPC("nvmf_delete_subsystem", nil, nqn)
-		return "", fmt.Errorf("failed to add Portals listener to subsystem: %w", err)
+		return "", fmt.Errorf("failed to add RDMA listener to subsystem: %w", err)
 	}
 
 	return nqn, nil

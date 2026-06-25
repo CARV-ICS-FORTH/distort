@@ -59,7 +59,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	targetOptions := make(map[string]string)
 	for k, v := range req.GetParameters() {
-		if strings.HasPrefix(k, "spdk-") || k == "spdk-core-mask" {
+		if strings.HasPrefix(k, "spdk-") || strings.HasPrefix(k, "bxi-") || strings.HasPrefix(k, "portals-") || strings.HasPrefix(k, "rdma-") || k == "spdk-core-mask" {
 			targetOptions[k] = v
 		}
 	}

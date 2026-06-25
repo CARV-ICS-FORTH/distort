@@ -1,80 +1,280 @@
-# Create a builder stage specifically for SPDK to avoid bloating the final image
-FROM ubuntu:24.04 AS spdk-builder
+#############################################
+# Stage 1: SPDK Builder (Rocky 9)
+#############################################
+FROM rockylinux:9 AS spdk-builder
 
-# Install dependencies required to build SPDK and RDMA components
 ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/Components: main$/Components: main universe restricted multiverse/g' /etc/apt/sources.list.d/ubuntu.sources && \
-    apt-get update && apt-get install -y \
-    gcc g++ make pkg-config libnuma-dev python3 uuid-dev git \
-    libibverbs-dev librdmacm-dev python3-pyelftools python3-venv \
-    libcunit1-dev libaio-dev libssl-dev libjson-c-dev libcmocka-dev \
-    libiscsi-dev libkeyutils-dev python3-pip python3-dev \
-    unzip libfuse3-dev patchelf curl nasm yasm autoconf libtool \
-    meson ninja-build help2man libncurses5-dev libncursesw5-dev \
-    && rm -rf /var/lib/apt/lists/*
 
+RUN dnf -y install dnf-plugins-core && \
+    dnf config-manager --set-enabled crb && \
+    dnf -y install epel-release && \
+    dnf -y update && \
+    dnf -y install \
+        CUnit \
+        gcc \
+        gcc-c++ \
+        make \
+        pkgconf \
+        pkgconf-pkg-config \
+        numactl-devel \
+        python3 \
+        python3-devel \
+        python3-pip \
+        git \
+        rdma-core-devel \
+        libuuid-devel \
+        libaio-devel \
+        openssl-devel \
+        json-c-devel \
+        CUnit-devel \
+        keyutils-libs-devel \
+        fuse3-devel \
+        nasm \
+        autoconf \
+        automake \
+        libtool \
+        meson \
+        ninja-build \
+        ncurses-devel \
+        which \
+        diffutils \
+        patchelf \
+    && dnf clean all
+
+
+#############################################
 # Clone SPDK
+#############################################
 WORKDIR /src
-RUN git clone -b v26.01 https://github.com/spdk/spdk.git /src/spdk
+
+RUN git clone https://github.com/CARV-ICS-FORTH/nvmeof-bxi.git /src/spdk
+
+
+#############################################
+# Install BXI headers + libraries
+#############################################
+
+# IMPORTANT:
+# host uses /usr/local/include first
+RUN mkdir -p /usr/local/include/linux/bxi3
+
+COPY bxilib/portals4.h /usr/local/include/
+COPY bxilib/portals4_bxiext.h /usr/local/include/
+COPY bxilib/bxi3/ /usr/local/include/linux/bxi3/
+
+
+COPY bxilib/libportals-bxi3.so /lib64/
+
+RUN ln -sf /lib64/libportals-bxi3.so /lib64/libportals.so
+
+RUN echo "/lib64" > /etc/ld.so.conf.d/bxi.conf && \
+    ldconfig
+
+
+#############################################
+# Verify BXI ABI
+#############################################
+
+RUN cat >/tmp/test_ioctl.c <<'EOF'
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <linux/bxi3/bxi3_ioctl.h>
+
+int main()
+{
+    printf("GET_INFO=0x%lx\n",
+           (unsigned long)BXI3_IOCTL_GET_INFO);
+
+    printf("sizeof(bxi3_info)=%lu\n",
+           sizeof(struct bxi3_info));
+
+    return 0;
+}
+EOF
+
+RUN gcc /tmp/test_ioctl.c -o /tmp/test_ioctl && \
+    /tmp/test_ioctl
+
+
+#############################################
+# Init submodules
+#############################################
 
 WORKDIR /src/spdk
-RUN git submodule update --init
 
-# Build DPDK and SPDK with RDMA enabled
-    RUN ./configure --with-rdma --disable-tests --disable-unit-tests || (cat /src/spdk/.spdk-isal.log && exit 1)
-    RUN make -j$(nproc)
+RUN git -c safe.directory="*" submodule update --init
 
 
-# Build the Go binaries
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir \
+        meson==0.63.* \
+        ninja==1.10.* \
+        pyelftools \
+        scan-build
+
+
+#############################################
+# Build DPDK
+#############################################
+
+WORKDIR /src/spdk/dpdk
+
+RUN meson setup build \
+    -Denable_libs=hash,eal,kvargs,log,ring,mempool,mbuf \
+    -Denable_drivers="" \
+    -Ddisable_drivers=net/gve
+
+
+RUN ninja -C build
+
+
+#############################################
+# Build SPDK
+#############################################
+
+WORKDIR /src/spdk
+
+
+RUN ./configure \
+    --with-rdma=portals \
+    --with-dpdk=./dpdk/build \
+    --disable-tests \
+    --disable-unit-tests
+
+
+RUN make -j$(nproc)
+
+
+
+#############################################
+# Stage 2: Go Builder
+#############################################
+
 FROM golang:1.25 AS go-builder
-ARG TARGETOS
-ARG TARGETARCH
+
 
 WORKDIR /workspace
-# Copy the Go Modules manifests
-COPY go.mod go.mod
-COPY go.sum go.sum
+
+
+COPY go.mod go.sum ./
+
 RUN go mod download
 
-# Copy the Go source
+
 COPY . .
 
-# Build all three components
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-manager cmd/distort-manager/main.go
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-agent cmd/distort-agent/main.go
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-csi cmd/distort-csi/main.go
+
+RUN CGO_ENABLED=0 go build \
+    -o bin/distort-manager \
+    cmd/distort-manager/main.go && \
+    CGO_ENABLED=0 go build \
+    -o bin/distort-agent \
+    cmd/distort-agent/main.go && \
+    CGO_ENABLED=0 go build \
+    -o bin/distort-csi \
+    cmd/distort-csi/main.go
 
 
-# Use ubuntu as base image for the final stages since the agent needs
-# access to system binaries like parted and nvme-cli, and now SPDK dynamically linked libs
-FROM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive
+
+#############################################
+# Stage 3: Runtime
+#############################################
+
+FROM rockylinux:9
+
 
 WORKDIR /
 
-# Copy Distort Go Binaries
-COPY --from=go-builder /workspace/bin/distort-manager /usr/local/bin/
-COPY --from=go-builder /workspace/bin/distort-agent /usr/local/bin/
-COPY --from=go-builder /workspace/bin/distort-csi /usr/local/bin/
 
-# Copy compiled SPDK Binaries & Scripts
-# nvmf_tgt is the main SPDK Target executable
-COPY --from=spdk-builder /src/spdk/build/bin/nvmf_tgt /usr/local/bin/nvmf_tgt
-COPY --from=spdk-builder /src/spdk/scripts /opt/spdk/scripts
-COPY --from=spdk-builder /src/spdk/python /opt/spdk/python
-COPY --from=spdk-builder /src/spdk/include /opt/spdk/include
+RUN dnf -y install \
+    CUnit\
+    nvme-cli \
+    parted \
+    e2fsprogs \
+    xfsprogs \
+    kmod \
+    python3 \
+    numactl-libs \
+    rdma-core \
+    libibverbs \
+    librdmacm \
+    pciutils \
+    fuse3-libs \
+    libaio \
+    openssl-libs \
+    json-c \
+    && dnf clean all
 
-ENV PYTHONPATH=/opt/spdk/python
 
 
-# Install runtime dependencies required by the agent, CSI, and SPDK RDMA
-RUN apt-get update && apt-get install -y \
-    nvme-cli parted e2fsprogs xfsprogs kmod \
-    python3 libnuma1 libibverbs1 librdmacm1 pciutils \
-    libfuse3-3 libaio1t64 \
-    && rm -rf /var/lib/apt/lists/*
+#############################################
+# Copy Go binaries
+#############################################
 
-# Manager should run non-privileged but agent/csi need root
-USER 0:0
+COPY --from=go-builder \
+    /workspace/bin/distort-manager \
+    /usr/local/bin/
+
+
+COPY --from=go-builder \
+    /workspace/bin/distort-agent \
+    /usr/local/bin/
+
+
+COPY --from=go-builder \
+    /workspace/bin/distort-csi \
+    /usr/local/bin/
+
+
+
+#############################################
+# Copy SPDK
+#############################################
+
+COPY --from=spdk-builder \
+    /src/spdk \
+    /spdk
+
+
+
+#############################################
+# Copy BXI runtime
+#############################################
+
+COPY --from=spdk-builder \
+    /lib64/libportals-bxi3.so \
+    /lib64/
+
+COPY --from=spdk-builder \
+    /src/spdk/lib/rdma_provider \
+    /opt/spdk/lib/rdma_provider/
+
+
+RUN ln -sf /lib64/libportals-bxi3.so /lib64/libportals.so
+
+
+RUN md5sum /lib64/libportals-bxi3.so
+
+#############################################
+# Dynamic linker config
+#############################################
+
+RUN echo "/opt/spdk/lib" > /etc/ld.so.conf.d/spdk.conf && \
+    echo "/opt/spdk/lib/rdma_provider" >> /etc/ld.so.conf.d/spdk.conf && \
+    echo "/lib64" > /etc/ld.so.conf.d/bxi.conf && \
+    ldconfig
+
+
+
+#############################################
+# Environment
+#############################################
+
+ENV PYTHONPATH=/spdk/python
+
+ENV LD_LIBRARY_PATH=/opt/spdk/lib/rdma_provider:/opt/spdk/lib:/lib64
+
+
+RUN md5sum /lib64/libportals-bxi3.so
 
 ENTRYPOINT ["/usr/local/bin/distort-manager"]
