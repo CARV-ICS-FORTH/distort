@@ -19,10 +19,11 @@ package csi
 import (
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/execlog"
 )
 
 // NVMeDevice represents a block device retrieved from `nvme list-subsys -o json`
@@ -46,10 +47,9 @@ type NVMEHostList []struct {
 
 // ConnectRDMA connects to an NVMe-oF RDMA target.
 func ConnectRDMA(nqn, portalIP, portalPort string) error {
-	klog.Infof("Executing nvme connect -t rdma -a %s -s %s -n %s", portalIP, portalPort, nqn)
-
-	cmd := exec.Command("nvme", "connect", "-t", "rdma", "-a", portalIP, "-s", portalPort, "-n", nqn)
-	out, err := cmd.CombinedOutput()
+	//TODO valid NID hardcoded for now
+	portalIP = "192.168.123.1"
+	out, err := execlog.Run("nvme", "connect", "-t", "portals4", "-a", portalIP, "-s", portalPort, "-n", nqn)
 	if err != nil {
 		if strings.Contains(string(out), "already connected") {
 			klog.Infof("NVMe target %s is already connected", nqn)
@@ -62,10 +62,7 @@ func ConnectRDMA(nqn, portalIP, portalPort string) error {
 
 // DisconnectRDMA disconnects from an NVMe-oF target by NQN.
 func DisconnectRDMA(nqn string) error {
-	klog.Infof("Executing nvme disconnect -n %s", nqn)
-
-	cmd := exec.Command("nvme", "disconnect", "-n", nqn)
-	out, err := cmd.CombinedOutput()
+	out, err := execlog.Run("nvme", "disconnect", "-n", nqn)
 	if err != nil {
 		if strings.Contains(string(out), "no controllers found") {
 			klog.Infof("NVMe target %s already disconnected", nqn)
@@ -78,8 +75,7 @@ func DisconnectRDMA(nqn string) error {
 
 // GetDeviceByNQN finds the block device (e.g., /dev/nvmeXn1) associated with an NQN.
 func GetDeviceByNQN(nqn string) (string, error) {
-	cmd := exec.Command("nvme", "list-subsys", "-o", "json")
-	out, err := cmd.CombinedOutput()
+	out, err := execlog.Run("nvme", "list-subsys", "-o", "json")
 	if err != nil {
 		return "", fmt.Errorf("nvme list-subsys failed: %v, output: %s", err, string(out))
 	}

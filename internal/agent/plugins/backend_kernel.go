@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/execlog"
 )
 
 type KernelBackend struct{}
@@ -24,10 +25,7 @@ func (k *KernelBackend) Name() string {
 func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error {
 	klog.Infof("Ensuring device %s (%s) is bound to kernel nvme driver", deviceName, pciAddress)
 	// Bind device back to kernel nvme driver
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh reset", pciAddress))
-	if out, err := setupCmd.CombinedOutput(); err != nil {
-		klog.Warningf("spdk_setup.sh reset failed or warned: %v, output: %s", err, string(out))
-	}
+	_, _ = execlog.Run("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s %s reset", pciAddress, spdkSetupScript()))
 	return nil
 }
 
@@ -46,9 +44,9 @@ func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blo
 	// Ensure configfs is mounted (nvmet module loaded)
 	if _, err := os.Stat(nvmetPath); err != nil {
 		klog.Info("Loading nvmet and nvmet-rdma modules...")
-		_ = exec.Command("modprobe", "nvmet").Run()
-		_ = exec.Command("modprobe", "nvmet-rdma").Run()
-		_ = exec.Command("mount", "-t", "configfs", "none", "/sys/kernel/config").Run()
+		_, _ = execlog.Run("modprobe", "nvmet")
+		_, _ = execlog.Run("modprobe", "nvmet-rdma")
+		_, _ = execlog.Run("mount", "-t", "configfs", "none", "/sys/kernel/config")
 	}
 
 	// 1. Create Subsystem

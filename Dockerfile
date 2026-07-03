@@ -203,6 +203,7 @@ RUN dnf -y install \
     libaio \
     openssl-libs \
     json-c \
+    procps-ng \
     && dnf clean all
 
 
@@ -271,6 +272,10 @@ RUN echo "/opt/spdk/lib" > /etc/ld.so.conf.d/spdk.conf && \
 #############################################
 
 ENV PYTHONPATH=/spdk/python
+
+# Root of the SPDK tree copied above (/src/spdk -> /spdk). The agent derives
+# scripts/rpc.py, scripts/setup.sh and build/bin/nvmf_tgt from this.
+ENV SPDK_DIR=/spdk
 
 ENV LD_LIBRARY_PATH=/opt/spdk/lib/rdma_provider:/opt/spdk/lib:/lib64
 

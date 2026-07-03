@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -12,6 +11,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
+
+	"distort/internal/execlog"
 )
 
 type NodeServer struct {
@@ -157,8 +158,7 @@ func formatAndMount(source, target string) error {
 
 	// Check if it's already mounted by trying to mount it.
 	klog.Infof("Trying to mount %s to %s", source, target)
-	cmd := exec.Command("mount", source, target)
-	if out, err := cmd.CombinedOutput(); err == nil {
+	if out, err := execlog.Run("mount", source, target); err == nil {
 		return nil // Successfully mounted, was already formatted
 	} else if strings.Contains(string(out), "already mounted") {
 		return nil // Already mounted
@@ -166,14 +166,12 @@ func formatAndMount(source, target string) error {
 
 	// Formatting
 	klog.Infof("Formatting %s as ext4", source)
-	cmd = exec.Command("mkfs.ext4", "-F", source)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execlog.Run("mkfs.ext4", "-F", source); err != nil {
 		return fmt.Errorf("formatting failed: %v, output: %s", err, string(out))
 	}
 
 	// Mount again
-	cmd = exec.Command("mount", source, target)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execlog.Run("mount", source, target); err != nil {
 		return fmt.Errorf("mount failed: %v, output: %s", err, string(out))
 	}
 	return nil
@@ -181,8 +179,7 @@ func formatAndMount(source, target string) error {
 
 func bindMount(source, target string) error {
 	os.MkdirAll(target, 0750)
-	cmd := exec.Command("mount", "--bind", source, target)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execlog.Run("mount", "--bind", source, target); err != nil {
 		if strings.Contains(string(out), "already mounted") {
 			return nil
 		}
@@ -192,8 +189,7 @@ func bindMount(source, target string) error {
 }
 
 func unmount(target string) error {
-	cmd := exec.Command("umount", target)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := execlog.Run("umount", target); err != nil {
 		if strings.Contains(string(out), "not mounted") {
 			return nil
 		}

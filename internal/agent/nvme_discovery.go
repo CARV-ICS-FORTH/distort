@@ -2,7 +2,6 @@ package agent
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"distort/internal/agent/plugins"
+	"distort/internal/execlog"
 )
 
 // HardwareNVMe represents a discovered physical NVMe namespace mapped into SPDK or Kernel.
@@ -174,7 +174,7 @@ type SpdkNVMeController struct {
 }
 
 func discoverSPDKNVMe() ([]HardwareNVMe, error) {
-	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
+	if _, err := execlog.Run("pidof", "nvmf_tgt"); err != nil {
 		return nil, nil // SPDK not running
 	}
 

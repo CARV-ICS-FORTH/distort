@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/execlog"
 )
 
 type SPDKBackend struct{}
@@ -21,13 +23,14 @@ func (s *SPDKBackend) Name() string {
 
 // EnsureSPDKRunning verifies nvmf_tgt is running in the background.
 func EnsureSPDKRunning(coreMask string) error {
-	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
+	if _, err := execlog.Run("pidof", "nvmf_tgt"); err != nil {
 		klog.Info("Starting nvmf_tgt daemon in the background...")
 		if coreMask == "" {
 			coreMask = "0x1"
 		}
 		// Start nvmf_tgt with specified core mask
-		cmd := exec.Command("bash", "-c", fmt.Sprintf("ulimit -l unlimited && nvmf_tgt -m %s", coreMask))
+		cmd := exec.Command("bash", "-c", fmt.Sprintf("ulimit -l unlimited && %s -m %s", spdkNvmfTgt(), coreMask))
+		execlog.LogStart(cmd)
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start nvmf_tgt: %v", err)
 		}
@@ -50,11 +53,8 @@ func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, device
 
 	// Unbind the specific NVMe drive from kernel and bind to vfio-pci/uio_pci_generic using setup.sh
 	klog.Infof("Running spdk_setup.sh to bind device %s (%s) to user-space", deviceName, pciAddress)
-	_ = exec.Command("modprobe", "uio_pci_generic").Run()
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh", pciAddress))
-	if out, err := setupCmd.CombinedOutput(); err != nil {
-		klog.Warningf("spdk_setup.sh failed or warned: %v, output: %s", err, string(out))
-	}
+	_, _ = execlog.Run("modprobe", "uio_pci_generic")
+	_, _ = execlog.Run("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s %s", pciAddress, spdkSetupScript()))
 
 	// Verify if already attached to avoid re-attaching
 	var controllers []struct {
@@ -139,8 +139,7 @@ func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 // ResetSPDKDevice unbinds the SPDK driver from the PCI device and binds it back to the kernel.
 func ResetSPDKDevice(pciAddress string) error {
 	klog.Infof("Resetting device %s back to kernel nvme driver", pciAddress)
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh reset", pciAddress))
-	if out, err := setupCmd.CombinedOutput(); err != nil {
+	if out, err := execlog.Run("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s %s reset", pciAddress, spdkSetupScript())); err != nil {
 		return fmt.Errorf("spdk_setup.sh reset failed: %v, output: %s", err, string(out))
 	}
 	return nil

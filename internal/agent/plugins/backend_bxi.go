@@ -3,10 +3,13 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/execlog"
 )
 
 type BXIBackend struct{}
@@ -21,8 +24,9 @@ func (b *BXIBackend) Name() string {
 
 // EnsureBXISPDKRunning verifies nvmf_tgt is running in the background with Portals/BXI environment variables.
 func EnsureBXISPDKRunning(coreMask string, portalsPID string) error {
-	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
+	if _, err := execlog.Run("pidof", "nvmf_tgt"); err != nil {
 		klog.Info("Starting nvmf_tgt daemon for BXI/Portals in the background...")
+
 		if coreMask == "" {
 			coreMask = "0x1"
 		}
@@ -30,21 +34,31 @@ func EnsureBXISPDKRunning(coreMask string, portalsPID string) error {
 			portalsPID = "11"
 		}
 
-		// Inject BXI specific environment variables (ROLE and PORTALS_PID) required by the custom DPDK build
-		cmdStr := fmt.Sprintf("ROLE=target PORTALS_PID=%s ulimit -l unlimited && /spdk/build/bin/nvmf_tgt -m %s", portalsPID, coreMask)
+		// Build command (no env inline in shell)
+		cmdStr := fmt.Sprintf("ulimit -l unlimited && %s -m %s", spdkNvmfTgt(), coreMask)
 		cmd := exec.Command("bash", "-c", cmdStr)
+
+		// Correct environment propagation
+		cmd.Env = append(os.Environ(),
+			"ROLE=target",
+			fmt.Sprintf("PORTALS_PID=%s", portalsPID),
+		)
+
+		execlog.LogStart(cmd)
+
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start BXI nvmf_tgt: %v", err)
 		}
+
 		go func() {
 			if err := cmd.Wait(); err != nil {
 				klog.Errorf("BXI nvmf_tgt exited with error: %v", err)
 			}
 		}()
 
-		// Give SPDK/DPDK extra time to initialize the Portals EAL and start JSON-RPC
 		time.Sleep(4 * time.Second)
 	}
+
 	return nil
 }
 
@@ -58,11 +72,8 @@ func (b *BXIBackend) SetupDevice(ctx context.Context, pciAddress string, deviceN
 
 	// Unbind the specific NVMe drive from kernel and bind to user-space
 	klog.Infof("Running spdk_setup.sh to bind device %s (%s) to user-space for BXI", deviceName, pciAddress)
-	_ = exec.Command("modprobe", "uio_pci_generic").Run()
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh", pciAddress))
-	if out, err := setupCmd.CombinedOutput(); err != nil {
-		klog.Warningf("spdk_setup.sh failed or warned: %v, output: %s", err, string(out))
-	}
+	_, _ = execlog.Run("modprobe", "uio_pci_generic")
+	_, _ = execlog.Run("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s %s", pciAddress, spdkSetupScript()))
 
 	// Verify if already attached to avoid re-attaching
 	var controllers []struct {

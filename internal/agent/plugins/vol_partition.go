@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/execlog"
 )
 
 type PartedVolumeManager struct{}
@@ -30,13 +31,9 @@ func (pv *PartedVolumeManager) SetupStorage(ctx context.Context, devicePath stri
 
 	klog.Infof("Wiping and Initializing GPT label on %s", devicePath)
 
-	cmdWipe := exec.Command("wipefs", "-a", devicePath)
-	if out, err := cmdWipe.CombinedOutput(); err != nil {
-		klog.Warningf("wipefs error (ignoring): %v output: %s", err, string(out))
-	}
+	_, _ = execlog.Run("wipefs", "-a", devicePath)
 
-	cmd := exec.Command("parted", "-s", devicePath, "mklabel", "gpt")
-	out, err := cmd.CombinedOutput()
+	out, err := execlog.Run("parted", "-s", devicePath, "mklabel", "gpt")
 	if err != nil {
 		return fmt.Errorf("parted mklabel error: %v output: %s", err, string(out))
 	}
@@ -58,11 +55,7 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 	startStr := fmt.Sprintf("%dMB", startMB)
 	endStr := fmt.Sprintf("%dMB", endMB)
 
-	cmd := exec.Command("parted", "-s", "-a", "optimal", devicePath, "mkpart", "primary", startStr, endStr)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Warningf("parted mkpart finished with error: %v output: %s", err, string(out))
-	}
+	_, _ = execlog.Run("parted", "-s", "-a", "optimal", devicePath, "mkpart", "primary", startStr, endStr)
 
 	// Wait for udev to create the device partition.
 	// Hardcoded to partition 1 for the E2E test's single-slice scenario.
@@ -81,8 +74,7 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 
 func (pv *PartedVolumeManager) DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string) error {
 	klog.Infof("Removing partition 1 from %s", devicePath)
-	cmd := exec.Command("parted", "-s", devicePath, "rm", "1")
-	out, err := cmd.CombinedOutput()
+	out, err := execlog.Run("parted", "-s", devicePath, "rm", "1")
 	if err != nil {
 		return fmt.Errorf("parted rm error: %v output: %s", err, string(out))
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -13,8 +14,10 @@ import (
 // It parses the JSON output into the provided result object.
 func CallSPDKRPC(method string, result interface{}, args ...string) error {
 	cmdArgs := append([]string{method}, args...)
-	cmd := exec.Command("/opt/spdk/scripts/rpc.py", cmdArgs...)
-	klog.V(4).Infof("Executing SPDK RPC: %v", cmdArgs)
+	rpcScript := spdkRPCScript()
+	cmd := exec.Command(rpcScript, cmdArgs...)
+	line := rpcScript + " " + strings.Join(cmdArgs, " ")
+	klog.Infof("[exec] running: %s", line)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -22,8 +25,10 @@ func CallSPDKRPC(method string, result interface{}, args ...string) error {
 
 	err := cmd.Run()
 	if err != nil {
+		klog.Errorf("[exec] FAILED: %s\n  error: %v\n  stderr: %s", line, err, strings.TrimRight(stderr.String(), "\n"))
 		return fmt.Errorf("spdk_rpc.py %s failed: %v\nStderr: %s", method, err, stderr.String())
 	}
+	klog.Infof("[exec] OK: %s\n  output: %s", line, strings.TrimRight(stdout.String(), "\n"))
 
 	if result != nil {
 		outBytes := bytes.TrimSpace(stdout.Bytes())

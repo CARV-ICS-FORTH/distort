@@ -51,12 +51,18 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 	lvolBdevName := fmt.Sprintf("%s/%s", storeName, volumeName)
 
 	var bdevs []struct {
-		Name string `json:"name"`
+		Name    string   `json:"name"`
+		Aliases []string `json:"aliases"`
 	}
 	if err := CallSPDKRPC("bdev_get_bdevs", &bdevs); err == nil {
 		for _, bdev := range bdevs {
 			if bdev.Name == lvolBdevName {
 				return lvolBdevName, nil
+			}
+			for _, alias := range bdev.Aliases {
+				if alias == lvolBdevName {
+					return lvolBdevName, nil
+				}
 			}
 		}
 	}

@@ -222,3 +222,6 @@ docs-serve: ## Run Hugo documentation site locally.
 docs-build: ## Build Hugo documentation site static files.
 	cd docs && hugo --minify
 
+.PHONY: sync-crds
+sync-crds: manifests
+	cp -f config/crd/bases/* deploy/charts/distort/crds/
