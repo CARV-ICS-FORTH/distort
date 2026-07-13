@@ -29,3 +29,7 @@ helm install distort ./deploy/charts/distort \
 ## License
 
 This software is distributed under the terms of the [Apache License 2.0](LICENSE).
+
+## Acknowledgements
+
+We thankfully acknowledge the support of the European Commission and the Greek General Secretariat for Research and Innovation to this project. DISTORT has received funding from the EuroHPC Joint Undertaking through project NET4EXA (GA-101175702). EuroHPC JU projects are jointly funded by the European Commission and the involved state members (including the Greek General Secretariat for Research and Innovation).
