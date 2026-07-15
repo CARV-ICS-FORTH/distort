@@ -101,11 +101,12 @@ spec:
                 type: object
               volumeManager:
                 default: partition
-                description: VolumeManager specifies the volume manager (e.g., "partition"
-                  or "lvm").
+                description: VolumeManager specifies the volume manager (e.g., "partition",
+                  "lvm", or "spdk").
                 enum:
                 - partition
                 - lvm
+                - spdk
                 type: string
             required:
             - size

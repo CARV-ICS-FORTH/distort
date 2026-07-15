@@ -57,6 +57,8 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		} else {
 			vmName = "parted"
 		}
+	} else if vmName == "spdk" {
+		vmName = "spdk-lvol"
 	}
 	volManager, err := plugins.GetVolumeManager(vmName)
 	if err != nil {

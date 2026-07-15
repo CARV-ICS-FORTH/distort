@@ -19,6 +19,9 @@ package csi
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -46,12 +49,29 @@ type NVMEHostList []struct {
 }
 
 // ConnectRDMA connects to an NVMe-oF RDMA target.
-func ConnectRDMA(nqn, portalIP, portalPort string) error {
-	//TODO valid NID hardcoded for now
-	portalIP = "192.168.123.1"
+func ConnectRDMA(nqn, portalIP, portalPort, targetBackend string) error {
+	transport := "rdma"
+	if targetBackend == "bxi" {
+		transport = "portals4"
+		// Find valid BXI NID dynamically
+		matches, err := filepath.Glob("/sys/devices/*/*/*/bxi3/bxi*/nid")
+		if err == nil && len(matches) > 0 {
+			for _, match := range matches {
+				data, err := os.ReadFile(match)
+				if err == nil {
+					nidStr := strings.TrimSpace(string(data))
+					if _, err := strconv.Atoi(nidStr); err == nil {
+						// Assuming BXI NIDs map to 192.168.123.<NID>
+						portalIP = fmt.Sprintf("192.168.123.%s", nidStr)
+						break
+					}
+				}
+			}
+		}
+	}
 
-	execlog.LogKernel(6, "nvme connect -t portals4 -a %s -s %s -n %s", portalIP, portalPort, nqn)
-	out, err := execlog.Run("nvme", "connect", "-t", "portals4", "-a", portalIP, "-s", portalPort, "-n", nqn)
+	execlog.LogKernel(6, "nvme connect -t %s -a %s -s %s -n %s", transport, portalIP, portalPort, nqn)
+	out, err := execlog.Run("nvme", "connect", "-t", transport, "-a", portalIP, "-s", portalPort, "-n", nqn)
 	if err != nil {
 		if strings.Contains(string(out), "already connected") {
 			klog.Infof("NVMe target %s is already connected", nqn)

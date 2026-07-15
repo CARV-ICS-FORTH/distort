@@ -74,8 +74,9 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	klog.Infof("NodeStageVolume: Connecting to NVMe-oF target. NQN=%s Portal=%s:%s", nqn, portalIP, portalPort)
 
-	// 1. Connect via RDMA
-	if err := ConnectRDMA(nqn, portalIP, portalPort); err != nil {
+	// 1. Connect via RDMA or Portals4
+	targetBackend := volCtx["target-backend"]
+	if err := ConnectRDMA(nqn, portalIP, portalPort, targetBackend); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to connect to NVMe-oF target: %v", err)
 	}
 

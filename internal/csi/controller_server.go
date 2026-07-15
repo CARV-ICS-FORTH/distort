@@ -55,7 +55,11 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	volumeManager := req.GetParameters()["volume-manager"]
 	if volumeManager == "" {
-		volumeManager = "partition"
+		if targetBackend == "spdk" || targetBackend == "bxi" {
+			volumeManager = "spdk"
+		} else {
+			volumeManager = "partition"
+		}
 	}
 	targetOptions := make(map[string]string)
 	for k, v := range req.GetParameters() {
