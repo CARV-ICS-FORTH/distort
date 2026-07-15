@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -251,6 +252,18 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	portalPort := 4420
+	if targetBackendName == "bxi" {
+		portalPort = 11
+	}
+
+	for _, key := range []string{"port", "rdma-port", "portals-pid"} {
+		if pStr, ok := partition.Spec.TargetOptions[key]; ok {
+			if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+				portalPort = p
+				break
+			}
+		}
+	}
 	nqn, err := backend.ExportVolume(ctx, partition.Name, blockPath, portalIP, portalPort, partition.Spec.TargetOptions)
 	if err != nil {
 		logger.Error(err, "Failed to export volume as target")

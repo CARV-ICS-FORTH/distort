@@ -51,7 +51,26 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// Extract the connection details we placed in CreateVolume
 	nqn := volCtx["nqn"]
 	portalIP := volCtx["portalIP"]
-	portalPort := volCtx["portalPort"]
+	// Resolve the connection port (checking all possible aliases for consistency)
+	portalPort := volCtx["port"]
+	if portalPort == "" {
+		portalPort = volCtx["portals-pid"]
+	}
+	if portalPort == "" {
+		portalPort = volCtx["rdma-port"]
+	}
+	if portalPort == "" {
+		portalPort = volCtx["portalPort"] // Agent CRD Status reported port
+	}
+
+	// Absolute fallback depending on the backend
+	if portalPort == "" || portalPort == "0" {
+		if volCtx["target-backend"] == "bxi" {
+			portalPort = "11"
+		} else {
+			portalPort = "4420"
+		}
+	}
 
 	klog.Infof("NodeStageVolume: Connecting to NVMe-oF target. NQN=%s Portal=%s:%s", nqn, portalIP, portalPort)
 

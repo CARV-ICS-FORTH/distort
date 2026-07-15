@@ -49,6 +49,8 @@ type NVMEHostList []struct {
 func ConnectRDMA(nqn, portalIP, portalPort string) error {
 	//TODO valid NID hardcoded for now
 	portalIP = "192.168.123.1"
+
+	execlog.LogKernel(6, "nvme connect -t portals4 -a %s -s %s -n %s", portalIP, portalPort, nqn)
 	out, err := execlog.Run("nvme", "connect", "-t", "portals4", "-a", portalIP, "-s", portalPort, "-n", nqn)
 	if err != nil {
 		if strings.Contains(string(out), "already connected") {

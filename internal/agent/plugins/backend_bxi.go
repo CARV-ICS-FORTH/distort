@@ -64,7 +64,14 @@ func EnsureBXISPDKRunning(coreMask string, portalsPID string) error {
 
 func (b *BXIBackend) SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error {
 	coreMask := options["spdk-core-mask"]
-	portalsPID := options["portals-pid"]
+
+	portalsPID := options["port"]
+	if portalsPID == "" {
+		portalsPID = options["portals-pid"]
+	}
+	if portalsPID == "" {
+		portalsPID = "11"
+	}
 
 	if err := EnsureBXISPDKRunning(coreMask, portalsPID); err != nil {
 		return err
@@ -113,17 +120,12 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName string, blockP
 		bxiNID = portalIP // Fallback to standard IP if no explicit BXI NID is provided via K8s config
 	}
 
-	portalsPID := options["portals-pid"]
-	if portalsPID == "" {
-		portalsPID = "11" // Hard fallback for BXI default env vars if needed
+	portStr := fmt.Sprintf("%d", portalPort)
+	if portStr == "0" {
+		portStr = "11" // Fallback safety
 	}
 
-	rdmaPort := fmt.Sprintf("%d", portalPort)
-	if rdmaPort == "0" {
-		rdmaPort = "4420"
-	}
-
-	klog.Infof("Exporting %s as NVMe-oF target %s on IP %s (RDMA Port %s, BXI PID %s) via SPDK", blockPath, nqn, bxiNID, rdmaPort, portalsPID)
+	klog.Infof("Exporting %s as NVMe-oF target %s on IP %s (Port/PID %s) via SPDK", blockPath, nqn, bxiNID, portStr)
 
 	// Check if already exported (subsystem exists)
 	var subsystems []struct {
@@ -156,7 +158,7 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName string, blockP
 
 	// 3. Add Listener
 	// Map the transport address (-a) to the BXI NID and use RDMA transport
-	err = CallSPDKRPC("nvmf_subsystem_add_listener", nil, nqn, "-t", "rdma", "-a", bxiNID, "-s", rdmaPort)
+	err = CallSPDKRPC("nvmf_subsystem_add_listener", nil, nqn, "-t", "rdma", "-a", bxiNID, "-s", portStr)
 	if err != nil {
 		_ = CallSPDKRPC("nvmf_delete_subsystem", nil, nqn)
 		return "", fmt.Errorf("failed to add RDMA listener to subsystem: %w", err)

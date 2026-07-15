@@ -59,7 +59,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	targetOptions := make(map[string]string)
 	for k, v := range req.GetParameters() {
-		if strings.HasPrefix(k, "spdk-") || strings.HasPrefix(k, "bxi-") || strings.HasPrefix(k, "portals-") || strings.HasPrefix(k, "rdma-") || k == "spdk-core-mask" {
+		if strings.HasPrefix(k, "spdk-") || strings.HasPrefix(k, "bxi-") || strings.HasPrefix(k, "portals-") || strings.HasPrefix(k, "rdma-") || k == "spdk-core-mask" || k == "port" {
 			targetOptions[k] = v
 		}
 	}
@@ -108,9 +108,17 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	// Construct context for the Node Stage/Publish calls
 	volCtx := map[string]string{
-		"nqn":        partition.Status.NQN,
-		"portalIP":   partition.Status.PortalIP,
-		"portalPort": fmt.Sprintf("%d", partition.Status.PortalPort),
+		"nqn":            partition.Status.NQN,
+		"portalIP":       partition.Status.PortalIP,
+		"portalPort":     fmt.Sprintf("%d", partition.Status.PortalPort),
+		"target-backend": targetBackend,
+	}
+
+	// Propagate StorageClass parameters to the VolumeContext for the Node plugin
+	for k, v := range req.GetParameters() {
+		if _, exists := volCtx[k]; !exists {
+			volCtx[k] = v
+		}
 	}
 
 	return &csi.CreateVolumeResponse{
