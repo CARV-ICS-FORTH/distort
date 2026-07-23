@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
 )
 
 type SPDKBackend struct{}
+
+var deviceSetupMu sync.Mutex
 
 func init() {
 	RegisterTargetBackend(&SPDKBackend{})
@@ -19,8 +23,9 @@ func (s *SPDKBackend) Name() string {
 	return "spdk"
 }
 
-// EnsureSPDKRunning verifies nvmf_tgt is running in the background.
-func EnsureSPDKRunning(coreMask string) error {
+// EnsureSPDKRunning starts nvmf_tgt when needed and waits until its JSON-RPC
+// service is usable. A running process is not necessarily ready to accept RPCs.
+func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
 		klog.Info("Starting nvmf_tgt daemon in the background...")
 		if coreMask == "" {
@@ -36,44 +41,107 @@ func EnsureSPDKRunning(coreMask string) error {
 				klog.Errorf("nvmf_tgt exited with error: %v", err)
 			}
 		}()
-		// Give SPDK time to initialize DPDK EAL and start JSON-RPC
-		time.Sleep(3 * time.Second)
 	}
-	return nil
+
+	var lastErr error
+	for attempt := 1; attempt <= 30; attempt++ {
+		var methods []string
+		if err := CallSPDKRPC("rpc_get_methods", &methods); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for nvmf_tgt JSON-RPC readiness: %w", ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("nvmf_tgt JSON-RPC was not ready after 30 seconds: %w", lastErr)
 }
 
 func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error {
 	coreMask := options["spdk-core-mask"]
-	if err := EnsureSPDKRunning(coreMask); err != nil {
+	if err := EnsureSPDKRunning(ctx, coreMask); err != nil {
 		return err
 	}
 
-	// Unbind the specific NVMe drive from kernel and bind to vfio-pci/uio_pci_generic using setup.sh
-	klog.Infof("Running spdk_setup.sh to bind device %s (%s) to user-space", deviceName, pciAddress)
-	_ = exec.Command("modprobe", "uio_pci_generic").Run()
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh", pciAddress))
-	if out, err := setupCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("spdk_setup.sh failed: %v, output: %s (Check if uio_pci_generic/vfio-pci is loaded or manually unbind on host)", err, string(out))
+	// Verify if already attached to avoid re-attaching
+	attached, err := isNVMeControllerAttached(deviceName)
+	if err == nil && attached {
+		return nil
 	}
 
-	// Verify if already attached to avoid re-attaching
-	var controllers []struct {
-		Name string `json:"name"`
+	// setup.sh changes host-wide PCI driver state. Serialize it with reset and
+	// retry because udev/sysfs may briefly report the device while its driver is
+	// still transitioning.
+	deviceSetupMu.Lock()
+	defer deviceSetupMu.Unlock()
+
+	attached, err = isNVMeControllerAttached(deviceName)
+	if err == nil && attached {
+		return nil
 	}
-	if err := CallSPDKRPC("bdev_nvme_get_controllers", &controllers); err == nil {
-		for _, c := range controllers {
-			if c.Name == deviceName {
-				return nil // already attached
-			}
-		}
+
+	klog.Infof("Running spdk_setup.sh to bind device %s (%s) to user-space", deviceName, pciAddress)
+	_ = exec.CommandContext(ctx, "modprobe", "uio_pci_generic").Run()
+	if err := runSPDKSetup(ctx, pciAddress); err != nil {
+		return err
 	}
 
 	klog.Infof("Attaching Physical NVMe controller %s at %s to SPDK", deviceName, pciAddress)
 	if err := CallSPDKRPC("bdev_nvme_attach_controller", nil, "-b", deviceName, "-t", "PCIe", "-a", pciAddress); err != nil {
+		// An earlier timed-out RPC may have completed on the server.
+		if attached, checkErr := isNVMeControllerAttached(deviceName); checkErr == nil && attached {
+			return nil
+		}
 		return fmt.Errorf("failed to attach NVMe %s to SPDK: %w", pciAddress, err)
 	}
 
 	return nil
+}
+
+func isNVMeControllerAttached(deviceName string) (bool, error) {
+	var controllers []struct {
+		Name string `json:"name"`
+	}
+	if err := CallSPDKRPC("bdev_nvme_get_controllers", &controllers); err != nil {
+		return false, err
+	}
+	for _, controller := range controllers {
+		if controller.Name == deviceName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func runSPDKSetup(ctx context.Context, pciAddress string) error {
+	var lastErr error
+	var lastOutput string
+	for attempt := 1; attempt <= 5; attempt++ {
+		cmd := exec.CommandContext(ctx, "/opt/spdk/scripts/setup.sh")
+		cmd.Env = append(cmd.Environ(), "FORCE=1", "PCI_ALLOWED="+pciAddress)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("spdk_setup.sh interrupted: %w", ctx.Err())
+		}
+
+		lastErr = err
+		lastOutput = strings.TrimSpace(string(out))
+		klog.Warningf("spdk_setup.sh attempt %d/5 failed for %s: %v, output: %s", attempt, pciAddress, err, lastOutput)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("spdk_setup.sh interrupted: %w", ctx.Err())
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	return fmt.Errorf("spdk_setup.sh failed after 5 attempts: %v, output: %s", lastErr, lastOutput)
 }
 
 func EnsureNVMeTransport() error {
@@ -138,8 +206,12 @@ func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 
 // ResetSPDKDevice unbinds the SPDK driver from the PCI device and binds it back to the kernel.
 func ResetSPDKDevice(pciAddress string) error {
+	deviceSetupMu.Lock()
+	defer deviceSetupMu.Unlock()
+
 	klog.Infof("Resetting device %s back to kernel nvme driver", pciAddress)
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh reset", pciAddress))
+	setupCmd := exec.Command("/opt/spdk/scripts/setup.sh", "reset")
+	setupCmd.Env = append(setupCmd.Environ(), "FORCE=1", "PCI_ALLOWED="+pciAddress)
 	if out, err := setupCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("spdk_setup.sh reset failed: %v, output: %s", err, string(out))
 	}

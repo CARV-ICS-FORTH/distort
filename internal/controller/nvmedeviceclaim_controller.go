@@ -75,8 +75,9 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if claim.Status.MatchedDevice != "" {
 				var dev storagev1alpha1.NVMeDevice
 				if err := r.Get(ctx, client.ObjectKey{Name: claim.Status.MatchedDevice, Namespace: claim.Namespace}, &dev); err == nil {
+					base := dev.DeepCopy()
 					dev.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
-					if err := r.Status().Update(ctx, &dev); err != nil {
+					if err := r.Status().Patch(ctx, &dev, client.MergeFrom(base)); err != nil {
 						logger.Error(err, "unable to free NVMeDevice status", "device", dev.Name)
 						return ctrl.Result{}, err
 					}
@@ -116,8 +117,9 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// Transition device to Claimed
+			base := dev.DeepCopy()
 			dev.Status.State = storagev1alpha1.NVMeDeviceStateClaimed
-			if err := r.Status().Update(ctx, &dev); err != nil {
+			if err := r.Status().Patch(ctx, &dev, client.MergeFrom(base)); err != nil {
 				logger.Error(err, "unable to update NVMeDevice status", "device", dev.Name)
 				return ctrl.Result{}, err
 			}

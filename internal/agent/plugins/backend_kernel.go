@@ -24,10 +24,8 @@ func (k *KernelBackend) Name() string {
 
 func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error {
 	klog.Infof("Ensuring device %s (%s) is bound to kernel nvme driver", deviceName, pciAddress)
-	// Bind device back to kernel nvme driver
-	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh reset", pciAddress))
-	if out, err := setupCmd.CombinedOutput(); err != nil {
-		klog.Warningf("spdk_setup.sh reset failed or warned: %v, output: %s", err, string(out))
+	if err := ResetSPDKDevice(pciAddress); err != nil {
+		klog.Warningf("spdk_setup.sh reset failed or warned: %v", err)
 	}
 	return nil
 }

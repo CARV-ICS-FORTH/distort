@@ -50,15 +50,6 @@ func (r *Reporter) report(ctx context.Context) {
 func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity int64) {
 	logger := log.FromContext(ctx)
 
-	nodeCR := &storagev1alpha1.RDMAStorageNode{}
-	err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, nodeCR)
-
-	exists := err == nil
-	if client.IgnoreNotFound(err) != nil {
-		logger.Error(err, "Failed to fetch RDMAStorageNode")
-		return
-	}
-
 	// Fetch K8s Node to determine Internal IP for RDMA
 	rdmaIP := "127.0.0.1" // Fallback
 	k8sNode := &corev1.Node{}
@@ -73,30 +64,43 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 		logger.Error(err, "Failed to get K8s Node for RDMAIP")
 	}
 
-	nodeCR.Name = r.NodeName
-	nodeCR.Spec.NodeName = r.NodeName
-	nodeCR.Spec.RDMAIP = rdmaIP
-	nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
+	nodeCR := &storagev1alpha1.RDMAStorageNode{}
+	err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, nodeCR)
+	exists := err == nil
+	if client.IgnoreNotFound(err) != nil {
+		logger.Error(err, "Failed to fetch RDMAStorageNode")
+		return
+	}
 
 	if !exists {
+		nodeCR.Name = r.NodeName
+		nodeCR.Spec.NodeName = r.NodeName
+		nodeCR.Spec.RDMAIP = rdmaIP
+		nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
 		if err := r.Create(ctx, nodeCR); err != nil {
 			logger.Error(err, "Failed to create RDMAStorageNode")
 			return
 		}
-	} else {
-		if err := r.Update(ctx, nodeCR); err != nil {
+	} else if nodeCR.Spec.NodeName != r.NodeName ||
+		nodeCR.Spec.RDMAIP != rdmaIP ||
+		nodeCR.Spec.Transport != storagev1alpha1.RDMATransportRoCEv2 {
+		base := nodeCR.DeepCopy()
+		nodeCR.Spec.NodeName = r.NodeName
+		nodeCR.Spec.RDMAIP = rdmaIP
+		nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
+		if err := r.Patch(ctx, nodeCR, client.MergeFrom(base)); err != nil {
 			logger.Error(err, "Failed to update RDMAStorageNode Spec")
 			return
 		}
 	}
 
-	// Update Status
+	base := nodeCR.DeepCopy()
 	nodeCR.Status.TotalCapacity = *resource.NewQuantity(totalCapacity, resource.BinarySI)
 	nodeCR.Status.FreeCapacity = *resource.NewQuantity(freeCapacity, resource.BinarySI)
-	nodeCR.Status.ActiveExports = 0 // Will be calculated by Manager or updated by CSI
-
-	if err := r.Status().Update(ctx, nodeCR); err != nil {
-		logger.Error(err, "Failed to update RDMAStorageNode Status")
+	nodeCR.Status.ActiveExports = 0
+	err = r.Status().Patch(ctx, nodeCR, client.MergeFrom(base))
+	if err != nil {
+		logger.Error(err, "Failed to report RDMAStorageNode")
 	}
 }
 
@@ -147,10 +151,15 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 			logger.Info("Discovered new NVMe device", "device", deviceName, "serial", d.SerialNumber)
 
 			// Initialize Status
-			devCR.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
-			devCR.Status.FreeCapacity = devCR.Spec.TotalCapacity
-
-			if err := r.Status().Update(ctx, devCR); err != nil {
+			latest := &storagev1alpha1.NVMeDevice{}
+			err := r.Get(ctx, types.NamespacedName{Name: deviceName}, latest)
+			if err == nil {
+				base := latest.DeepCopy()
+				latest.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
+				latest.Status.FreeCapacity = latest.Spec.TotalCapacity
+				err = r.Status().Patch(ctx, latest, client.MergeFrom(base))
+			}
+			if err != nil {
 				logger.Error(err, "Failed to update NVMeDevice status", "device", deviceName)
 			}
 

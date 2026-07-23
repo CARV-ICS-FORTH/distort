@@ -75,8 +75,9 @@ func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Update the device status only if it changed
 	newFreeCapacity := *resource.NewQuantity(freeCapacity, resource.BinarySI)
 	if device.Status.FreeCapacity.Cmp(newFreeCapacity) != 0 {
+		base := device.DeepCopy()
 		device.Status.FreeCapacity = newFreeCapacity
-		if err := r.Status().Update(ctx, &device); err != nil {
+		if err := r.Status().Patch(ctx, &device, client.MergeFrom(base)); err != nil {
 			logger.Error(err, "Failed to update NVMeDevice Status with FreeCapacity")
 			return ctrl.Result{}, err
 		}
