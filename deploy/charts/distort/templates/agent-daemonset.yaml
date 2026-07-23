@@ -48,21 +48,12 @@ spec:
               mountPath: /dev
             - name: hugepages
               mountPath: /dev/hugepages
-            - name: sys-class-nvme
-              mountPath: /sys/class/nvme
-              readOnly: true
-            - name: sys-class-block
-              mountPath: /sys/class/block
-              readOnly: true
-            - name: sys-kernel-config
-              mountPath: /sys/kernel/config
-              mountPropagation: Bidirectional
             - name: lib-modules
               mountPath: /lib/modules
               readOnly: true
             - name: sys
               mountPath: /sys
-              mountPropagation: Bidirectional
+              mountPropagation: HostToContainer
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
       volumes:
@@ -73,18 +64,6 @@ spec:
         - name: hugepages
           emptyDir:
             medium: HugePages
-        - name: sys-class-nvme
-          hostPath:
-            path: /sys/class/nvme
-            type: DirectoryOrCreate
-        - name: sys-class-block
-          hostPath:
-            path: /sys/class/block
-            type: Directory
-        - name: sys-kernel-config
-          hostPath:
-            path: /sys/kernel/config
-            type: Directory
         - name: host-root
           hostPath:
             path: /

@@ -52,10 +52,8 @@ func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
 
 func (d *Driver) Run() {
 	var wg sync.WaitGroup
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 
 		// Parse endpoint
 		var protocol, addr string
@@ -90,7 +88,7 @@ func (d *Driver) Run() {
 		if err := server.Serve(listener); err != nil {
 			klog.Fatalf("GRPC server failed: %v", err)
 		}
-	}()
+	})
 
 	wg.Wait()
 }

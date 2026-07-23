@@ -83,7 +83,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				if err == nil {
 					var devPath, devBaseName string
 					for _, d := range devices {
-						if strings.ToLower(d.SerialNumber) == strings.ToLower(partition.Spec.ParentDeviceSerialNumber) {
+						if strings.EqualFold(d.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
 							devBaseName = d.Name
 							devPath = "/dev/" + d.Name + "n1"
 							if targetBackendName == "spdk" {
@@ -227,7 +227,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	var devPath, devBaseName string
 	for _, d := range devices {
-		if strings.ToLower(d.SerialNumber) == strings.ToLower(partition.Spec.ParentDeviceSerialNumber) {
+		if strings.EqualFold(d.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
 			devBaseName = d.Name
 			devPath = "/dev/" + d.Name + "n1"
 			if targetBackendName == "spdk" {

@@ -69,7 +69,7 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 	partPath = devicePath + "p1"
 
 	klog.Infof("Waiting for udev to create %s...", partPath)
-	for i := 0; i < 15; i++ {
+	for range 15 {
 		if _, err := os.Stat(partPath); err == nil {
 			break
 		}

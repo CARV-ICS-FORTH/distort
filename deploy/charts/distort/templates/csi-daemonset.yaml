@@ -49,8 +49,8 @@ spec:
               mountPath: /dev
             - name: plugin-dir
               mountPath: /csi
-            - name: pods-mount-dir
-              mountPath: /var/lib/kubelet/pods
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
               mountPropagation: "Bidirectional"
           resources:
             {{- toYaml .Values.csi.resources | nindent 12 }}
@@ -67,9 +67,9 @@ spec:
           hostPath:
             path: /var/lib/kubelet/plugins_registry/
             type: Directory
-        - name: pods-mount-dir
+        - name: kubelet-dir
           hostPath:
-            path: /var/lib/kubelet/pods
+            path: /var/lib/kubelet
             type: DirectoryOrCreate
       {{- with .Values.nodeSelector }}
       nodeSelector:

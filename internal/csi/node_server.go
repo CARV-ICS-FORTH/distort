@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -67,7 +68,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// Wait for udev to create the block device node
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, err := os.Stat(devPath); err == nil {
 			break
 		}
@@ -152,35 +153,67 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
+func isMountPoint(target string) (bool, error) {
+	target = filepath.Clean(target)
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		data, err = os.ReadFile("/proc/mounts")
+		if err != nil {
+			return false, err
+		}
+	}
+	lines := strings.SplitSeq(string(data), "\n")
+	for line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 {
+			mountPoint := filepath.Clean(fields[4])
+			if mountPoint == target {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 func formatAndMount(source, target string) error {
-	os.MkdirAll(target, 0750)
+	_ = os.MkdirAll(target, 0750)
 
-	// Check if it's already mounted by trying to mount it.
-	klog.Infof("Trying to mount %s to %s", source, target)
-	cmd := exec.Command("mount", source, target)
-	if out, err := cmd.CombinedOutput(); err == nil {
-		return nil // Successfully mounted, was already formatted
-	} else if strings.Contains(string(out), "already mounted") {
-		return nil // Already mounted
+	mounted, err := isMountPoint(target)
+	if err == nil && mounted {
+		klog.Infof("Target %s is already mounted", target)
+		return nil
 	}
 
-	// Formatting
-	klog.Infof("Formatting %s as ext4", source)
-	cmd = exec.Command("mkfs.ext4", "-F", source)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("formatting failed: %v, output: %s", err, string(out))
+	// Check if source block device is already formatted
+	cmd := exec.Command("blkid", source)
+	if err := cmd.Run(); err != nil {
+		klog.Infof("Formatting %s as ext4", source)
+		mkfsCmd := exec.Command("mkfs.ext4", "-F", source)
+		if out, mkfsErr := mkfsCmd.CombinedOutput(); mkfsErr != nil {
+			return fmt.Errorf("formatting failed: %v, output: %s", mkfsErr, string(out))
+		}
 	}
 
-	// Mount again
-	cmd = exec.Command("mount", source, target)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("mount failed: %v, output: %s", err, string(out))
+	klog.Infof("Mounting %s to %s", source, target)
+	mountCmd := exec.Command("mount", source, target)
+	if out, mountErr := mountCmd.CombinedOutput(); mountErr != nil {
+		if strings.Contains(string(out), "already mounted") {
+			return nil
+		}
+		return fmt.Errorf("mount failed: %v, output: %s", mountErr, string(out))
 	}
 	return nil
 }
 
 func bindMount(source, target string) error {
-	os.MkdirAll(target, 0750)
+	_ = os.MkdirAll(target, 0750)
+
+	mounted, err := isMountPoint(target)
+	if err == nil && mounted {
+		klog.Infof("Target %s is already bind mounted", target)
+		return nil
+	}
+
 	cmd := exec.Command("mount", "--bind", source, target)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if strings.Contains(string(out), "already mounted") {
@@ -192,12 +225,19 @@ func bindMount(source, target string) error {
 }
 
 func unmount(target string) error {
-	cmd := exec.Command("umount", target)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "not mounted") {
+	for {
+		mounted, err := isMountPoint(target)
+		if err != nil || !mounted {
+			klog.Infof("Target %s is not mounted", target)
 			return nil
 		}
-		return fmt.Errorf("unmount failed: %v, output: %s", err, string(out))
+
+		cmd := exec.Command("umount", target)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if strings.Contains(string(out), "not mounted") || strings.Contains(string(out), "no mount point specified") {
+				return nil
+			}
+			return fmt.Errorf("unmount failed: %v, output: %s", err, string(out))
+		}
 	}
-	return nil
 }

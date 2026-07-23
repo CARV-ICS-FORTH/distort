@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -58,7 +59,7 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	finalizerName := "storage.distort.io/claim-cleanup"
 
 	// Examine DeletionTimestamp to determine if object is under deletion
-	if claim.ObjectMeta.DeletionTimestamp.IsZero() {
+	if claim.DeletionTimestamp.IsZero() {
 		// The object is not being deleted, so if it does not have our finalizer,
 		// then lets add the finalizer and update the object.
 		if !containsString(claim.GetFinalizers(), finalizerName) {
@@ -142,12 +143,7 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 // Helper functions to check and remove string from a slice of strings.
 func containsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, s)
 }
 
 func removeString(slice []string, s string) (result []string) {

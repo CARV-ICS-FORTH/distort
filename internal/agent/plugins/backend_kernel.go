@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -33,6 +34,27 @@ func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, devi
 
 const nvmetPath = "/sys/kernel/config/nvmet"
 
+func isMountPoint(target string) bool {
+	target = filepath.Clean(target)
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		data, err = os.ReadFile("/proc/mounts")
+		if err != nil {
+			return false
+		}
+	}
+	lines := strings.SplitSeq(string(data), "\n")
+	for line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 {
+			if filepath.Clean(fields[4]) == target {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error) {
 	nqn := "nqn.2026-02.io.distort:volume-" + volumeName
 	subsysPath := filepath.Join(nvmetPath, "subsystems", nqn)
@@ -48,7 +70,10 @@ func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blo
 		klog.Info("Loading nvmet and nvmet-rdma modules...")
 		_ = exec.Command("modprobe", "nvmet").Run()
 		_ = exec.Command("modprobe", "nvmet-rdma").Run()
-		_ = exec.Command("mount", "-t", "configfs", "none", "/sys/kernel/config").Run()
+		if !isMountPoint("/sys/kernel/config") {
+			klog.Info("Mounting configfs on /sys/kernel/config...")
+			_ = exec.Command("mount", "-t", "configfs", "none", "/sys/kernel/config").Run()
+		}
 	}
 
 	// 1. Create Subsystem

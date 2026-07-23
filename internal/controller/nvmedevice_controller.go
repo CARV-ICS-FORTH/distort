@@ -68,10 +68,9 @@ func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	freeCapacity := totalCapacity - usedCapacity
-	if freeCapacity < 0 {
-		freeCapacity = 0 // Should not happen if scheduling is correct
-	}
+	freeCapacity := max(totalCapacity-usedCapacity,
+		// Should not happen if scheduling is correct
+		0)
 
 	// Update the device status only if it changed
 	newFreeCapacity := *resource.NewQuantity(freeCapacity, resource.BinarySI)
