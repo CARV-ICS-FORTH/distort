@@ -40,6 +40,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Resolve the target backend and volume manager plugins
 	targetBackendName := partition.Spec.TargetBackend
+	logger.Info("Resolving target backend plugin", "backend", targetBackendName)
 	if targetBackendName == "" {
 		targetBackendName = "spdk" // default fallback
 	}
@@ -50,6 +51,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	vmName := partition.Spec.VolumeManager
+	logger.Info("Resolving volume manager plugin", "vm", vmName)
 	if vmName == "" || vmName == "partition" {
 		if targetBackendName == "spdk" {
 			vmName = "spdk-lvol"
@@ -141,8 +143,31 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
-	// If it's already exported or failed, do nothing
-	if partition.Status.State == storagev1alpha1.NVMePartitionStateExported || partition.Status.State == storagev1alpha1.NVMePartitionStateFailed {
+	// If it's already exported or failed, verify its existence or return
+	if partition.Status.State == storagev1alpha1.NVMePartitionStateExported {
+		if targetBackendName == "spdk" {
+			nqn := partition.Status.NQN
+			var subsystems []struct {
+				NQN string `json:"nqn"`
+			}
+			exists := false
+			if err := plugins.CallSPDKRPC("nvmf_get_subsystems", &subsystems); err == nil {
+				for _, sub := range subsystems {
+					if sub.NQN == nqn {
+						exists = true
+						break
+					}
+				}
+			}
+			if exists {
+				return ctrl.Result{}, nil
+			}
+			logger.Info("Partition is marked Exported but subsystem is missing from SPDK. Re-provisioning...", "nqn", nqn)
+			// Fall through to re-provision
+		} else {
+			return ctrl.Result{}, nil
+		}
+	} else if partition.Status.State == storagev1alpha1.NVMePartitionStateFailed {
 		return ctrl.Result{}, nil
 	}
 

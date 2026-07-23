@@ -118,6 +118,27 @@ func discoverKernelNVMe() ([]HardwareNVMe, error) {
 			hwDev.PCIAddress = filepath.Base(link)
 		}
 
+		// Check environment variables
+		if excludeList := os.Getenv("NVME_EXCLUDE_DEVICES"); excludeList != "" {
+			if strings.Contains(excludeList, hwDev.PCIAddress) {
+				//klog.Infof("Skipping device %s (%s) because it is in NVME_EXCLUDE_DEVICES", devName, hwDev.PCIAddress)
+
+				continue
+			}
+		}
+		if allowList := os.Getenv("NVME_ALLOWED_DEVICES"); allowList != "" {
+			if !strings.Contains(allowList, hwDev.PCIAddress) {
+				klog.Infof("Skipping device %s (%s) because it is not in NVME_ALLOWED_DEVICES", devName, hwDev.PCIAddress)
+				continue
+			}
+		}
+
+		// Check for mounted filesystems using lsblk
+		if isDeviceMounted(devName) {
+			klog.Infof("Skipping device %s (%s) because it has mounted filesystems", devName, hwDev.PCIAddress)
+			continue
+		}
+
 		// Calculate total bytes from matching namespace blocks
 		hwDev.TotalBytes = calculateTotalBytes(devName)
 
@@ -125,6 +146,37 @@ func discoverKernelNVMe() ([]HardwareNVMe, error) {
 	}
 
 	return devices, nil
+}
+
+func isDeviceMounted(devName string) bool {
+	// devName is an NVMe controller (e.g. "nvme1"), which is a character device.
+	// lsblk only works on block devices, so we must check the namespaces
+	// (e.g. nvme1n1, nvme1n2) found under /sys/class/block.
+	entries, err := os.ReadDir(sysClassBlock)
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entries {
+		bName := entry.Name()
+		if !strings.HasPrefix(bName, devName+"n") {
+			continue
+		}
+		out, err := exec.Command("lsblk", "/dev/"+bName, "-n", "-o", "MOUNTPOINT").Output()
+		if err != nil {
+			klog.Warningf("lsblk failed for namespace %s: %v", bName, err)
+			continue
+		}
+		lines := strings.Split(string(out), "\n")
+		klog.Infof("lsblk mountpoints for namespace %s: %v", bName, lines)
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				klog.Infof("Namespace %s is mounted (mountpoint: %q), skipping controller %s", bName, strings.TrimSpace(line), devName)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func calculateTotalBytes(nvmeName string) int64 {

@@ -58,8 +58,9 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		volumeManager = "partition"
 	}
 	targetOptions := make(map[string]string)
+	// csi.storage.k8s.io/* keys are injected by the provisioner sidecar and are not for backends.
 	for k, v := range req.GetParameters() {
-		if strings.HasPrefix(k, "spdk-") || k == "spdk-core-mask" {
+		if !strings.HasPrefix(k, "csi.storage.k8s.io/") && k != "target-backend" && k != "volume-manager" {
 			targetOptions[k] = v
 		}
 	}
@@ -85,11 +86,19 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			klog.Errorf("Failed to create NVMePartition CRD: %v", err)
 			return nil, status.Errorf(codes.Internal, "failed to create partition: %v", err)
 		}
-		// If it already exists, just retrieve it
-		err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, partition)
-		if err != nil {
+		// Partition already exists — retrieve it and verify it matches the requested backend.
+		// This prevents silently reusing a stale partition created with a different backend.
+		existing := &storagev1alpha1.NVMePartition{}
+		if err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, existing); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get existing partition: %v", err)
 		}
+		if existing.Spec.TargetBackend != targetBackend {
+			klog.Errorf("Existing NVMePartition %s has backend %q but %q was requested", name, existing.Spec.TargetBackend, targetBackend)
+			return nil, status.Errorf(codes.AlreadyExists,
+				"partition %s already exists with backend %q; delete the existing partition or PVC first",
+				name, existing.Spec.TargetBackend)
+		}
+		partition = existing
 	}
 
 	// Wait for the partition to be Exported

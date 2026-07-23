@@ -23,7 +23,7 @@ spec:
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.1
           args:
             - --csi-address=/csi/csi.sock
-            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi.distort.io/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/storage.distort.io/csi.sock
           volumeMounts:
             - name: plugin-dir
               mountPath: /csi
@@ -61,7 +61,7 @@ spec:
             type: Directory
         - name: plugin-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/csi.distort.io/
+            path: /var/lib/kubelet/plugins/storage.distort.io/
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:

@@ -26,6 +26,26 @@ helm install distort ./deploy/charts/distort \
 >
 > Learn how to claim hardware and configure StorageClasses in the **[Using section of the docs](https://distort-csi.dev/using/)**.
 
+## Configuration & Troubleshooting
+
+### NVMe Device Discovery Filtering
+
+By default, the DISTORT agent discovers all physical PCIe NVMe devices (skipping those with mounted filesystems). You can explicitly restrict which devices the agent discovers by configuring environment variables in the agent deployment:
+
+- `NVME_ALLOWED_DEVICES`: A comma-separated list of PCI addresses (e.g., `0000:01:00.0,0000:02:00.0`). Only these devices will be discovered.
+- `NVME_EXCLUDE_DEVICES`: A comma-separated list of PCI addresses to explicitly ignore.
+
+### Manual Device Unbinding (SPDK Setup Failures)
+
+When provisioning partitions using the SPDK backend, the agent must unbind the device from the host kernel (`nvme`) and bind it to a user-space driver (`uio_pci_generic` or `vfio-pci`). 
+In some locked-down container environments (AppArmor, SELinux, read-only `/sys`), this operation may fail, leading to `spdk_setup.sh failed` errors.
+
+**Workaround**: Ensure the target kernel module is loaded on the host (`modprobe uio_pci_generic`), and manually unbind the NVMe device on the host node before letting the agent take over:
+```bash
+# On the host node
+FORCE=1 PCI_ALLOWED="0000:01:00.0" /opt/spdk/scripts/setup.sh
+```
+
 ## License
 
 This software is distributed under the terms of the [Apache License 2.0](LICENSE).

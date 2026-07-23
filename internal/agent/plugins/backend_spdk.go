@@ -53,7 +53,7 @@ func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, device
 	_ = exec.Command("modprobe", "uio_pci_generic").Run()
 	setupCmd := exec.Command("bash", "-c", fmt.Sprintf("FORCE=1 PCI_ALLOWED=%s /opt/spdk/scripts/setup.sh", pciAddress))
 	if out, err := setupCmd.CombinedOutput(); err != nil {
-		klog.Warningf("spdk_setup.sh failed or warned: %v, output: %s", err, string(out))
+		return fmt.Errorf("spdk_setup.sh failed: %v, output: %s (Check if uio_pci_generic/vfio-pci is loaded or manually unbind on host)", err, string(out))
 	}
 
 	// Verify if already attached to avoid re-attaching
