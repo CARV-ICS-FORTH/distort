@@ -91,65 +91,81 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			logger.Info("Cleaning up NVMePartition", "partition", partition.Name)
 
 			// 1. Unexport the NVMe-oF target
-			if partition.Status.NQN != "" {
-				if err := backend.UnexportVolume(ctx, partition.Status.NQN); err != nil {
-					logger.Error(err, "Failed to unexport NVMe target")
-				}
+			nqn := partition.Status.NQN
+			if nqn == "" {
+				// ExportVolume may have created the subsystem before the status
+				// update succeeded. All current backends use this deterministic NQN.
+				nqn = "nqn.2026-02.io.distort:volume-" + partition.Name
+			}
+			if err := backend.UnexportVolume(ctx, nqn); err != nil {
+				logger.Error(err, "Failed to unexport NVMe target", "nqn", nqn)
+				return ctrl.Result{}, err
 			}
 
 			// 2. Remove the partition from the block device
 			if partition.Spec.ParentDeviceSerialNumber != "" {
-				devices, err := DiscoverNVMe()
-				if err == nil {
-					var devPath, devBaseName string
+				var devPath, devBaseName string
+				if targetBackendName == "spdk" {
+					// SPDK controller names are deterministic and remain available
+					// even when the device is no longer visible in kernel sysfs.
+					devBaseName = p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
+					devPath = devBaseName
+				} else {
+					devices, err := DiscoverNVMe()
+					if err != nil {
+						logger.Error(err, "Failed to discover NVMe devices during teardown")
+						return ctrl.Result{}, err
+					}
 					for _, d := range devices {
 						if strings.EqualFold(d.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
 							devBaseName = d.Name
 							devPath = "/dev/" + d.Name + "n1"
-							if targetBackendName == "spdk" {
-								devPath = d.Name
-							}
 							break
 						}
 					}
-					if devBaseName != "" {
-						if err := volManager.DeleteVolume(ctx, devPath, devBaseName, partition.Name); err != nil {
-							logger.Error(err, "Failed to delete volume from backend")
-						}
+					if devBaseName == "" {
+						err := fmt.Errorf("NVMe device with serial %s was not found during teardown", partition.Spec.ParentDeviceSerialNumber)
+						logger.Error(err, "Failed to resolve NVMe device during teardown")
+						return ctrl.Result{}, err
 					}
-				} else {
-					logger.Error(err, "Failed to discover NVMe devices during teardown")
 				}
 
-				// Reset the device's operational mode status if this was the last partition
+				if err := volManager.DeleteVolume(ctx, devPath, devBaseName, partition.Name); err != nil {
+					logger.Error(err, "Failed to delete volume from backend", "volume", partition.Name)
+					return ctrl.Result{}, err
+				}
+
+				// Clear the operational mode for backends which do not retain
+				// ownership of the physical device. SPDK keeps its lvstore and
+				// controller attached for reuse; resetting PCI ownership without
+				// first deleting the lvstore and detaching the controller is unsafe.
 				var partList storagev1alpha1.NVMePartitionList
-				if err := p.List(ctx, &partList); err == nil {
-					activeCount := 0
-					for _, pt := range partList.Items {
-						if pt.Spec.ParentDeviceSerialNumber == partition.Spec.ParentDeviceSerialNumber &&
-							pt.Name != partition.Name &&
-							pt.DeletionTimestamp.IsZero() {
-							activeCount++
-						}
+				if err := p.List(ctx, &partList); err != nil {
+					logger.Error(err, "Failed to list NVMePartitions during teardown")
+					return ctrl.Result{}, err
+				}
+				activeCount := 0
+				for _, pt := range partList.Items {
+					if pt.Spec.ParentDeviceSerialNumber == partition.Spec.ParentDeviceSerialNumber &&
+						pt.Name != partition.Name &&
+						pt.DeletionTimestamp.IsZero() {
+						activeCount++
 					}
-					if activeCount == 0 {
-						deviceName := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
-						err := p.updateDeviceStatus(ctx, types.NamespacedName{Name: deviceName}, func(status *storagev1alpha1.NVMeDeviceStatus) {
-							status.ActiveBackend = ""
-						})
-						if err != nil {
-							logger.Error(err, "Failed to clear NVMeDevice active backend")
-						} else if targetBackendName == "spdk" {
-							// Also release driver back to kernel
-							var dev storagev1alpha1.NVMeDevice
-							if err := p.Get(ctx, types.NamespacedName{Name: deviceName}, &dev); err == nil {
-								_ = plugins.ResetSPDKDevice(dev.Spec.PCIAddress)
-							}
-						}
+				}
+				if activeCount == 0 && targetBackendName != "spdk" {
+					deviceName := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
+					err := p.updateDeviceStatus(ctx, types.NamespacedName{Name: deviceName}, func(status *storagev1alpha1.NVMeDeviceStatus) {
+						status.ActiveBackend = ""
+					})
+					if err != nil {
+						logger.Error(err, "Failed to clear NVMeDevice active backend")
+						return ctrl.Result{}, err
 					}
 				}
 			}
 
+			// Remove the finalizer only after every required external cleanup
+			// operation succeeded. Any error above retains it and causes a retry.
 			var latest storagev1alpha1.NVMePartition
 			if err := p.Get(ctx, req.NamespacedName, &latest); err != nil {
 				return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -198,7 +214,13 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, nil
 		}
 	} else if partition.Status.State == storagev1alpha1.NVMePartitionStateFailed {
-		return ctrl.Result{}, nil
+		if targetBackendName != "spdk" {
+			return ctrl.Result{}, nil
+		}
+		// SPDK operations may have succeeded before an RPC response or status
+		// update failed. Reconcile again so idempotent discovery can recover the
+		// existing lvol/subsystem instead of leaving external resources orphaned.
+		logger.Info("Retrying failed SPDK partition to recover partial provisioning")
 	}
 
 	logger.Info("Provisioning partition on local node", "partition", partition.Name, "size", partition.Spec.Size.String())
@@ -287,18 +309,12 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Setup and slice volume storage
 	if err := volManager.SetupStorage(ctx, devPath, devBaseName); err != nil {
 		logger.Error(err, "Failed to configure storage slicing")
-		_ = p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
-			status.State = storagev1alpha1.NVMePartitionStateFailed
-		})
 		return ctrl.Result{}, err
 	}
 
 	blockPath, err := volManager.CreateVolume(ctx, devPath, devBaseName, partition.Name, partition.Spec.Size.Value())
 	if err != nil {
 		logger.Error(err, "Failed to carve volume from device")
-		_ = p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
-			status.State = storagev1alpha1.NVMePartitionStateFailed
-		})
 		return ctrl.Result{}, err
 	}
 
@@ -320,9 +336,6 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	nqn, err := backend.ExportVolume(ctx, partition.Name, blockPath, portalIP, portalPort, partition.Spec.TargetOptions)
 	if err != nil {
 		logger.Error(err, "Failed to export volume as target")
-		_ = p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
-			status.State = storagev1alpha1.NVMePartitionStateFailed
-		})
 		return ctrl.Result{}, err
 	}
 

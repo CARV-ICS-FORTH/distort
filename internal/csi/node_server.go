@@ -97,6 +97,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 }
 
 func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	started := time.Now()
 	volID := req.GetVolumeId()
 	if volID == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
@@ -110,16 +111,21 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	klog.Infof("NodeUnstageVolume: ID=%s Path=%s", volID, stagingTargetPath)
 
 	// 1. Unmount the staging path
-	if err := unmount(stagingTargetPath); err != nil {
-		klog.Warningf("Failed to unmount staging path: %v", err)
+	unmountStarted := time.Now()
+	if err := unmount(ctx, stagingTargetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to unmount staging path: %v", err)
 	}
+	klog.Infof("Unmounted staging path %s in %s", stagingTargetPath, time.Since(unmountStarted))
 
 	// 2. Execute `nvme disconnect -n <NQN>`
 	nqn := "nqn.2026-02.io.distort:volume-" + volID
 
-	if err := DisconnectRDMA(nqn); err != nil {
+	disconnectStarted := time.Now()
+	if err := DisconnectRDMA(ctx, nqn); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to disconnect NVMe target: %v", err)
 	}
+	klog.Infof("Disconnected NVMe target %s in %s", nqn, time.Since(disconnectStarted))
+	klog.Infof("NodeUnstageVolume completed for %s in %s", volID, time.Since(started))
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
@@ -140,16 +146,17 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 }
 
 func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	started := time.Now()
 	volID := req.GetVolumeId()
 	target := req.GetTargetPath()
 
 	klog.Infof("NodeUnpublishVolume: ID=%s Target=%s", volID, target)
 
-	if err := unmount(target); err != nil {
-		klog.Warningf("Failed to unmount target path: %v", err)
+	if err := unmount(ctx, target); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to unmount target path: %v", err)
 	}
 
-	klog.Infof("Unmounted %s", target)
+	klog.Infof("NodeUnpublishVolume unmounted %s in %s", target, time.Since(started))
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -224,16 +231,26 @@ func bindMount(source, target string) error {
 	return nil
 }
 
-func unmount(target string) error {
+func unmount(ctx context.Context, target string) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("unmount interrupted: %w", err)
+		}
+
 		mounted, err := isMountPoint(target)
-		if err != nil || !mounted {
+		if err != nil {
+			return fmt.Errorf("checking mount point: %w", err)
+		}
+		if !mounted {
 			klog.Infof("Target %s is not mounted", target)
 			return nil
 		}
 
-		cmd := exec.Command("umount", target)
+		cmd := exec.CommandContext(ctx, "umount", target)
 		if out, err := cmd.CombinedOutput(); err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("unmount interrupted: %w", ctx.Err())
+			}
 			if strings.Contains(string(out), "not mounted") || strings.Contains(string(out), "no mount point specified") {
 				return nil
 			}

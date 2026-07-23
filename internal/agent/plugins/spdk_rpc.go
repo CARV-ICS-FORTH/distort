@@ -22,7 +22,8 @@ func CallSPDKRPC(method string, result any, args ...string) error {
 
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("spdk_rpc.py %s failed: %v\nStderr: %s", method, err, stderr.String())
+		return fmt.Errorf("spdk_rpc.py %s failed: %v\nStdout: %s\nStderr: %s",
+			method, err, stdout.String(), stderr.String())
 	}
 
 	if result != nil {

@@ -17,6 +17,7 @@ limitations under the License.
 package csi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -61,12 +62,15 @@ func ConnectRDMA(nqn, portalIP, portalPort string) error {
 }
 
 // DisconnectRDMA disconnects from an NVMe-oF target by NQN.
-func DisconnectRDMA(nqn string) error {
+func DisconnectRDMA(ctx context.Context, nqn string) error {
 	klog.Infof("Executing nvme disconnect -n %s", nqn)
 
-	cmd := exec.Command("nvme", "disconnect", "-n", nqn)
+	cmd := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("nvme disconnect interrupted: %w", ctx.Err())
+		}
 		if strings.Contains(string(out), "no controllers found") {
 			klog.Infof("NVMe target %s already disconnected", nqn)
 			return nil

@@ -198,6 +198,22 @@ func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, block
 
 func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 	klog.Infof("Unexporting SPDK NVMe-oF target %s", nqn)
+	var subsystems []struct {
+		NQN string `json:"nqn"`
+	}
+	if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err != nil {
+		return fmt.Errorf("failed to list SPDK NVMe-oF subsystems: %w", err)
+	}
+	found := false
+	for _, subsystem := range subsystems {
+		if subsystem.NQN == nqn {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
 	if err := CallSPDKRPC("nvmf_delete_subsystem", nil, nqn); err != nil {
 		return fmt.Errorf("failed to delete SPDK subsystem %s: %w", nqn, err)
 	}
