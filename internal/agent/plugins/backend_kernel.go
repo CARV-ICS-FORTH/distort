@@ -10,6 +10,10 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/volumeidentity"
+
+	"distort/internal/storageoptions"
 )
 
 type KernelBackend struct{}
@@ -23,6 +27,9 @@ func (k *KernelBackend) Name() string {
 }
 
 func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error {
+	if err := storageoptions.Validate(k.Name(), options); err != nil {
+		return err
+	}
 	klog.Infof("Ensuring device %s (%s) is bound to kernel nvme driver", deviceName, pciAddress)
 	if err := ResetSPDKDevice(pciAddress); err != nil {
 		klog.Warningf("spdk_setup.sh reset failed or warned: %v", err)
@@ -54,7 +61,7 @@ func isMountPoint(target string) bool {
 }
 
 func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error) {
-	nqn := "nqn.2026-02.io.distort:volume-" + volumeName
+	nqn := volumeidentity.NQN(volumeName)
 	subsysPath := filepath.Join(nvmetPath, "subsystems", nqn)
 	if _, err := os.Stat(subsysPath); err == nil {
 		klog.Infof("NVMe-oF target %s already exported via Kernel ConfigFS", nqn)

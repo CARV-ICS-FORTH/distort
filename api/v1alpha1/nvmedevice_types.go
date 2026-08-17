@@ -68,6 +68,10 @@ type NVMeDeviceStatus struct {
 	// +kubebuilder:default=Available
 	State NVMeDeviceState `json:"state,omitempty"`
 
+	// ClaimRef identifies the exact active claim that owns this device.
+	// +optional
+	ClaimRef *NVMeDeviceClaimReference `json:"claimRef,omitempty"`
+
 	// FreeCapacity is the remaining unallocated capacity on the device.
 	FreeCapacity resource.Quantity `json:"freeCapacity,omitempty"`
 

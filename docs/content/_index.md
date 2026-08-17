@@ -59,5 +59,9 @@ graph TD
 Explore the different sections of the documentation to understand and consume DISTORT:
 
 - **[Architecture](/architecture/)**: Read our high-level design, component roles, interactive control sequence, and implementation layout.
+- **[Project Internals](/internals/)**: Follow the controller, agent, CSI, and storage data paths in detail, including recovery boundaries.
 - **[Using DISTORT](/using/)**: Learn how to discover underlying storage controllers, claim hardware drives using `NVMeDeviceClaim` specs, and request StorageClasses.
-- **[Contributing](/contributing/)**: Setup a local multi-node virtual K3s cluster with virtual NVMe drives and SoftRoCE loopback to build code and run E2E Ginkgo validation tests.
+- **[Local Testing Lab](/local-testing/)**: Keep a three-node Vagrant/K3s cluster running for fast redeploys, manual storage checks, and automated E2E tests.
+- **[Testing Strategy](/testing/)**: Run the green suite and the finding-keyed regression tests used to drive each review fix.
+- **[Review Findings](/review-findings/)**: Track confirmed defects, resolved regressions, acceptance criteria, and production-readiness gates.
+- **[Contributing](/contributing/)**: Build, generate, validate, and submit changes using the repository's supported workflows.

@@ -17,7 +17,19 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Running Tests
+      - name: Verify module files
         run: |
           go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Run unit, envtest, and contract tests
+        run: |
           make test
+
+      - name: Run race detector
+        run: |
+          make test-race
+
+      - name: Compile Vagrant E2E suite
+        run: |
+          go test -tags=e2e ./test/e2e -run '^$'

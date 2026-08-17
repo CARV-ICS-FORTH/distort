@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
+
+	"distort/internal/volumeidentity"
 )
 
 type NodeServer struct {
@@ -89,7 +92,16 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	klog.Infof("Staging volume %s (device %s) to %s", volID, devPath, stagingTargetPath)
 
-	if err := formatAndMount(devPath, stagingTargetPath); err != nil {
+	fsType, err := resolveFilesystem(volCtx, []*csi.VolumeCapability{req.GetVolumeCapability()})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid filesystem configuration: %v", err)
+	}
+
+	if err := formatAndMount(devPath, stagingTargetPath, fsType); err != nil {
+		var mismatch *filesystemMismatchError
+		if errors.As(err, &mismatch) {
+			return nil, status.Error(codes.FailedPrecondition, mismatch.Error())
+		}
 		return nil, status.Errorf(codes.Internal, "Failed to format and mount: %v", err)
 	}
 
@@ -117,8 +129,16 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	}
 	klog.Infof("Unmounted staging path %s in %s", stagingTargetPath, time.Since(unmountStarted))
 
-	// 2. Execute `nvme disconnect -n <NQN>`
-	nqn := "nqn.2026-02.io.distort:volume-" + volID
+	// 2. Execute `nvme disconnect -n <NQN>`. New handles carry the immutable
+	// partition UID; retain the legacy fallback for already-published volumes.
+	nqn := volumeidentity.NQN(volID)
+	if reference, err := volumeidentity.ParseVolumeHandle(volID); err == nil {
+		identity, identityErr := volumeidentity.New(reference.Namespace, reference.Name, reference.UID)
+		if identityErr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "Invalid volume identity: %v", identityErr)
+		}
+		nqn = volumeidentity.NQN(identity.ExternalID)
+	}
 
 	disconnectStarted := time.Now()
 	if err := DisconnectRDMA(ctx, nqn); err != nil {
@@ -182,7 +202,17 @@ func isMountPoint(target string) (bool, error) {
 	return false, nil
 }
 
-func formatAndMount(source, target string) error {
+type filesystemMismatchError struct {
+	source    string
+	requested string
+	detected  string
+}
+
+func (e *filesystemMismatchError) Error() string {
+	return fmt.Sprintf("Block device %s contains %s, but %s was requested; refusing to format or mount it", e.source, e.detected, e.requested)
+}
+
+func formatAndMount(source, target, fsType string) error {
 	_ = os.MkdirAll(target, 0750)
 
 	mounted, err := isMountPoint(target)
@@ -191,18 +221,12 @@ func formatAndMount(source, target string) error {
 		return nil
 	}
 
-	// Check if source block device is already formatted
-	cmd := exec.Command("blkid", source)
-	if err := cmd.Run(); err != nil {
-		klog.Infof("Formatting %s as ext4", source)
-		mkfsCmd := exec.Command("mkfs.ext4", "-F", source)
-		if out, mkfsErr := mkfsCmd.CombinedOutput(); mkfsErr != nil {
-			return fmt.Errorf("formatting failed: %v, output: %s", mkfsErr, string(out))
-		}
+	if err := ensureFilesystem(source, fsType, probeFilesystem, formatFilesystem); err != nil {
+		return err
 	}
 
-	klog.Infof("Mounting %s to %s", source, target)
-	mountCmd := exec.Command("mount", source, target)
+	klog.Infof("Mounting %s as %s to %s", source, fsType, target)
+	mountCmd := exec.Command("mount", "-t", fsType, source, target)
 	if out, mountErr := mountCmd.CombinedOutput(); mountErr != nil {
 		if strings.Contains(string(out), "already mounted") {
 			return nil
@@ -210,6 +234,59 @@ func formatAndMount(source, target string) error {
 		return fmt.Errorf("mount failed: %v, output: %s", mountErr, string(out))
 	}
 	return nil
+}
+
+func ensureFilesystem(source, requested string, probe func(string) (string, error), format func(string, string) error) error {
+	detected, err := probe(source)
+	if err != nil {
+		return fmt.Errorf("probing filesystem on %s: %w", source, err)
+	}
+	if detected == "" {
+		return format(source, requested)
+	}
+	if normalizeFilesystem(detected) != requested {
+		return &filesystemMismatchError{source: source, requested: requested, detected: detected}
+	}
+	klog.Infof("Block device %s already contains %s", source, detected)
+	return nil
+}
+
+func probeFilesystem(source string) (string, error) {
+	cmd := exec.Command("blkid", "-p", "-s", "TYPE", "-o", "value", source)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return normalizeFilesystem(string(out)), nil
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
+		return "", nil
+	}
+	return "", fmt.Errorf("blkid failed: %w, output: %s", err, strings.TrimSpace(string(out)))
+}
+
+func formatFilesystem(source, fsType string) error {
+	command, args, err := filesystemFormatCommand(source, fsType)
+	if err != nil {
+		return err
+	}
+
+	klog.Infof("Formatting %s as %s", source, fsType)
+	if out, err := exec.Command(command, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("formatting %s as %s failed: %w, output: %s", source, fsType, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func filesystemFormatCommand(source, fsType string) (string, []string, error) {
+	switch fsType {
+	case "ext4":
+		return "mkfs.ext4", []string{"-F", source}, nil
+	case "xfs":
+		return "mkfs.xfs", []string{"-f", source}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported filesystem %q", fsType)
+	}
 }
 
 func bindMount(source, target string) error {

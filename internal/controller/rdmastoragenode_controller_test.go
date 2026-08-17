@@ -21,7 +21,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -31,58 +30,40 @@ import (
 )
 
 var _ = Describe("RDMAStorageNode Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+	var reconciler *RDMAStorageNodeReconciler
 
+	BeforeEach(func() {
+		reconciler = &RDMAStorageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	})
+
+	It("leaves reporter-owned node data unchanged", func() {
 		ctx := context.Background()
-
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+		key := types.NamespacedName{Name: "reporter-owned-node"}
+		resource := &storagev1alpha1.RDMAStorageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name},
+			Spec: storagev1alpha1.RDMAStorageNodeSpec{
+				NodeName:  "test-node",
+				RDMAIP:    "192.0.2.10",
+				Transport: storagev1alpha1.RDMATransportRoCEv2,
+			},
 		}
-		rdmastoragenode := &storagev1alpha1.RDMAStorageNode{}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, resource) })
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind RDMAStorageNode")
-			err := k8sClient.Get(ctx, typeNamespacedName, rdmastoragenode)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &storagev1alpha1.RDMAStorageNode{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					Spec: storagev1alpha1.RDMAStorageNodeSpec{
-						NodeName:  "test-node",
-						RDMAIP:    "127.0.0.1",
-						Transport: storagev1alpha1.RDMATransportRoCEv2,
-					},
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		actual := &storagev1alpha1.RDMAStorageNode{}
+		Expect(k8sClient.Get(ctx, key, actual)).To(Succeed())
+		Expect(actual.Spec).To(Equal(resource.Spec))
+	})
+
+	It("treats a deleted reporter-owned node as an idempotent no-op", func() {
+		result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "missing-rdma-node"},
 		})
-
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &storagev1alpha1.RDMAStorageNode{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Cleanup the specific resource instance RDMAStorageNode")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &RDMAStorageNodeReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
-		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
 	})
 })

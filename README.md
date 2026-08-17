@@ -1,18 +1,25 @@
-# DISTORT: DISaggregated STorage Over Rdma Transport
+# DISTORT
 
-DISTORT is a high-performance, Kubernetes-native storage engine specifically designed to manage dynamic, disaggregated physical disk allocation. Utilizing NVMe-over-Fabrics (NVMe-oF) via Remote Direct Memory Access (RDMA) target exports, it orchestrates direct block storage attachments directly between worker nodes at near-local speeds.
+DISTORT (**DIS**aggregated **ST**orage **O**ver **R**DMA **T**ransport) is a
+Kubernetes-native storage system that exports claimed NVMe capacity over
+NVMe-over-Fabrics/RDMA and provisions it through CSI.
 
-## Documentation
+> [!WARNING]
+> DISTORT is under active development. The SPDK and kernel data paths run in the
+> isolated project testbed, but the documented production-readiness backlog is
+> not complete. Review the [open findings](docs/content/review-findings.md)
+> before evaluating it for production workloads.
 
-For in-depth architectural details, local VM setups, testing workflows, and user manuals, visit our official documentation site:
+## Components
 
-👉 **[DISTORT Documentation](https://distort-csi.dev/)**
+- `distort-manager` binds device claims and schedules logical partitions.
+- `distort-agent` discovers NVMe hardware, creates storage, and exports targets.
+- `distort-csi` translates Kubernetes volume operations into DISTORT resources
+  and mounts remote NVMe devices on consumer nodes.
 
-## Quick Start Installation
+## Quick start
 
-DISTORT is packaged as a Helm chart under `deploy/charts/distort` which bundles the manager control plane, node-level storage agents, CSI driver sidecars, and all required RBAC permissions and Custom Resource Definitions (CRDs).
-
-To deploy the entire stack into your cluster inside the `distort-system` namespace:
+Install the Helm chart into a cluster with suitable NVMe and RDMA hardware:
 
 ```bash
 helm install distort ./deploy/charts/distort \
@@ -20,36 +27,51 @@ helm install distort ./deploy/charts/distort \
   --create-namespace
 ```
 
-> [!IMPORTANT]
-> **Allocate Hardware Devices:**
-> After installation, physical storage devices are **not** automatically claimed. You must explicitly allocate storage controllers to DISTORT by applying **`NVMeDeviceClaim`** Custom Resources.
->
-> Learn how to claim hardware and configure StorageClasses in the **[Using section of the docs](https://distort-csi.dev/using/)**.
+DISTORT never claims physical storage automatically. After installation, an
+administrator must create an `NVMeDeviceClaim` for each device that DISTORT may
+use. See [Using DISTORT](docs/content/using.md) for the complete workflow.
 
-## Configuration & Troubleshooting
+## Documentation
 
-### NVMe Device Discovery Filtering
+The Hugo site under [`docs/content`](docs/content/) is the canonical source for
+detailed documentation:
 
-By default, the DISTORT agent discovers all physical PCIe NVMe devices (skipping those with mounted filesystems). You can explicitly restrict which devices the agent discovers by configuring environment variables in the agent deployment:
+- [Architecture](docs/content/architecture.md)
+- [Project internals](docs/content/internals.md)
+- [Installation and usage](docs/content/using.md)
+- [Contributing](docs/content/contributing.md)
+- [Testing strategy](docs/content/testing.md)
+- [Local Vagrant testbed](docs/content/local-testing.md)
+- [Review findings and production-readiness backlog](docs/content/review-findings.md)
 
-- `NVME_ALLOWED_DEVICES`: A comma-separated list of PCI addresses (e.g., `0000:01:00.0,0000:02:00.0`). Only these devices will be discovered.
-- `NVME_EXCLUDE_DEVICES`: A comma-separated list of PCI addresses to explicitly ignore.
+The published documentation is available at
+[distort-csi.dev](https://distort-csi.dev/).
 
-### Manual Device Unbinding (SPDK Setup Failures)
+## Development
 
-When provisioning partitions using the SPDK backend, the agent must unbind the device from the host kernel (`nvme`) and bind it to a user-space driver (`uio_pci_generic` or `vfio-pci`). 
-In some locked-down container environments (AppArmor, SELinux, read-only `/sys`), this operation may fail, leading to `spdk_setup.sh failed` errors.
-
-**Workaround**: Ensure the target kernel module is loaded on the host (`modprobe uio_pci_generic`), and manually unbind the NVMe device on the host node before letting the agent take over:
 ```bash
-# On the host node
-FORCE=1 PCI_ALLOWED="0000:01:00.0" /opt/spdk/scripts/setup.sh
+make test-suite
+make test-race
 ```
+
+Hardware and full-stack changes are validated in the guarded, isolated
+three-node Vagrant environment described in the
+[local testing guide](docs/content/local-testing.md). Do not run its destructive
+reset workflow against another cluster.
+
+## Project policies
+
+See [Contributing](CONTRIBUTING.md), [Security](SECURITY.md),
+[Code of Conduct](CODE_OF_CONDUCT.md), [Maintainers](MAINTAINERS.md), and the
+[Roadmap](ROADMAP.md).
 
 ## License
 
-This software is distributed under the terms of the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).
 
 ## Acknowledgements
 
-We thankfully acknowledge the support of the European Commission and the Greek General Secretariat for Research and Innovation to this project. DISTORT has received funding from the EuroHPC Joint Undertaking through project NET4EXA (GA-101175702). EuroHPC JU projects are jointly funded by the European Commission and the involved state members (including the Greek General Secretariat for Research and Innovation).
+DISTORT has received funding from the EuroHPC Joint Undertaking through project
+NET4EXA (GA-101175702), jointly funded by the European Commission and the
+participating member states, including the Greek General Secretariat for
+Research and Innovation.

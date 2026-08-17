@@ -75,13 +75,16 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if claim.Status.MatchedDevice != "" {
 				var dev storagev1alpha1.NVMeDevice
 				if err := r.Get(ctx, client.ObjectKey{Name: claim.Status.MatchedDevice, Namespace: claim.Namespace}, &dev); err == nil {
-					base := dev.DeepCopy()
-					dev.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
-					if err := r.Status().Patch(ctx, &dev, client.MergeFrom(base)); err != nil {
-						logger.Error(err, "unable to free NVMeDevice status", "device", dev.Name)
-						return ctrl.Result{}, err
+					if dev.Status.ClaimRef != nil && dev.Status.ClaimRef.UID == claim.UID {
+						base := dev.DeepCopy()
+						dev.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
+						dev.Status.ClaimRef = nil
+						if err := r.Status().Patch(ctx, &dev, client.MergeFrom(base)); err != nil {
+							logger.Error(err, "Unable to free NVMeDevice status", "device", dev.Name)
+							return ctrl.Result{}, err
+						}
+						logger.Info("Successfully freed NVMeDevice", "device", dev.Name)
 					}
-					logger.Info("Successfully freed NVMeDevice", "device", dev.Name)
 				}
 			}
 
@@ -95,11 +98,6 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	// If already bound to a device, nothing to do (simplified).
-	if claim.Status.Active && claim.Status.MatchedDevice != "" {
-		return ctrl.Result{}, nil
-	}
-
 	// Find the device with the matching serial number
 	var deviceList storagev1alpha1.NVMeDeviceList
 	if err := r.List(ctx, &deviceList); err != nil {
@@ -109,18 +107,28 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	for _, dev := range deviceList.Items {
 		if dev.Spec.SerialNumber == claim.Spec.SerialNumber {
-			// Found a match
-			if dev.Status.State == storagev1alpha1.NVMeDeviceStateClaimed && dev.Name != claim.Status.MatchedDevice {
-				// The device is claimed by someone else
+			// A non-empty claim reference is the source of truth for ownership. For
+			// upgrades, an active claim may adopt its already-matched legacy device.
+			ownedByThisClaim := dev.Status.ClaimRef != nil && dev.Status.ClaimRef.UID == claim.UID
+			legacyMatch := dev.Status.ClaimRef == nil && claim.Status.Active && claim.Status.MatchedDevice == dev.Name
+			if dev.Status.State == storagev1alpha1.NVMeDeviceStateClaimed && !ownedByThisClaim && !legacyMatch {
 				logger.Info("Target device is already claimed by another resource", "device", dev.Name)
 				continue
 			}
 
-			// Transition device to Claimed
+			claimRef := &storagev1alpha1.NVMeDeviceClaimReference{
+				Namespace: claim.Namespace,
+				Name:      claim.Name,
+				UID:       claim.UID,
+			}
+
+			// Transition the device and persist the exact owner identity atomically
+			// in the same status patch.
 			base := dev.DeepCopy()
 			dev.Status.State = storagev1alpha1.NVMeDeviceStateClaimed
+			dev.Status.ClaimRef = claimRef
 			if err := r.Status().Patch(ctx, &dev, client.MergeFrom(base)); err != nil {
-				logger.Error(err, "unable to update NVMeDevice status", "device", dev.Name)
+				logger.Error(err, "Unable to update NVMeDevice status", "device", dev.Name)
 				return ctrl.Result{}, err
 			}
 
@@ -129,7 +137,7 @@ func (r *NVMeDeviceClaimReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			claim.Status.MatchedDevice = dev.Name
 			claim.Status.NodeName = dev.Spec.NodeName
 			if err := r.Status().Update(ctx, &claim); err != nil {
-				logger.Error(err, "unable to update NVMeDeviceClaim status")
+				logger.Error(err, "Unable to update NVMeDeviceClaim status")
 				return ctrl.Result{}, err
 			}
 

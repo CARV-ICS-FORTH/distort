@@ -2,4 +2,4 @@
 
 We follow the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/master/code-of-conduct.md).
 
-Please contact [chazapis@ics.forth.gr] to report an issue.
+Please contact [chazapis@ics.forth.gr](mailto:chazapis@ics.forth.gr) to report an issue.

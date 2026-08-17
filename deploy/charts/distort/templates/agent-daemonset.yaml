@@ -36,11 +36,31 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - /usr/local/bin/distort-agent
+          {{- if ne (empty .Values.agent.spdk.iobufSmallPoolCount) (empty .Values.agent.spdk.iobufLargePoolCount) }}
+          {{- fail "agent.spdk.iobufSmallPoolCount and agent.spdk.iobufLargePoolCount must be configured together" }}
+          {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if not (empty .Values.agent.spdk.iobufSmallPoolCount) }}
+            - name: SPDK_IOBUF_SMALL_POOL_COUNT
+              value: {{ .Values.agent.spdk.iobufSmallPoolCount | quote }}
+            {{- end }}
+            {{- if not (empty .Values.agent.spdk.iobufLargePoolCount) }}
+            - name: SPDK_IOBUF_LARGE_POOL_COUNT
+              value: {{ .Values.agent.spdk.iobufLargePoolCount | quote }}
+            {{- end }}
+            {{- if not (empty .Values.agent.spdk.maxSrqDepth) }}
+            - name: SPDK_NVMF_MAX_SRQ_DEPTH
+              value: {{ .Values.agent.spdk.maxSrqDepth | quote }}
+            {{- end }}
+            {{- if .Values.agent.spdk.skipHugepageSetup }}
+            # SPDK setup.sh inherits this documented switch from the agent.
+            - name: SKIP_HUGE
+              value: "yes"
+            {{- end }}
           securityContext:
             privileged: true
           volumeMounts:

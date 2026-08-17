@@ -19,6 +19,17 @@ manager:
       memory: 64Mi
 
 agent:
+  spdk:
+    # Leave both empty to use SPDK defaults. Set both when a deployment needs
+    # explicit iobuf sizing for its workload and hugepage budget.
+    iobufSmallPoolCount: ""
+    iobufLargePoolCount: ""
+    # Leave empty to use SPDK's default RDMA shared receive queue depth. A
+    # smaller positive value reduces DMA memory at the cost of queue capacity.
+    maxSrqDepth: ""
+    # Set when hugepages are provisioned by the host administrator. This keeps
+    # SPDK setup.sh from replacing that reservation with its 2 GiB default.
+    skipHugepageSetup: false
   resources:
     limits:
       cpu: 1000m

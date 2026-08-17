@@ -3,17 +3,28 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
+
+	"distort/internal/volumeidentity"
+
+	"distort/internal/storageoptions"
 )
 
 type SPDKBackend struct{}
 
 var deviceSetupMu sync.Mutex
+var spdkStartMu sync.Mutex
+var spdkTransportMu sync.Mutex
+var spdkTargetExecutable = "nvmf_tgt"
+var prepareSPDKProcess = raiseMemlockLimit
 
 func init() {
 	RegisterTargetBackend(&SPDKBackend{})
@@ -26,13 +37,31 @@ func (s *SPDKBackend) Name() string {
 // EnsureSPDKRunning starts nvmf_tgt when needed and waits until its JSON-RPC
 // service is usable. A running process is not necessarily ready to accept RPCs.
 func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
+	spdkStartMu.Lock()
+	defer spdkStartMu.Unlock()
+	if coreMask == "" {
+		coreMask = "0x1"
+	}
+	if err := storageoptions.ValidateSPDKCoreMask(coreMask); err != nil {
+		return err
+	}
+
 	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
 		klog.Info("Starting nvmf_tgt daemon in the background...")
-		if coreMask == "" {
-			coreMask = "0x1"
+		iobufArgs, configureIobufPools, err := spdkIobufPoolArgs()
+		if err != nil {
+			return err
 		}
-		// Start nvmf_tgt with specified core mask
-		cmd := exec.Command("bash", "-c", fmt.Sprintf("ulimit -l unlimited && nvmf_tgt -m %s", coreMask))
+		args := []string{"-m", coreMask}
+		if configureIobufPools {
+			args = append(args, "--wait-for-rpc")
+		}
+		if err := prepareSPDKProcess(); err != nil {
+			return fmt.Errorf("prepare nvmf_tgt process limits: %w", err)
+		}
+		cmd := exec.CommandContext(ctx, spdkTargetExecutable, args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start nvmf_tgt: %v", err)
 		}
@@ -41,8 +70,39 @@ func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 				klog.Errorf("nvmf_tgt exited with error: %v", err)
 			}
 		}()
+
+		if configureIobufPools {
+			if err := waitForSPDKRPC(ctx); err != nil {
+				return err
+			}
+			if err := CallSPDKRPC("iobuf_set_options", nil, iobufArgs...); err != nil {
+				return fmt.Errorf("failed to configure SPDK iobuf pools: %w", err)
+			}
+			if err := CallSPDKRPC("framework_start_init", nil); err != nil {
+				return fmt.Errorf("failed to start SPDK framework initialization: %w", err)
+			}
+			if err := CallSPDKRPC("framework_wait_init", nil); err != nil {
+				return fmt.Errorf("SPDK framework initialization failed: %w", err)
+			}
+		}
 	}
 
+	return waitForSPDKRPC(ctx)
+}
+
+func raiseMemlockLimit() error {
+	var limit unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &limit); err != nil {
+		return err
+	}
+	if limit.Cur == limit.Max {
+		return nil
+	}
+	limit.Cur = limit.Max
+	return unix.Setrlimit(unix.RLIMIT_MEMLOCK, &limit)
+}
+
+func waitForSPDKRPC(ctx context.Context) error {
 	var lastErr error
 	for attempt := 1; attempt <= 30; attempt++ {
 		var methods []string
@@ -61,7 +121,31 @@ func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 	return fmt.Errorf("nvmf_tgt JSON-RPC was not ready after 30 seconds: %w", lastErr)
 }
 
+func spdkIobufPoolArgs() ([]string, bool, error) {
+	small := os.Getenv("SPDK_IOBUF_SMALL_POOL_COUNT")
+	large := os.Getenv("SPDK_IOBUF_LARGE_POOL_COUNT")
+	if small == "" && large == "" {
+		return nil, false, nil
+	}
+	if small == "" || large == "" {
+		return nil, false, fmt.Errorf("SPDK_IOBUF_SMALL_POOL_COUNT and SPDK_IOBUF_LARGE_POOL_COUNT must be set together")
+	}
+	for name, value := range map[string]string{
+		"SPDK_IOBUF_SMALL_POOL_COUNT": small,
+		"SPDK_IOBUF_LARGE_POOL_COUNT": large,
+	} {
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || parsed == 0 {
+			return nil, false, fmt.Errorf("%s must be a positive integer, got %q", name, value)
+		}
+	}
+	return []string{"--small-pool-count", small, "--large-pool-count", large}, true, nil
+}
+
 func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error {
+	if err := storageoptions.Validate(s.Name(), options); err != nil {
+		return err
+	}
 	coreMask := options["spdk-core-mask"]
 	if err := EnsureSPDKRunning(ctx, coreMask); err != nil {
 		return err
@@ -145,16 +229,47 @@ func runSPDKSetup(ctx context.Context, pciAddress string) error {
 }
 
 func EnsureNVMeTransport() error {
-	// Create RDMA transport. Safe if it already exists.
-	err := CallSPDKRPC("nvmf_create_transport", nil, "-t", "RDMA", "-u", "8192", "-i", "131072", "-c", "8192")
+	spdkTransportMu.Lock()
+	defer spdkTransportMu.Unlock()
+
+	args, err := spdkNVMfTransportArgs()
 	if err != nil {
-		klog.V(4).Infof("nvmf_create_transport RDMA returned: %v (might already exist)", err)
+		return err
+	}
+
+	var transports []struct {
+		Trtype string `json:"trtype"`
+	}
+	if err := CallSPDKRPC("nvmf_get_transports", &transports); err != nil {
+		return fmt.Errorf("failed to list SPDK NVMe-oF transports: %w", err)
+	}
+	for _, transport := range transports {
+		if strings.EqualFold(transport.Trtype, "RDMA") {
+			return nil
+		}
+	}
+
+	if err := CallSPDKRPC("nvmf_create_transport", nil, args...); err != nil {
+		return fmt.Errorf("failed to create SPDK RDMA transport: %w", err)
 	}
 	return nil
 }
 
+func spdkNVMfTransportArgs() ([]string, error) {
+	args := []string{"-t", "RDMA", "-u", "8192", "-i", "131072", "-c", "8192"}
+	maxSRQDepth := os.Getenv("SPDK_NVMF_MAX_SRQ_DEPTH")
+	if maxSRQDepth == "" {
+		return args, nil
+	}
+	parsed, err := strconv.ParseUint(maxSRQDepth, 10, 32)
+	if err != nil || parsed == 0 {
+		return nil, fmt.Errorf("SPDK_NVMF_MAX_SRQ_DEPTH must be a positive integer, got %q", maxSRQDepth)
+	}
+	return append(args, "-s", maxSRQDepth), nil
+}
+
 func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error) {
-	nqn := "nqn.2026-02.io.distort:volume-" + volumeName
+	nqn := volumeidentity.NQN(volumeName)
 	klog.Infof("Exporting %s as NVMe-oF target %s on %s:%d via SPDK", blockPath, nqn, portalIP, portalPort)
 
 	// Check if already exported (subsystem exists)

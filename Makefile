@@ -1,6 +1,18 @@
 # Image URL to use all building/pushing image targets
 IMG ?= distort:latest
 
+# Isolated Vagrant/K3s test lab configuration.
+VAGRANT_NODES ?= distort-master distort-worker-1 distort-worker-2
+E2E_ARGS ?=
+FINDING ?=
+LOCAL_KUBECONFIG ?= $(shell pwd)/kubeconfig.yaml
+TEST_ENV_IMAGE_REPOSITORY ?= distort
+TEST_ENV_IMAGE_TAG ?= latest
+TEST_ENV_IMG = $(TEST_ENV_IMAGE_REPOSITORY):$(TEST_ENV_IMAGE_TAG)
+TEST_ENV_BUILD_JOBS ?= 1
+TEST_ENV_GO_BUILD_PROCS ?= 1
+TEST_ENV_SKIP_IMAGE_BUILD ?= 0
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -61,36 +73,161 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+.PHONY: test-regression
+test-regression: manifests generate fmt vet setup-envtest ## Run quarantined tests for known review findings (optionally FINDING=F7).
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" DISTORT_RUN_KNOWN_FAILURES=1 DISTORT_FINDING="$(FINDING)" go test $$(go list ./... | grep -v /e2e) -count=1
+
+.PHONY: test-suite
+test-suite: test test-static ## Run the complete green host-side suite and compile E2E tests.
+	go test -tags=e2e ./test/e2e -run '^$$'
+
+.PHONY: test-static
+test-static: ## Run repository contracts and validate Helm and Hugo artifacts.
+	go test ./test/contracts -count=1
+	helm lint ./deploy/charts/distort
+	helm template distort ./deploy/charts/distort --namespace distort-system >/dev/null
+	hugo --source docs --destination /tmp/distort-docs-test --minify
+
+.PHONY: test-race
+test-race: setup-envtest ## Run host-side tests under the Go race detector.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test -race $$(go list ./... | grep -v /e2e) -count=1
+
 ##@ E2E Testing on Vagrant
 
-export KUBECONFIG ?= $(shell pwd)/kubeconfig.yaml
+.PHONY: test-env-prereqs
+test-env-prereqs: ## Verify tools required by the isolated Vagrant test lab.
+	@command -v vagrant >/dev/null || { echo "ERROR: vagrant is required"; exit 1; }
+	@command -v VBoxManage >/dev/null || { echo "ERROR: VirtualBox is required"; exit 1; }
+	@command -v $(CONTAINER_TOOL) >/dev/null || { echo "ERROR: $(CONTAINER_TOOL) is required"; exit 1; }
+	@command -v helm >/dev/null || { echo "ERROR: helm is required"; exit 1; }
+	@command -v $(KUBECTL) >/dev/null || { echo "ERROR: $(KUBECTL) is required"; exit 1; }
+	@vagrant --version >/dev/null || { echo "ERROR: vagrant is installed but unusable"; exit 1; }
+	@VBoxManage --version >/dev/null || { echo "ERROR: VirtualBox is installed but unusable"; exit 1; }
+	@if [ "$$(uname -s)" = Linux ] && [ ! -c /dev/vboxdrv ]; then \
+		echo "ERROR: /dev/vboxdrv is unavailable; install/load the VirtualBox host kernel module"; exit 1; \
+	fi
+	@$(CONTAINER_TOOL) info >/dev/null || { echo "ERROR: $(CONTAINER_TOOL) daemon is unavailable to this user"; exit 1; }
+	@helm version --short >/dev/null || { echo "ERROR: helm is installed but unusable"; exit 1; }
+	@$(KUBECTL) version --client >/dev/null || { echo "ERROR: $(KUBECTL) is installed but unusable"; exit 1; }
+
+.PHONY: test-env-up
+test-env-up: test-env-prereqs ## Create/start the three-node isolated Vagrant K3s lab.
+	@for node in $(VAGRANT_NODES); do \
+		echo "Starting and provisioning $$node"; \
+		(cd vagrant && vagrant up "$$node"); \
+	done
+	$(MAKE) get-kubeconfig
+	KUBECTL="$(KUBECTL)" bash vagrant/verify-local-kubeconfig.sh "$(LOCAL_KUBECONFIG)"
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) get nodes -o wide
+
+.PHONY: test-env-create
+test-env-create: test-env-prereqs ## Build with VMs stopped, create the low-memory lab, deploy, and run smoke tests.
+	-cd vagrant && vagrant halt
+	$(MAKE) test-env-image
+	$(MAKE) test-env-up
+	$(MAKE) test-env-deploy TEST_ENV_SKIP_IMAGE_BUILD=1
+	$(MAKE) test-env-smoke
+
+.PHONY: test-env-image
+test-env-image: ## Build the lab image with constrained SPDK and Go parallelism.
+	$(MAKE) docker-build IMG="$(TEST_ENV_IMG)" DOCKER_BUILD_ARGS="--build-arg SPDK_BUILD_JOBS=$(TEST_ENV_BUILD_JOBS) --build-arg GO_BUILD_PROCS=$(TEST_ENV_GO_BUILD_PROCS)"
 
 .PHONY: get-kubeconfig
 get-kubeconfig:
-	cd vagrant && vagrant ssh distort-master -c "sudo cat /etc/rancher/k3s/k3s.yaml" | sed "s/127.0.0.1/192.168.56.10/g" > ../kubeconfig.yaml
-	chmod 600 kubeconfig.yaml
+	cd vagrant && vagrant ssh distort-master -c "sudo cat /etc/rancher/k3s/k3s.yaml" | sed "s/127.0.0.1/192.168.56.10/g" > "$(LOCAL_KUBECONFIG).tmp"
+	@test -s "$(LOCAL_KUBECONFIG).tmp" || { echo "ERROR: fetched kubeconfig is empty"; exit 1; }
+	mv "$(LOCAL_KUBECONFIG).tmp" "$(LOCAL_KUBECONFIG)"
+	chmod 600 "$(LOCAL_KUBECONFIG)"
+
+.PHONY: test-env-guard
+test-env-guard: get-kubeconfig ## Refuse lab mutations unless kubeconfig targets the isolated Vagrant cluster.
+	KUBECTL="$(KUBECTL)" bash vagrant/verify-local-kubeconfig.sh "$(LOCAL_KUBECONFIG)"
 
 .PHONY: test-env-reset
-test-env-reset: ## Reset the Vagrant test environment (wipe partitions, reload configfs)
-	cd vagrant && vagrant ssh distort-worker-1 -c "sudo bash /vagrant/clean-node.sh"
-	cd vagrant && vagrant ssh distort-master -c "sudo bash /vagrant/clean-node.sh"
-	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl delete nvmedeviceclaim,nvmepartition --all || true
+test-env-reset: test-env-guard ## Clean test resources and storage state without uninstalling DISTORT.
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete namespace distort-test --ignore-not-found --wait=true --timeout=120s
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete pod e2e-distort-pod --ignore-not-found --wait=true --timeout=90s
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete pvc e2e-distort-pvc --ignore-not-found --wait=true --timeout=90s
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete storageclass distort-csi-sc --ignore-not-found
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete nvmepartitions --all --all-namespaces --ignore-not-found --wait=true --timeout=120s
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete nvmedeviceclaims --all --all-namespaces --ignore-not-found --wait=true --timeout=120s
+	@for node in $(VAGRANT_NODES); do \
+		echo "Cleaning storage state on $$node"; \
+		(cd vagrant && vagrant ssh "$$node" -c "sudo bash /vagrant/clean-node.sh"); \
+	done
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete nvmedevices,rdmastoragenodes --all --ignore-not-found
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system daemonset/distort-agent
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system daemonset/distort-agent --timeout=180s
 
 .PHONY: test-env-deploy
-test-env-deploy: docker-build get-kubeconfig manifests ## Build image, load into Vagrant, and deploy Helm chart
+test-env-deploy: test-env-guard manifests ## Build/load the image and Helm-upgrade the persistent Vagrant lab.
+	@if [ "$(TEST_ENV_SKIP_IMAGE_BUILD)" != "1" ]; then \
+		$(MAKE) test-env-image; \
+	fi
 	/bin/cp -f config/crd/bases/* deploy/charts/distort/crds/
-	docker save ${IMG} -o vagrant/distort-img.tar
-	cd vagrant && vagrant ssh distort-master -c "sudo k3s ctr images import /vagrant/distort-img.tar"
-	cd vagrant && vagrant ssh distort-worker-1 -c "sudo k3s ctr images import /vagrant/distort-img.tar"
-	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl apply -f config/crd/bases/
-	helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set image.repository=distort --set image.tag=latest
-	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl rollout restart -n distort-system deployment distort-manager distort-csi-controller
-	KUBECONFIG=$(PWD)/kubeconfig.yaml kubectl rollout restart -n distort-system daemonset distort-agent distort-csi-node
+	$(CONTAINER_TOOL) save "$(TEST_ENV_IMG)" -o vagrant/distort-img.tar
+	@for node in $(VAGRANT_NODES); do \
+		echo "Loading $(TEST_ENV_IMG) into $$node"; \
+		(cd vagrant && vagrant ssh "$$node" -c "sudo k3s ctr images import /vagrant/distort-img.tar"); \
+	done
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) apply -f config/crd/bases/
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set-string image.repository="$(TEST_ENV_IMAGE_REPOSITORY)" --set-string image.tag="$(TEST_ENV_IMAGE_TAG)" --set-string agent.spdk.iobufSmallPoolCount=4096 --set-string agent.spdk.iobufLargePoolCount=256 --set-string agent.spdk.maxSrqDepth=128 --set agent.spdk.skipHugepageSetup=true --set-string agent.resources.requests.memory=256Mi --set-string agent.resources.limits.memory=512Mi --set-string agent.resources.requests.hugepages-2Mi=256Mi --set-string agent.resources.limits.hugepages-2Mi=256Mi
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system deployment/distort-manager deployment/distort-csi-controller
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system daemonset/distort-agent daemonset/distort-csi-node
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system deployment/distort-manager --timeout=180s
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system deployment/distort-csi-controller --timeout=180s
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system daemonset/distort-agent --timeout=180s
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system daemonset/distort-csi-node --timeout=180s
+
+.PHONY: test-env-redeploy
+test-e test-env-destroynv-redeploy: test-env-deploy ## Alias for the normal edit/build/load/Helm-upgrade inner loop.
+
+.PHONY: test-env-status
+test-env-status: test-env-guard ## Show VMs, Kubernetes workloads, discovered hardware, and allocations.
+	cd vagrant && vagrant status
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) get nodes -o wide
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) get pods -n distort-system -o wide
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) get nvmedevices,rdmastoragenodes,nvmedeviceclaims,nvmepartitions -A -o wide
+
+.PHONY: test-env-smoke
+test-env-smoke: test-env-guard ## Verify three ready nodes, healthy rollouts, NVMe discovery, and RDMA discovery.
+	KUBECTL="$(KUBECTL)" bash vagrant/smoke-test.sh "$(LOCAL_KUBECONFIG)"
+
+.PHONY: test-env-logs
+test-env-logs: test-env-guard ## Print recent logs from all DISTORT lab workloads.
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) logs -n distort-system -l app.kubernetes.io/name=distort --all-containers=true --prefix=true --tail=200
+
+.PHONY: test-env-ssh
+test-env-ssh: ## Open a shell on NODE (default: distort-worker-1).
+	cd vagrant && vagrant ssh $(or $(NODE),distort-worker-1)
+
+.PHONY: test-env-destroy
+test-env-destroy: ## Destroy only the isolated Vagrant lab VMs.
+	cd vagrant && vagrant destroy -f
 
 .PHONY: test-e2e
 test-e2e: get-kubeconfig manifests generate fmt vet ## Run the unified Ginkgo E2E tests against Vagrant K3s
-	bash vagrant/verify-env.sh
-	KUBECONFIG=$(PWD)/kubeconfig.yaml go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	KUBECTL="$(KUBECTL)" bash vagrant/verify-local-kubeconfig.sh "$(LOCAL_KUBECONFIG)"
+	$(MAKE) test-env-smoke
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" bash vagrant/verify-env.sh
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" go test -tags=e2e ./test/e2e/ -v -ginkgo.v $(E2E_ARGS)
+
+.PHONY: test-e2e-regression
+test-e2e-regression: get-kubeconfig manifests generate fmt vet ## Run quarantined Vagrant regressions (optionally FINDING=F1).
+	KUBECTL="$(KUBECTL)" bash vagrant/verify-local-kubeconfig.sh "$(LOCAL_KUBECONFIG)"
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" DISTORT_RUN_KNOWN_FAILURES=1 DISTORT_FINDING="$(FINDING)" go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter=known-failure $(E2E_ARGS)
+
+.PHONY: test-env-all
+test-env-all: ## Reset the isolated lab, verify it, and run every green E2E test.
+	$(MAKE) test-env-reset
+	$(MAKE) test-env-smoke
+	$(MAKE) test-e2e
+
+.PHONY: test-env-regression
+test-env-regression: ## Reset the lab and run quarantined E2E regressions (optionally FINDING=F1).
+	$(MAKE) test-env-reset
+	$(MAKE) test-env-smoke
+	$(MAKE) test-e2e-regression FINDING="$(FINDING)"
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -121,7 +258,7 @@ run: manifests generate fmt vet ## Run the manager controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build $(DOCKER_BUILD_ARGS) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -164,6 +301,8 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.8.0
+GOLANGCI_LINT_BASE = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GOLANGCI_LINT_CUSTOM = $(LOCALBIN)/golangci-lint-custom-$(GOLANGCI_LINT_VERSION)
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
@@ -185,13 +324,17 @@ $(ENVTEST): $(LOCALBIN)
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
-		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
-	} || true
+$(GOLANGCI_LINT): $(GOLANGCI_LINT_CUSTOM)
+	ln -sfn "$$(realpath "$(GOLANGCI_LINT_CUSTOM)")" "$(GOLANGCI_LINT)"
+
+$(GOLANGCI_LINT_BASE): | $(LOCALBIN)
+	GOBIN="$(LOCALBIN)" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mv "$(LOCALBIN)/golangci-lint" "$(GOLANGCI_LINT_BASE)"
+
+$(GOLANGCI_LINT_CUSTOM): $(GOLANGCI_LINT_BASE) .custom-gcl.yml
+	@echo "Building custom golangci-lint with plugins..."
+	"$(GOLANGCI_LINT_BASE)" custom --destination "$(LOCALBIN)" --name golangci-lint-custom
+	mv "$(LOCALBIN)/golangci-lint-custom" "$(GOLANGCI_LINT_CUSTOM)"
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -221,4 +364,3 @@ docs-serve: ## Run Hugo documentation site locally.
 
 docs-build: ## Build Hugo documentation site static files.
 	cd docs && hugo --minify
-

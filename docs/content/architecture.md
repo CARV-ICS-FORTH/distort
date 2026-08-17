@@ -92,7 +92,7 @@ This layer translates standard PersistentVolumeClaims (PVCs) into concrete stora
 
 ## Codebase Layout & Compilation
 
-DISTORT is implemented in Go (version 1.23+), leveraging the `controller-runtime` and Kubebuilder frameworks to enforce operator paradigms. The system compiles into three distinct binaries located in the `cmd/` directory:
+DISTORT is implemented in Go (version 1.25.3+), leveraging the `controller-runtime` and Kubebuilder frameworks to enforce operator paradigms. The system compiles into three distinct binaries located in the `cmd/` directory:
 
 1. **`distort-manager`:** The control plane application housing the claims and placement schedulers.
 2. **`distort-agent`:** The privileged hardware-interaction daemon.
@@ -113,3 +113,18 @@ DISTORT integrates the **Storage Performance Development Kit (SPDK)** to achieve
 
 Volume teardown employs Kubernetes **Finalizers**, intercepting `NVMePartition` deletion events to cleanly un-export the Fabric pathway via RPC before destroying the logical volume.
 
+## Identity and ownership guarantees
+
+Device authorization and volume identity are persisted in Kubernetes rather than inferred from mutable names:
+
+- A claimed `NVMeDevice` records the claim namespace, name, and immutable UID. The agent verifies that exact live claim before performing host or SPDK operations.
+- Each new `NVMePartition` derives a backend-safe external identity from its immutable UID. CSI handles include namespace, name, and UID so same-named volumes in different namespaces cannot alias one another.
+- Legacy name-only volume handles remain readable only through a fail-safe compatibility path; ambiguous matches are never deleted.
+
+These guarantees protect the provider side. Consumer-side attachment fencing is not complete: the chart currently declares `attachRequired: false`, and the CSI controller does not implement `ControllerPublishVolume`/`ControllerUnpublishVolume`. `ReadWriteOnce` therefore must not be treated as durable single-node fencing during forced migration. This is tracked as F25 in the [review findings](/review-findings/).
+
+## Current capability boundary
+
+DISTORT is under active development. The implemented happy path includes claimed-device authorization, namespace-safe volume identity, SPDK and kernel targets, ext4/XFS detection and formatting, and persistent three-node lab validation. Important remaining production work includes exact SPDK cleanup verification, concurrent capacity reservation, target-process recovery, attachment fencing, complete CSI capability enforcement, and RDMA health reporting.
+
+For controller-by-controller behavior and recovery details, see [Project Internals](/internals/). For the prioritized defect ledger and release gates, see [Review Findings](/review-findings/).

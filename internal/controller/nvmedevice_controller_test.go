@@ -18,67 +18,112 @@ package controller
 
 import (
 	"context"
+	"os"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "distort/api/v1alpha1"
 )
 
-var _ = Describe("NVMeDevice Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+var _ = Describe("NVMeDevice capacity reconciliation", func() {
+	const namespace = "default"
+	ctx := context.Background()
 
-		ctx := context.Background()
-
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+	AfterEach(func() {
+		for _, object := range []client.Object{
+			&storagev1alpha1.NVMePartition{ObjectMeta: metav1.ObjectMeta{Name: "capacity-a", Namespace: namespace}},
+			&storagev1alpha1.NVMePartition{ObjectMeta: metav1.ObjectMeta{Name: "capacity-b", Namespace: namespace}},
+			&storagev1alpha1.NVMePartition{ObjectMeta: metav1.ObjectMeta{Name: "capacity-negative", Namespace: namespace}},
+			&storagev1alpha1.NVMeDevice{ObjectMeta: metav1.ObjectMeta{Name: "capacity-device"}},
+		} {
+			_ = k8sClient.Delete(ctx, object)
 		}
-		nvmedevice := &storagev1alpha1.NVMeDevice{}
+	})
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind NVMeDevice")
-			err := k8sClient.Get(ctx, typeNamespacedName, nvmedevice)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &storagev1alpha1.NVMeDevice{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
-		})
+	createDevice := func() {
+		device := &storagev1alpha1.NVMeDevice{
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-device"},
+			Spec: storagev1alpha1.NVMeDeviceSpec{
+				NodeName:      "distort-worker-1",
+				PCIAddress:    "0000:01:00.0",
+				SerialNumber:  "capacity-serial",
+				TotalCapacity: resource.MustParse("10Gi"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, device)).To(Succeed())
+	}
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &storagev1alpha1.NVMeDevice{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+	reconcileDevice := func() (storagev1alpha1.NVMeDevice, error) {
+		reconciler := &NVMeDeviceReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "capacity-device"}})
+		var actual storagev1alpha1.NVMeDevice
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "capacity-device"}, &actual)).To(Succeed())
+		return actual, err
+	}
+	assignedSpec := func(size, serial string) storagev1alpha1.NVMePartitionSpec {
+		return storagev1alpha1.NVMePartitionSpec{
+			Size:                     resource.MustParse(size),
+			NodeName:                 "distort-worker-1",
+			ParentDeviceSerialNumber: serial,
+			ClaimRef: &storagev1alpha1.NVMeDeviceClaimReference{
+				Namespace: namespace,
+				Name:      "capacity-claim",
+				UID:       types.UID("capacity-claim-uid"),
+			},
+		}
+	}
 
-			By("Cleanup the specific resource instance NVMeDevice")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &NVMeDeviceReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+	It("subtracts only partitions assigned to the matching serial", func() {
+		createDevice()
+		Expect(k8sClient.Create(ctx, &storagev1alpha1.NVMePartition{
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-a", Namespace: namespace},
+			Spec:       assignedSpec("2Gi", "capacity-serial"),
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &storagev1alpha1.NVMePartition{
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-b", Namespace: namespace},
+			Spec:       assignedSpec("7Gi", "another-serial"),
+		})).To(Succeed())
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
-		})
+		actual, err := reconcileDevice()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(actual.Status.FreeCapacity.Cmp(resource.MustParse("8Gi"))).To(Equal(0))
+	})
+
+	It("clamps oversubscription at zero", func() {
+		createDevice()
+		Expect(k8sClient.Create(ctx, &storagev1alpha1.NVMePartition{
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-a", Namespace: namespace},
+			Spec:       assignedSpec("11Gi", "capacity-serial"),
+		})).To(Succeed())
+
+		actual, err := reconcileDevice()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(actual.Status.FreeCapacity.IsZero()).To(BeTrue())
+	})
+
+	It("rejects malformed negative allocations instead of increasing capacity", func() {
+		if os.Getenv("DISTORT_RUN_KNOWN_FAILURES") != "1" {
+			Skip("F7 is a known defect")
+		}
+		finding := os.Getenv("DISTORT_FINDING")
+		if finding != "" && finding != "F7" {
+			Skip("F7 is not selected")
+		}
+
+		createDevice()
+		Expect(k8sClient.Create(ctx, &storagev1alpha1.NVMePartition{
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-negative", Namespace: namespace},
+			Spec:       assignedSpec("-1Gi", "capacity-serial"),
+		})).To(Succeed())
+
+		actual, err := reconcileDevice()
+		Expect(err).To(HaveOccurred())
+		Expect(actual.Status.FreeCapacity.Cmp(actual.Spec.TotalCapacity)).To(BeNumerically("<=", 0))
 	})
 })

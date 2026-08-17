@@ -43,6 +43,15 @@ kubectl get nvmedevices
 
 This returns a list of discovered controllers, showing their status, capacity, NUMA alignment, serial number, and hosting node.
 
+### Limit discovery to approved devices
+
+The agent accepts two optional environment variables containing exact, comma-separated PCI addresses:
+
+- `NVME_ALLOWED_DEVICES` limits discovery to the listed controllers.
+- `NVME_EXCLUDE_DEVICES` removes listed controllers from discovery; exclusion wins when both variables are set.
+
+For example, `0000:04:00.0,0000:05:00.0` selects two exact addresses. Substring and partial-address matches are deliberately rejected. These variables are not currently first-class Helm values, so installations that need them must add the environment entries to the agent workload through their deployment customization. Confirm the PCI addresses and mounted-device state before enabling an agent; assigning an OS or otherwise in-use controller to SPDK can make the host unavailable or destroy data.
+
 ### Step 2: Allocate Drives via `NVMeDeviceClaim`
 
 To make a discovered physical device available for partitioning and pod allocation, an administrator must **claim** it. 
@@ -90,6 +99,10 @@ DISTORT supports multiple backends and volume carving configurations. These are 
 | `target-backend` | String | `spdk`, `kernel` | `spdk` | The target export technology to run on the storage nodes. |
 | `volume-manager` | String | `partition` (or `lvm` in future) | `partition` | The volume carving method to slice physical drives. |
 | `spdk-core-mask` | String | CPU mask (e.g., `0x1`, `0x3`) | `0x1` | Core affinity mask to pass to the SPDK target daemon (SPDK only). |
+| `fsType` | String | `ext4`, `xfs` | `ext4` | Filesystem created on a blank exported volume.|
+| `csi.storage.k8s.io/fstype` | String | `ext4`, `xfs` | `ext4` | CSI ecosystem spelling for the filesystem type. |
+
+Use only one filesystem parameter in a StorageClass. DISTORT accepts both spellings for compatibility; if both are set, their values must agree. Filesystem values are case-insensitive.
 
 > [!WARNING]
 > **Data Destruction on Backend Swap:**
@@ -126,11 +139,44 @@ parameters:
   volume-manager: "partition"
 ```
 
+**Option C: XFS Filesystem**
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: distort-spdk-xfs
+provisioner: storage.distort.io
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  target-backend: "spdk"
+  volume-manager: "partition"
+  fsType: "xfs"
+```
+
+The filesystem choice applies when DISTORT first stages a blank volume. If a volume already contains a filesystem, DISTORT preserves it. Staging fails without formatting or mounting when the detected type differs from the StorageClass request, preventing accidental data loss. DISTORT does not convert existing ext4 volumes to XFS.
+
+Custom formatting options and StorageClass `mountOptions` are not currently supported. XFS also requires XFS support in the consumer node's host kernel, cannot be shrunk, and must not be mounted read-write from multiple nodes because it is not a clustered filesystem.
+
+DISTORT also does not yet provide controller-side attachment fencing. Until `ControllerPublishVolume`/`ControllerUnpublishVolume` or an equivalent durable lease is implemented, do not force a read-write volume between nodes or assume `ReadWriteOnce` alone prevents a second active consumer. See F25 in the [review findings](/review-findings/).
+
 Apply the chosen StorageClass:
 
 ```bash
 kubectl apply -f storageclass.yaml
 ```
+
+### SPDK memory and RDMA queue tuning
+
+The chart exposes resource controls for installations with a deliberately sized hugepage budget:
+
+| Helm value | Default | Purpose |
+|---|---|---|
+| `agent.spdk.iobufSmallPoolCount` | SPDK default | Number of small iobuf entries; configure together with the large pool. |
+| `agent.spdk.iobufLargePoolCount` | SPDK default | Number of large iobuf entries; configure together with the small pool. |
+| `agent.spdk.maxSrqDepth` | SPDK default | Maximum RDMA shared receive queue depth; lowering it reduces DMA memory at the cost of queue capacity. |
+| `agent.spdk.skipHugepageSetup` | `false` | Preserve a hugepage reservation managed by the host instead of allowing SPDK setup to replace it. |
+
+Leaving the values unset preserves upstream SPDK behavior. Size them from measured workload concurrency and the node's hugepage reservation; the small values used by the local lab are functional-test settings, not universal production recommendations. The agent validates paired iobuf settings and positive numeric values before starting SPDK.
 
 ### 2. Request a Volume via PVC
 
@@ -161,4 +207,4 @@ kubectl apply -f pvc.yaml
 2. Rather than creating a block loop file on a local filesystem, it creates a new **`NVMePartition`** CRD requesting `500Mi` of capacity.
 3. The centralized **`distort-manager`** reconciles the partition, finding an active `NVMeDeviceClaim` on a healthy node with sufficient free space.
 4. The local **`distort-agent`** DaemonSet on that node watches the partition, dynamically carves out an SPDK user-space Logical Volume (Lvol) in memory, and exposes it over the network as an NVMe-oF target.
-5. The **CSI-Node-Server** on the compute node executing the application Pod connects to the remote target over the SoftRoCE/RDMA network, formats the block device with `ext4`, and bind-mounts it directly into the container!
+5. The **CSI-Node-Server** on the compute node executing the application Pod connects to the remote target over the SoftRoCE/RDMA network, formats a blank block device with the StorageClass filesystem (`ext4` by default or `xfs`), and bind-mounts it directly into the container!

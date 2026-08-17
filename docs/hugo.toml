@@ -25,6 +25,26 @@ disableKinds = ["taxonomy", "term"]
   weight = 25
 
 [[menu.main]]
+  name = "Internals"
+  url = "/internals/"
+  weight = 30
+
+[[menu.main]]
+  name = "Local Testing"
+  url = "/local-testing/"
+  weight = 35
+
+[[menu.main]]
+  name = "Testing"
+  url = "/testing/"
+  weight = 40
+
+[[menu.main]]
+  name = "Review Findings"
+  url = "/review-findings/"
+  weight = 45
+
+[[menu.main]]
   name = "Contributing"
   url = "/contributing/"
-  weight = 30
+  weight = 50

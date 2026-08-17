@@ -98,6 +98,31 @@ spec:
                 description: ActiveBackend tracks which target technology currently
                   owns this controller ("spdk", "kernel", or "none").
                 type: string
+              claimRef:
+                description: ClaimRef identifies the exact active claim that owns
+                  this device.
+                properties:
+                  name:
+                    description: Name is the name of the claim.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace is the namespace containing the claim.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the immutable Kubernetes UID of the claim.
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: claimRef is immutable
+                  rule: self == oldSelf
+                - message: claimRef UID must not be empty
+                  rule: size(self.uid) > 0
               conditions:
                 description: Conditions represent the current state of the NVMeDevice
                   resource.

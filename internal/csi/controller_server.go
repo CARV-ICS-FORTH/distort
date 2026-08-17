@@ -9,6 +9,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -16,13 +17,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/storageoptions"
+	"distort/internal/volumeidentity"
 )
 
 // ControllerServer implements the CSI Controller interface.
 // It translates CreateVolume calls into NVMePartition CRDs.
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
-	k8sClient client.Client
+	k8sClient                  client.Client
+	partitionReadyPollInterval time.Duration
+	partitionReadyTimeout      time.Duration
 }
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -34,6 +39,10 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	caps := req.GetVolumeCapabilities()
 	if len(caps) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume Capabilities cannot be empty")
+	}
+	fsType, err := resolveFilesystem(req.GetParameters(), caps)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid filesystem configuration: %v", err)
 	}
 
 	requiredBytes := req.GetCapacityRange().GetRequiredBytes()
@@ -60,9 +69,12 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	targetOptions := make(map[string]string)
 	// csi.storage.k8s.io/* keys are injected by the provisioner sidecar and are not for backends.
 	for k, v := range req.GetParameters() {
-		if !strings.HasPrefix(k, "csi.storage.k8s.io/") && k != "target-backend" && k != "volume-manager" {
+		if !strings.HasPrefix(k, "csi.storage.k8s.io/") && k != "target-backend" && k != "volume-manager" && k != filesystemParameter {
 			targetOptions[k] = v
 		}
+	}
+	if err := storageoptions.Validate(targetBackend, targetOptions); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid backend options: %v", err)
 	}
 
 	// Create NVMePartition CRD
@@ -80,7 +92,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		},
 	}
 
-	err := cs.k8sClient.Create(ctx, partition)
+	err = cs.k8sClient.Create(ctx, partition)
 	if err != nil {
 		if client.IgnoreAlreadyExists(err) != nil {
 			klog.Errorf("Failed to create NVMePartition CRD: %v", err)
@@ -114,17 +126,26 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get final partition status: %v", err)
 	}
+	volumeID := partition.Status.VolumeID
+	if volumeID == "" {
+		identity, identityErr := volumeidentity.New(partition.Namespace, partition.Name, partition.UID)
+		if identityErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to derive partition identity: %v", identityErr)
+		}
+		volumeID = identity.VolumeHandle
+	}
 
 	// Construct context for the Node Stage/Publish calls
 	volCtx := map[string]string{
-		"nqn":        partition.Status.NQN,
-		"portalIP":   partition.Status.PortalIP,
-		"portalPort": fmt.Sprintf("%d", partition.Status.PortalPort),
+		"nqn":               partition.Status.NQN,
+		"portalIP":          partition.Status.PortalIP,
+		"portalPort":        fmt.Sprintf("%d", partition.Status.PortalPort),
+		filesystemParameter: fsType,
 	}
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:      name,
+			VolumeId:      volumeID,
 			CapacityBytes: requiredBytes,
 			VolumeContext: volCtx,
 		},
@@ -139,34 +160,87 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 	klog.Infof("DeleteVolume: ID=%s", volID)
 
-	var pList storagev1alpha1.NVMePartitionList
-	if err := cs.k8sClient.List(ctx, &pList); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list partitions: %v", err)
+	reference, err := volumeidentity.ParseVolumeHandle(volID)
+	if err != nil {
+		return cs.deleteLegacyVolume(ctx, volID)
 	}
 
-	for _, p := range pList.Items {
-		if p.Name == volID {
-			if err := cs.k8sClient.Delete(ctx, &p); err != nil && client.IgnoreNotFound(err) != nil {
-				klog.Errorf("Failed to delete NVMePartition %s: %v", volID, err)
-				return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
-			}
+	partition := &storagev1alpha1.NVMePartition{}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: reference.Name}
+	if err := cs.k8sClient.Get(ctx, key, partition); err != nil {
+		if apierrors.IsNotFound(err) {
 			return &csi.DeleteVolumeResponse{}, nil
 		}
+		return nil, status.Errorf(codes.Internal, "failed to get partition: %v", err)
+	}
+	if partition.UID != reference.UID {
+		// The volume represented by this handle is already gone. Never delete a
+		// replacement object which happens to reuse its namespace and name.
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+	if err := cs.k8sClient.Delete(ctx, partition); err != nil && client.IgnoreNotFound(err) != nil {
+		klog.Errorf("Failed to delete NVMePartition %s: %v", key, err)
+		return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
 	}
 
 	// Note: We might want to wait for actual deletion if we use finalizers in the Agent
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
+func (cs *ControllerServer) deleteLegacyVolume(ctx context.Context, volumeID string) (*csi.DeleteVolumeResponse, error) {
+	// Releases before globally unique handles stored only metadata.name in PVs.
+	// Preserve upgrade cleanup without repeating the old unsafe first-match
+	// behavior: delete only a single object whose persisted backend identity is
+	// also the legacy name, and refuse an ambiguous request.
+	var partitions storagev1alpha1.NVMePartitionList
+	if err := cs.k8sClient.List(ctx, &partitions); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resolve legacy volume ID: %v", err)
+	}
+	matches := make([]*storagev1alpha1.NVMePartition, 0, 1)
+	for index := range partitions.Items {
+		partition := &partitions.Items[index]
+		if partition.Name != volumeID {
+			continue
+		}
+		externalID := partition.Status.ExternalID
+		if externalID == "" {
+			externalID, _ = volumeidentity.ExternalIDFromNQN(partition.Status.NQN)
+		}
+		if externalID == "" || externalID == volumeID {
+			matches = append(matches, partition)
+		}
+	}
+	if len(matches) == 0 {
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+	if len(matches) > 1 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"legacy volume ID %q matches multiple partitions; refusing ambiguous deletion", volumeID)
+	}
+	if err := cs.k8sClient.Delete(ctx, matches[0]); err != nil && client.IgnoreNotFound(err) != nil {
+		return nil, status.Errorf(codes.Internal, "failed to delete legacy partition: %v", err)
+	}
+	return &csi.DeleteVolumeResponse{}, nil
+}
+
 func (cs *ControllerServer) waitForPartitionReady(ctx context.Context, name, namespace string) error {
-	// Simple polling for now
-	timeout := time.After(2 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
+	pollInterval := cs.partitionReadyPollInterval
+	if pollInterval <= 0 {
+		pollInterval = 5 * time.Second
+	}
+	readyTimeout := cs.partitionReadyTimeout
+	if readyTimeout <= 0 {
+		readyTimeout = 2 * time.Minute
+	}
+
+	timeout := time.NewTimer(readyTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-timeout:
+		case <-timeout.C:
 			return fmt.Errorf("timeout waiting for NVMePartition %s", name)
 		case <-ctx.Done():
 			return ctx.Err()

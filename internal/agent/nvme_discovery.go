@@ -22,8 +22,8 @@ type HardwareNVMe struct {
 	NUMANode     int
 }
 
-const sysClassNVMe = "/sys/class/nvme"
-const sysClassBlock = "/sys/class/block"
+var sysClassNVMe = "/sys/class/nvme"
+var sysClassBlock = "/sys/class/block"
 
 // DiscoverNVMe scans both the Linux sysfs tree (for kernel-bound NVMe devices)
 // and SPDK JSON-RPC (for SPDK-bound NVMe devices), returning a unified list.

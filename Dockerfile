@@ -1,10 +1,16 @@
 # Create a builder stage specifically for SPDK to avoid bloating the final image
 FROM ubuntu:24.04 AS spdk-builder
+ARG SPDK_BUILD_JOBS=2
 
 # Install dependencies required to build SPDK and RDMA components
 ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/Components: main$/Components: main universe restricted multiverse/g' /etc/apt/sources.list.d/ubuntu.sources && \
-    apt-get update && apt-get install -y \
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+    -e 's/Components: main$/Components: main universe restricted multiverse/g' \
+    /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y \
     gcc g++ make pkg-config libnuma-dev python3 uuid-dev git \
     libibverbs-dev librdmacm-dev python3-pyelftools python3-venv \
     libcunit1-dev libaio-dev libssl-dev libjson-c-dev libcmocka-dev \
@@ -15,20 +21,22 @@ RUN sed -i 's/Components: main$/Components: main universe restricted multiverse/
 
 # Clone SPDK
 WORKDIR /src
-RUN git clone -b v26.01 https://github.com/spdk/spdk.git /src/spdk
+RUN git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone -b v26.01 https://github.com/spdk/spdk.git /src/spdk
 
 WORKDIR /src/spdk
-RUN git submodule update --init
+RUN git -c submodule.fetchJobs=1 -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 submodule update --init
 
 # Build DPDK and SPDK with RDMA enabled
     RUN ./configure --with-rdma --disable-tests --disable-unit-tests || (cat /src/spdk/.spdk-isal.log && exit 1)
-    RUN make -j$(nproc)
+    RUN make -j${SPDK_BUILD_JOBS}
 
 
 # Build the Go binaries
 FROM golang:1.25 AS go-builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG GO_BUILD_PROCS=2
+ENV GOMAXPROCS=${GO_BUILD_PROCS}
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -68,7 +76,12 @@ ENV PYTHONPATH=/opt/spdk/python
 
 
 # Install runtime dependencies required by the agent, CSI, and SPDK RDMA
-RUN apt-get update && apt-get install -y \
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y \
     nvme-cli parted e2fsprogs xfsprogs kmod \
     python3 libnuma1 libibverbs1 librdmacm1 pciutils \
     libfuse3-3 libaio1t64 \

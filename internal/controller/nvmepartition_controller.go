@@ -77,8 +77,9 @@ func (r *NVMePartitionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	for i := range deviceList.Items {
 		device := &deviceList.Items[i]
 
-		// Only consider Claimed devices
-		if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed {
+		// Only a device with a persisted, immutable owner identity can authorize
+		// an allocation. The agent independently verifies the live claim again.
+		if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed || device.Status.ClaimRef == nil {
 			continue
 		}
 
@@ -112,6 +113,11 @@ func (r *NVMePartitionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	partition.Spec.NodeName = bestDevice.Spec.NodeName
 	partition.Spec.ParentDeviceSerialNumber = bestDevice.Spec.SerialNumber
+	partition.Spec.ClaimRef = &storagev1alpha1.NVMeDeviceClaimReference{
+		Namespace: bestDevice.Status.ClaimRef.Namespace,
+		Name:      bestDevice.Status.ClaimRef.Name,
+		UID:       bestDevice.Status.ClaimRef.UID,
+	}
 	if err := r.Update(ctx, &partition); err != nil {
 		logger.Error(err, "unable to update NVMePartition with selected node and device", "partition", partition.Name)
 		return ctrl.Result{}, err

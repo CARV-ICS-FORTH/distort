@@ -88,8 +88,12 @@ func GetDeviceByNQN(nqn string) (string, error) {
 		return "", fmt.Errorf("nvme list-subsys failed: %v, output: %s", err, string(out))
 	}
 
+	return deviceByNQN(out, nqn)
+}
+
+func deviceByNQN(data []byte, nqn string) (string, error) {
 	var list NVMEHostList
-	if err := json.Unmarshal(out, &list); err != nil {
+	if err := json.Unmarshal(data, &list); err != nil {
 		return "", fmt.Errorf("failed to parse nvme list-subsys JSON: %v", err)
 	}
 

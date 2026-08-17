@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -29,6 +30,24 @@ type NVMeDeviceClaimSpec struct {
 	// This uniquely identifies the drive even if it moves to another node or PCIe slot.
 	// +kubebuilder:validation:Required
 	SerialNumber string `json:"serialNumber"`
+}
+
+// NVMeDeviceClaimReference identifies the exact claim that authorizes use of a device.
+// The UID prevents a deleted claim from being silently replaced by another object with
+// the same namespace and name.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="claimRef is immutable"
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="claimRef UID must not be empty"
+type NVMeDeviceClaimReference struct {
+	// Namespace is the namespace containing the claim.
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
+
+	// Name is the name of the claim.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// UID is the immutable Kubernetes UID of the claim.
+	UID types.UID `json:"uid"`
 }
 
 // NVMeDeviceClaimStatus defines the observed state of NVMeDeviceClaim.

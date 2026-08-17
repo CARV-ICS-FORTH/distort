@@ -9,11 +9,13 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var spdkRPCExecutable = "/opt/spdk/scripts/rpc.py"
+
 // CallSPDKRPC executes spdk_rpc.py with the given method and arguments.
 // It parses the JSON output into the provided result object.
 func CallSPDKRPC(method string, result any, args ...string) error {
 	cmdArgs := append([]string{method}, args...)
-	cmd := exec.Command("/opt/spdk/scripts/rpc.py", cmdArgs...)
+	cmd := exec.Command(spdkRPCExecutable, cmdArgs...)
 	klog.V(4).Infof("Executing SPDK RPC: %v", cmdArgs)
 
 	var stdout, stderr bytes.Buffer
