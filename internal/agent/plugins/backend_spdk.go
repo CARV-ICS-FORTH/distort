@@ -313,24 +313,37 @@ func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, block
 
 func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 	klog.Infof("Unexporting SPDK NVMe-oF target %s", nqn)
-	var subsystems []struct {
-		NQN string `json:"nqn"`
-	}
-	if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err != nil {
-		return fmt.Errorf("failed to list SPDK NVMe-oF subsystems: %w", err)
-	}
-	found := false
-	for _, subsystem := range subsystems {
-		if subsystem.NQN == nqn {
-			found = true
-			break
+	subsystemExists := func() (bool, error) {
+		var subsystems []struct {
+			NQN string `json:"nqn"`
 		}
+		if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err != nil {
+			return false, fmt.Errorf("failed to list SPDK NVMe-oF subsystems: %w", err)
+		}
+		for _, subsystem := range subsystems {
+			if subsystem.NQN == nqn {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	found, err := subsystemExists()
+	if err != nil {
+		return err
 	}
 	if !found {
 		return nil
 	}
-	if err := CallSPDKRPC("nvmf_delete_subsystem", nil, nqn); err != nil {
-		return fmt.Errorf("failed to delete SPDK subsystem %s: %w", nqn, err)
+	deleteErr := CallSPDKRPC("nvmf_delete_subsystem", nil, nqn)
+	found, verifyErr := subsystemExists()
+	if verifyErr != nil {
+		return fmt.Errorf("verify SPDK subsystem %s absence: %w", nqn, verifyErr)
+	}
+	if found {
+		if deleteErr != nil {
+			return fmt.Errorf("failed to delete SPDK subsystem %s: %w", nqn, deleteErr)
+		}
+		return fmt.Errorf("SPDK subsystem %s still exists after deletion", nqn)
 	}
 	return nil
 }

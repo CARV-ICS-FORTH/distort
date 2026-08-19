@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,30 +45,163 @@ func TestBuiltInPluginsAreRegistered(t *testing.T) {
 }
 
 func TestPartedSetupStorageIsIdempotentWhenPartitionExists(t *testing.T) {
-	device := filepath.Join(t.TempDir(), "nvme0n1")
-	if err := os.WriteFile(device+"p1", nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := (&PartedVolumeManager{}).SetupStorage(context.Background(), device, "nvme0"); err != nil {
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+	disk.partitions = []partedPartition{{number: 2, start: 1024 * 1024, end: 2*1024*1024 - 1, name: "existing"}}
+	if err := (&PartedVolumeManager{}).SetupStorage(context.Background(), disk.devicePath, "nvme0"); err != nil {
 		t.Fatalf("SetupStorage returned error for existing partition: %v", err)
+	}
+	if disk.wipeCalls != 0 {
+		t.Fatalf("SetupStorage wiped a device with an existing partition table")
 	}
 }
 
 func TestPartedVolumesDoNotAliasPartitionOne(t *testing.T) {
-	knownfailure.Require(t, "F3")
-	device := filepath.Join(t.TempDir(), "nvme0n1")
-	if err := os.WriteFile(device+"p1", nil, 0600); err != nil {
+	disk := installFakePartedDisk(t)
+	manager := &PartedVolumeManager{}
+	if err := manager.SetupStorage(context.Background(), disk.devicePath, "nvme0"); err != nil {
 		t.Fatal(err)
 	}
-	manager := &PartedVolumeManager{}
-	first, err := manager.CreateVolume(context.Background(), device, "nvme0", "first", 128*1024*1024)
+	first, err := manager.CreateVolume(context.Background(), disk.devicePath, "nvme0", "first", 128*1024*1024)
 	if err != nil {
 		t.Fatalf("creating first volume: %v", err)
 	}
-	second, err := manager.CreateVolume(context.Background(), device, "nvme0", "second", 128*1024*1024)
-	if err == nil && first == second {
-		t.Fatalf("two independent volumes alias the same block path %q", first)
+	second, err := manager.CreateVolume(context.Background(), disk.devicePath, "nvme0", "second", 128*1024*1024)
+	if err != nil {
+		t.Fatalf("creating second volume: %v", err)
 	}
+	if first.BackendVolumeID != disk.devicePath+"p1" || second.BackendVolumeID != disk.devicePath+"p2" {
+		t.Fatalf("volume paths = %q and %q, want distinct p1 and p2", first, second)
+	}
+
+	// A fresh manager must recover the durable mapping from the GPT label.
+	recovered, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), disk.devicePath, "nvme0", "second", 128*1024*1024)
+	if err != nil || recovered != second {
+		t.Fatalf("recovering second volume after restart: path=%q err=%v", recovered, err)
+	}
+
+	if err := manager.DeleteVolume(context.Background(), disk.devicePath, "nvme0", "first", first); err != nil {
+		t.Fatalf("deleting first volume: %v", err)
+	}
+	third, err := manager.CreateVolume(context.Background(), disk.devicePath, "nvme0", "third", 64*1024*1024)
+	if err != nil {
+		t.Fatalf("creating volume in reusable partition slot: %v", err)
+	}
+	if third.BackendVolumeID != disk.devicePath+"p1" {
+		t.Fatalf("reusable partition path = %q, want %sp1", third, disk.devicePath)
+	}
+	if matches := partitionsNamed(disk.partitions, "second"); len(matches) != 1 || matches[0].number != 2 {
+		t.Fatalf("deleting p1 damaged surviving volume: %#v", disk.partitions)
+	}
+	if err := manager.DeleteVolume(context.Background(), disk.devicePath, "nvme0", "first", third); err == nil {
+		t.Fatal("deletion accepted a reused partition now owned by another volume")
+	}
+	if err := manager.DeleteVolume(context.Background(), disk.devicePath, "nvme0", "second", second); err != nil {
+		t.Fatalf("deleting second volume: %v", err)
+	}
+	if matches := partitionsNamed(disk.partitions, "third"); len(matches) != 1 || matches[0].number != 1 {
+		t.Fatalf("deleting p2 damaged surviving volume: %#v", disk.partitions)
+	}
+	fourth, err := manager.CreateVolume(context.Background(), disk.devicePath, "nvme0", "fourth", 64*1024*1024)
+	if err != nil {
+		t.Fatalf("reusing second partition slot: %v", err)
+	}
+	if fourth.BackendVolumeID != disk.devicePath+"p2" {
+		t.Fatalf("second reusable partition path = %q, want %sp2", fourth, disk.devicePath)
+	}
+}
+
+type fakePartedDisk struct {
+	devicePath  string
+	size        int64
+	initialized bool
+	partitions  []partedPartition
+	wipeCalls   int
+}
+
+func installFakePartedDisk(t *testing.T) *fakePartedDisk {
+	t.Helper()
+	disk := &fakePartedDisk{devicePath: "/dev/nvme-testn1", size: 1024 * 1024 * 1024}
+	oldParted := executeParted
+	oldWipefs := executeWipefs
+	oldStat := partitionPathStat
+	oldPollCount := partitionPollCount
+	executeParted = disk.runParted
+	executeWipefs = func(context.Context, string) ([]byte, error) {
+		disk.wipeCalls++
+		return nil, nil
+	}
+	partitionPathStat = func(string) (os.FileInfo, error) { return nil, nil }
+	partitionPollCount = 1
+	t.Cleanup(func() {
+		executeParted = oldParted
+		executeWipefs = oldWipefs
+		partitionPathStat = oldStat
+		partitionPollCount = oldPollCount
+		partitionDeviceLocks.Delete(disk.devicePath)
+	})
+	return disk
+}
+
+func (d *fakePartedDisk) runParted(_ context.Context, args ...string) ([]byte, error) {
+	for index, arg := range args {
+		switch arg {
+		case "print":
+			if !d.initialized {
+				return nil, fmt.Errorf("unrecognized disk label")
+			}
+			return []byte(d.table(index+1 < len(args) && args[index+1] == "free")), nil
+		case "mklabel":
+			d.initialized = true
+			d.partitions = nil
+			return nil, nil
+		case "mkpart":
+			name := args[index+1]
+			start, err := parseByteField(args[index+2])
+			if err != nil {
+				return nil, err
+			}
+			end, err := parseByteField(args[index+3])
+			if err != nil {
+				return nil, err
+			}
+			number := lowestAvailablePartitionNumber(d.partitions)
+			d.partitions = append(d.partitions, partedPartition{number: number, start: start, end: end, name: name})
+			return nil, nil
+		case "rm":
+			number, err := strconv.Atoi(args[index+1])
+			if err != nil {
+				return nil, err
+			}
+			for partitionIndex := range d.partitions {
+				if d.partitions[partitionIndex].number == number {
+					d.partitions = append(d.partitions[:partitionIndex], d.partitions[partitionIndex+1:]...)
+					return nil, nil
+				}
+			}
+			return nil, fmt.Errorf("partition %d does not exist", number)
+		}
+	}
+	return nil, fmt.Errorf("unsupported parted arguments: %v", args)
+}
+
+func (d *fakePartedDisk) table(includeFree bool) string {
+	partitions := append([]partedPartition(nil), d.partitions...)
+	sort.Slice(partitions, func(i, j int) bool { return partitions[i].start < partitions[j].start })
+	var output strings.Builder
+	fmt.Fprintf(&output, "BYT;\n%s:%dB:file:512:512:gpt::;\n", d.devicePath, d.size)
+	cursor := int64(0)
+	for _, partition := range partitions {
+		if includeFree && cursor < partition.start {
+			fmt.Fprintf(&output, "1:%dB:%dB:%dB:free;\n", cursor, partition.start-1, partition.start-cursor)
+		}
+		fmt.Fprintf(&output, "%d:%dB:%dB:%dB::%s:;\n", partition.number, partition.start, partition.end, partition.end-partition.start+1, partition.name)
+		cursor = partition.end + 1
+	}
+	if includeFree && cursor < d.size {
+		fmt.Fprintf(&output, "1:%dB:%dB:%dB:free;\n", cursor, d.size-1, d.size-cursor)
+	}
+	return output.String()
 }
 
 func TestPartedCreateReturnsCommandFailure(t *testing.T) {
@@ -276,17 +411,158 @@ esac`)
 	}
 }
 
+func TestSPDKLvolPersistsAndDeletesExactCreatedIdentity(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "lvol-exists")
+	deleted := filepath.Join(t.TempDir(), "deleted-uuid")
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"lvs_base-n1","base_bdev":"base-n1"}]\n' ;;
+  bdev_get_bdevs)
+    if [ -f %q ]; then
+      printf '[{"name":"lvol-uuid","uuid":"lvol-uuid","aliases":["lvs_base-n1/volume-id"],"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
+    else
+      printf '[]\n'
+    fi ;;
+  bdev_lvol_create) touch %q; printf 'lvol-uuid\n' ;;
+  bdev_lvol_delete) printf '%%s' "$2" > %q; rm -f %q; printf 'true\n' ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, state, state, deleted, state)
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	manager := &SPDKLvolManager{}
+	identity, err := manager.CreateVolume(context.Background(), "base-n1", "base-n1", "volume-id", 64*1024*1024)
+	if err != nil {
+		t.Fatalf("CreateVolume returned error: %v", err)
+	}
+	want := (VolumeIdentity{
+		BackendVolumeID: "lvs_base-n1/volume-id",
+		BaseBdev:        "base-n1",
+		VolumeStoreName: "lvs_base-n1",
+		VolumeStoreUUID: "store-uuid",
+		VolumeName:      "volume-id",
+		VolumeUUID:      "lvol-uuid",
+	})
+	if identity != want {
+		t.Fatalf("created identity = %#v, want %#v", identity, want)
+	}
+	if err := manager.DeleteVolume(context.Background(), "wrong-guessed-controller", "wrong-guessed-controller", "volume-id", identity); err != nil {
+		t.Fatalf("DeleteVolume returned error: %v", err)
+	}
+	deletedUUID, err := os.ReadFile(deleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(deletedUUID) != "lvol-uuid" {
+		t.Fatalf("deleted bdev = %q, want exact lvol UUID", deletedUUID)
+	}
+	if err := manager.DeleteVolume(context.Background(), "wrong-guessed-controller", "wrong-guessed-controller", "volume-id", identity); err != nil {
+		t.Fatalf("idempotent DeleteVolume returned error: %v", err)
+	}
+}
+
+func TestSPDKLvolLegacyIdentityRecoversExactBdevAfterPartialDelete(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "lvol-exists")
+	if err := os.WriteFile(state, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"actual-store","base_bdev":"actual-controller-n1"}]\n' ;;
+  bdev_get_bdevs)
+    if [ -f %q ]; then
+      printf '[{"name":"legacy-uuid","aliases":["actual-store/legacy-volume"]},{"name":"other-uuid","aliases":["other-store/legacy-volume"]}]\n'
+    else
+      printf '[{"name":"other-uuid","aliases":["other-store/legacy-volume"]}]\n'
+    fi ;;
+  bdev_lvol_delete) rm -f %q; printf 'response lost\n' >&2; exit 9 ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, state, state)
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	legacy := VolumeIdentity{BackendVolumeID: "actual-store/legacy-volume"}
+	if err := (&SPDKLvolManager{}).DeleteVolume(context.Background(), "guessed-controller", "guessed-controller", "legacy-volume", legacy); err != nil {
+		t.Fatalf("legacy cleanup did not verify partial deletion success: %v", err)
+	}
+}
+
+func TestSPDKLvolRefusesAliasReusedByDifferentUUID(t *testing.T) {
+	rpcBody := `
+case "$1" in
+  bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"store","base_bdev":"base-n1"}]\n' ;;
+  bdev_get_bdevs) printf '[{"name":"replacement-uuid","aliases":["store/volume-id"]}]\n' ;;
+  bdev_lvol_delete) printf 'unsafe delete called\n' >&2; exit 99 ;;
+  *) printf 'unexpected method %s\n' "$1" >&2; exit 8 ;;
+esac`
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	identity := VolumeIdentity{
+		BackendVolumeID: "store/volume-id",
+		VolumeStoreName: "store",
+		VolumeStoreUUID: "store-uuid",
+		VolumeName:      "volume-id",
+		VolumeUUID:      "deleted-original-uuid",
+	}
+	err := (&SPDKLvolManager{}).DeleteVolume(context.Background(), "base-n1", "base-n1", "volume-id", identity)
+	if err == nil || !strings.Contains(err.Error(), "only some persisted SPDK identifiers resolve") {
+		t.Fatalf("reused alias was not rejected safely: %v", err)
+	}
+}
+
+func TestSPDKUnexportVerifiesSubsystemAbsentAfterLostDeleteResponse(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "subsystem-exists")
+	if err := os.WriteFile(state, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  nvmf_get_subsystems)
+    if [ -f %q ]; then
+      printf '[{"nqn":"nqn.test:volume"}]\n'
+    else
+      printf '[]\n'
+    fi ;;
+  nvmf_delete_subsystem) rm -f %q; printf 'response lost\n' >&2; exit 9 ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, state, state)
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	backend := &SPDKBackend{}
+	if err := backend.UnexportVolume(context.Background(), "nqn.test:volume"); err != nil {
+		t.Fatalf("UnexportVolume did not accept verified partial success: %v", err)
+	}
+	if err := backend.UnexportVolume(context.Background(), "nqn.test:volume"); err != nil {
+		t.Fatalf("idempotent UnexportVolume returned error: %v", err)
+	}
+}
+
 func TestSPDKLvolRoundsCapacityUp(t *testing.T) {
 	knownfailure.Require(t, "F7")
 	fakeBin := t.TempDir()
 	capture := filepath.Join(t.TempDir(), "lvol-create-arguments")
 	rpcBody := fmt.Sprintf(`
 case "$1" in
-  bdev_lvol_get_lvstores) printf '[{"name":"lvs_device","base_bdev":"device"}]\n' ;;
-  bdev_get_bdevs) printf '[]\n' ;;
+  bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"lvs_device","base_bdev":"device"}]\n' ;;
+  bdev_get_bdevs)
+    if [ -f %q ]; then
+      printf '[{"name":"uuid-1","uuid":"uuid-1","aliases":["lvs_device/volume"],"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
+    else
+      printf '[]\n'
+    fi ;;
   bdev_lvol_create) printf '%%s\n' "$@" > %q; printf 'uuid-1\n' ;;
   *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
-esac`, capture)
+esac`, capture, capture)
 	rpc := writeTestExecutable(t, fakeBin, "rpc.py", rpcBody)
 	oldExecutable := spdkRPCExecutable
 	spdkRPCExecutable = rpc

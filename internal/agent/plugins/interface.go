@@ -22,6 +22,18 @@ type TargetBackend interface {
 	UnexportVolume(ctx context.Context, nqn string) error
 }
 
+// VolumeIdentity contains the stable backend identifiers needed to address one
+// carved volume exactly. Managers that do not expose structured identities only
+// need to set BackendVolumeID.
+type VolumeIdentity struct {
+	BackendVolumeID string
+	BaseBdev        string
+	VolumeStoreName string
+	VolumeStoreUUID string
+	VolumeName      string
+	VolumeUUID      string
+}
+
 // VolumeManager defines the interface that all volume carving/management plugins must implement.
 type VolumeManager interface {
 	// Name returns the identifier of the volume manager (e.g., "partition", "lvm")
@@ -31,11 +43,11 @@ type VolumeManager interface {
 	SetupStorage(ctx context.Context, devicePath string, deviceName string) error
 
 	// CreateVolume carves out a volume of the specified size (in bytes)
-	// Returns the path to the resulting block device/volume and error
-	CreateVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, sizeBytes int64) (string, error)
+	// Returns the stable identity of the resulting block device/volume and error.
+	CreateVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, sizeBytes int64) (VolumeIdentity, error)
 
-	// DeleteVolume deletes the carved volume
-	DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string) error
+	// DeleteVolume deletes the exact carved volume returned by CreateVolume.
+	DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, identity VolumeIdentity) error
 }
 
 var (

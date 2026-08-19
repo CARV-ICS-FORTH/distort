@@ -2,10 +2,12 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,15 +45,16 @@ func (m *countingVolumeManager) SetupStorage(context.Context, string, string) er
 	m.setupCalls.Add(1)
 	return nil
 }
-func (m *countingVolumeManager) CreateVolume(context.Context, string, string, string, int64) (string, error) {
-	return "/dev/test", nil
+func (m *countingVolumeManager) CreateVolume(context.Context, string, string, string, int64) (plugins.VolumeIdentity, error) {
+	return plugins.VolumeIdentity{BackendVolumeID: "/dev/test"}, nil
 }
-func (m *countingVolumeManager) DeleteVolume(context.Context, string, string, string) error {
+func (m *countingVolumeManager) DeleteVolume(context.Context, string, string, string, plugins.VolumeIdentity) error {
 	return nil
 }
 
 type namedTestBackend struct {
-	name string
+	name          string
+	unexportCalls atomic.Int32
 }
 
 func (b *namedTestBackend) Name() string { return b.name }
@@ -61,25 +64,50 @@ func (b *namedTestBackend) SetupDevice(context.Context, string, string, map[stri
 func (b *namedTestBackend) ExportVolume(context.Context, string, string, string, int, map[string]string) (string, error) {
 	return "nqn.test", nil
 }
-func (b *namedTestBackend) UnexportVolume(context.Context, string) error { return nil }
+func (b *namedTestBackend) UnexportVolume(context.Context, string) error {
+	b.unexportCalls.Add(1)
+	return nil
+}
 
 type recordingDeleteManager struct {
-	devicePath string
-	deviceName string
-	volumeName string
+	devicePath      string
+	deviceName      string
+	volumeName      string
+	backendVolumeID string
+	identity        plugins.VolumeIdentity
+}
+
+type retryDeleteManager struct {
+	calls atomic.Int32
+}
+
+func (m *retryDeleteManager) Name() string { return "retry-delete-manager" }
+func (m *retryDeleteManager) SetupStorage(context.Context, string, string) error {
+	return nil
+}
+func (m *retryDeleteManager) CreateVolume(context.Context, string, string, string, int64) (plugins.VolumeIdentity, error) {
+	return plugins.VolumeIdentity{}, nil
+}
+func (m *retryDeleteManager) DeleteVolume(context.Context, string, string, string, plugins.VolumeIdentity) error {
+	if m.calls.Add(1) == 1 {
+		return errors.New("simulated crash after unexport")
+	}
+	return nil
 }
 
 func (m *recordingDeleteManager) Name() string { return "teardown-recording-manager" }
 func (m *recordingDeleteManager) SetupStorage(context.Context, string, string) error {
 	return nil
 }
-func (m *recordingDeleteManager) CreateVolume(context.Context, string, string, string, int64) (string, error) {
-	return "", nil
+func (m *recordingDeleteManager) CreateVolume(context.Context, string, string, string, int64) (plugins.VolumeIdentity, error) {
+	return plugins.VolumeIdentity{}, nil
 }
-func (m *recordingDeleteManager) DeleteVolume(_ context.Context, devicePath, deviceName, volumeName string) error {
+func (m *recordingDeleteManager) DeleteVolume(_ context.Context, devicePath, deviceName, volumeName string, identity plugins.VolumeIdentity) error {
 	m.devicePath = devicePath
 	m.deviceName = deviceName
 	m.volumeName = volumeName
+	m.backendVolumeID = identity.BackendVolumeID
+	m.identity = identity
 	return nil
 }
 
@@ -322,8 +350,7 @@ func TestInvalidPluginConfigurationBecomesTerminalStatus(t *testing.T) {
 	}
 }
 
-func TestSPDKTeardownUsesTheExactNamespaceBdev(t *testing.T) {
-	knownfailure.Require(t, "F5")
+func TestSPDKTeardownPassesThePersistedLvolIdentity(t *testing.T) {
 	originalSPDK, err := plugins.GetTargetBackend("spdk")
 	if err != nil {
 		t.Fatal(err)
@@ -348,7 +375,15 @@ func TestSPDKTeardownUsesTheExactNamespaceBdev(t *testing.T) {
 			TargetBackend:            "spdk",
 			VolumeManager:            manager.Name(),
 		},
-		Status: storagev1alpha1.NVMePartitionStatus{NQN: "nqn.test:spdk-delete"},
+		Status: storagev1alpha1.NVMePartitionStatus{
+			NQN:             "nqn.test:spdk-delete",
+			BackendVolumeID: "lvs_node-a-serial-1n1/volume-id",
+			SPDKBaseBdev:    "node-a-serial-1n1",
+			SPDKLvstoreName: "lvs_node-a-serial-1n1",
+			SPDKLvstoreUUID: "store-uuid",
+			SPDKLvolName:    "volume-id",
+			SPDKLvolUUID:    "lvol-uuid",
+		},
 	}
 	testClient := newPartitionManagerClient(t, partition)
 	reconciler := &PartitionManager{Client: testClient, NodeName: "node-a"}
@@ -358,7 +393,76 @@ func TestSPDKTeardownUsesTheExactNamespaceBdev(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile returned error: %v", err)
 	}
-	if manager.deviceName != "node-a-serial-1n1" || manager.devicePath != "node-a-serial-1n1" {
-		t.Fatalf("teardown reconstructed device path/name as %q/%q, want exact namespace bdev node-a-serial-1n1", manager.devicePath, manager.deviceName)
+	wantIdentity := plugins.VolumeIdentity{
+		BackendVolumeID: "lvs_node-a-serial-1n1/volume-id",
+		BaseBdev:        "node-a-serial-1n1",
+		VolumeStoreName: "lvs_node-a-serial-1n1",
+		VolumeStoreUUID: "store-uuid",
+		VolumeName:      "volume-id",
+		VolumeUUID:      "lvol-uuid",
+	}
+	if manager.identity != wantIdentity {
+		t.Fatalf("teardown identity = %#v, want %#v", manager.identity, wantIdentity)
+	}
+}
+
+func TestSPDKTeardownRetriesAfterUnexportBeforeLvolDeletion(t *testing.T) {
+	originalSPDK, err := plugins.GetTargetBackend("spdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { plugins.RegisterTargetBackend(originalSPDK) })
+	backend := &namedTestBackend{name: "spdk"}
+	plugins.RegisterTargetBackend(backend)
+	manager := &retryDeleteManager{}
+	plugins.RegisterVolumeManager(manager)
+
+	now := metav1.Now()
+	partition := &storagev1alpha1.NVMePartition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "retry-spdk-delete",
+			Namespace:         "default",
+			Finalizers:        []string{partitionFinalizer},
+			DeletionTimestamp: &now,
+		},
+		Spec: storagev1alpha1.NVMePartitionSpec{
+			NodeName:                 "node-a",
+			ParentDeviceSerialNumber: "SERIAL-1",
+			TargetBackend:            "spdk",
+			VolumeManager:            manager.Name(),
+		},
+		Status: storagev1alpha1.NVMePartitionStatus{
+			NQN:             "nqn.test:retry-spdk-delete",
+			BackendVolumeID: "store/volume",
+		},
+	}
+	testClient := newPartitionManagerClient(t, partition)
+	reconciler := &PartitionManager{Client: testClient, NodeName: "node-a"}
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace}}
+
+	if _, err := reconciler.Reconcile(context.Background(), request); err == nil {
+		t.Fatal("first teardown unexpectedly succeeded after simulated lvol deletion crash")
+	}
+	var retained storagev1alpha1.NVMePartition
+	if err := testClient.Get(context.Background(), request.NamespacedName, &retained); err != nil {
+		t.Fatal(err)
+	}
+	if len(retained.Finalizers) != 1 || retained.Finalizers[0] != partitionFinalizer {
+		t.Fatalf("cleanup finalizer was removed after partial failure: %v", retained.Finalizers)
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("retry teardown returned error: %v", err)
+	}
+	if manager.calls.Load() != 2 || backend.unexportCalls.Load() != 2 {
+		t.Fatalf("retry calls: delete=%d unexport=%d, want 2 each", manager.calls.Load(), backend.unexportCalls.Load())
+	}
+	var cleaned storagev1alpha1.NVMePartition
+	if err := testClient.Get(context.Background(), request.NamespacedName, &cleaned); err == nil {
+		if len(cleaned.Finalizers) != 0 {
+			t.Fatalf("cleanup finalizer remains after verified retry: %v", cleaned.Finalizers)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatal(err)
 	}
 }

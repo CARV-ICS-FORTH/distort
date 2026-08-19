@@ -135,6 +135,256 @@ spec:
 	})
 })
 
+var _ = Describe("Exact SPDK teardown", Label("green", "F5", "spdk"), func() {
+	It("removes the persisted lvol after an already-completed unexport", func() {
+		const (
+			claimName     = "regression-f5-claim"
+			partitionName = "regression-f5-partition"
+		)
+		serial := serialForNode("distort-master")
+		DeferCleanup(func() {
+			_, _ = kubectl("delete", "nvmepartition", partitionName, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "nvmedeviceclaim", claimName, "--ignore-not-found", "--wait=false")
+		})
+
+		_, err := applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: %s
+spec:
+  serialNumber: %s
+---
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: %s
+spec:
+  size: 64Mi
+  targetBackend: spdk
+  volumeManager: partition
+`, claimName, serial, partitionName))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmepartition", partitionName, "-o", "jsonpath={.status.state}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Exported"))
+		}, 180*time.Second, 5*time.Second).Should(Succeed())
+
+		statusField := func(field string) string {
+			out, getErr := kubectl("get", "nvmepartition", partitionName, "-o", "jsonpath={.status."+field+"}")
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(out).NotTo(BeEmpty(), "status.%s was not persisted", field)
+			return out
+		}
+		nqn := statusField("nqn")
+		backendVolumeID := statusField("backendVolumeID")
+		baseBdev := statusField("spdkBaseBdev")
+		lvstoreName := statusField("spdkLvstoreName")
+		lvstoreUUID := statusField("spdkLvstoreUUID")
+		lvolName := statusField("spdkLvolName")
+		lvolUUID := statusField("spdkLvolUUID")
+		Expect(backendVolumeID).To(Equal(lvstoreName + "/" + lvolName))
+
+		agentPod, err := kubectl(
+			"get", "pod", "-n", "distort-system",
+			"-l", "app.kubernetes.io/component=agent",
+			"--field-selector", "spec.nodeName=distort-master",
+			"-o", "jsonpath={.items[0].metadata.name}",
+		)
+		Expect(err).NotTo(HaveOccurred())
+		agentPod = strings.TrimSpace(agentPod)
+		rpc := func(method string, args ...string) string {
+			command := []string{"exec", "-n", "distort-system", agentPod, "--", "/opt/spdk/scripts/rpc.py", method}
+			command = append(command, args...)
+			out, rpcErr := kubectl(command...)
+			Expect(rpcErr).NotTo(HaveOccurred())
+			return out
+		}
+
+		Expect(rpc("nvmf_get_subsystems")).To(ContainSubstring(nqn))
+		bdevs := rpc("bdev_get_bdevs")
+		Expect(bdevs).To(ContainSubstring(backendVolumeID))
+		Expect(bdevs).To(ContainSubstring(lvolUUID))
+		lvstores := rpc("bdev_lvol_get_lvstores")
+		Expect(lvstores).To(ContainSubstring(baseBdev))
+		Expect(lvstores).To(ContainSubstring(lvstoreUUID))
+
+		// Model a process crash after unexport and before lvol deletion. The
+		// reconciler must accept the already-absent subsystem and resume cleanup.
+		rpc("nvmf_delete_subsystem", nqn)
+		_, err = kubectl("delete", "nvmepartition", partitionName, "--wait=true", "--timeout=120s")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(rpc("nvmf_get_subsystems")).NotTo(ContainSubstring(nqn))
+		bdevs = rpc("bdev_get_bdevs")
+		Expect(bdevs).NotTo(ContainSubstring(backendVolumeID))
+		Expect(bdevs).NotTo(ContainSubstring(lvolUUID))
+		lvstores = rpc("bdev_lvol_get_lvstores")
+		Expect(lvstores).To(ContainSubstring(lvstoreName), "the reusable lvstore should remain")
+		Expect(lvstores).To(ContainSubstring(lvstoreUUID))
+		Expect(lvstores).To(ContainSubstring(baseBdev))
+
+		_, err = kubectl("delete", "nvmedeviceclaim", claimName, "--wait=true", "--timeout=120s")
+		Expect(err).NotTo(HaveOccurred())
+	})
+})
+
+var _ = Describe("Kernel partition isolation", Label("green", "F3", "kernel"), func() {
+	It("allocates reusable partition numbers without damaging surviving volumes", func() {
+		const (
+			namespace = "distort-f3"
+			claimName = "regression-f3-claim"
+			className = "regression-f3-kernel"
+		)
+		serial := serialForNode("distort-worker-2")
+		DeferCleanup(func() {
+			_, _ = kubectl("delete", "namespace", namespace, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "storageclass", className, "--ignore-not-found", "--wait=false")
+		})
+
+		_, err := applyManifest(fmt.Sprintf(`
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: %s
+---
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  namespace: %s
+  name: %s
+spec:
+  serialNumber: %s
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: %s
+provisioner: storage.distort.io
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  target-backend: kernel
+  volume-manager: partition
+`, namespace, namespace, claimName, serial, className))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmedeviceclaim", "-n", namespace, claimName, "-o", "jsonpath={.status.active}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("true"))
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
+
+		createPVC := func(name string) {
+			_, createErr := applyManifest(fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: %s
+  name: %s
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi
+  storageClassName: %s
+`, namespace, name, className))
+			Expect(createErr).NotTo(HaveOccurred())
+		}
+		createPod := func(name, claim string) {
+			_, createErr := applyManifest(fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: %s
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: distort-worker-1
+  containers:
+  - name: test
+    image: busybox:1.36
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: %s
+`, namespace, name, claim))
+			Expect(createErr).NotTo(HaveOccurred())
+		}
+		deletePod := func(name string) {
+			_, deleteErr := kubectl("delete", "pod", "-n", namespace, name, "--wait=true", "--timeout=120s")
+			Expect(deleteErr).NotTo(HaveOccurred())
+		}
+		partitionForPVC := func(pvc string) (string, string) {
+			var pv string
+			Eventually(func(g Gomega) {
+				var getErr error
+				pv, getErr = kubectl("get", "pvc", "-n", namespace, pvc, "-o", "jsonpath={.spec.volumeName}")
+				g.Expect(getErr).NotTo(HaveOccurred())
+				g.Expect(pv).NotTo(BeEmpty())
+			}, 180*time.Second, 5*time.Second).Should(Succeed())
+			Eventually(func(g Gomega) {
+				out, getErr := kubectl("get", "nvmepartition", "-n", namespace, pv, "-o", "jsonpath={.status.state}")
+				g.Expect(getErr).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Exported"))
+			}, 180*time.Second, 5*time.Second).Should(Succeed())
+			path, getErr := kubectl("get", "nvmepartition", "-n", namespace, pv, "-o", "jsonpath={.status.backendVolumeID}")
+			Expect(getErr).NotTo(HaveOccurred())
+			return pv, path
+		}
+		deletePVCAndWait := func(pvc, partition string) {
+			_, deleteErr := kubectl("delete", "pvc", "-n", namespace, pvc, "--wait=true", "--timeout=120s")
+			Expect(deleteErr).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				out, getErr := kubectl("get", "nvmepartition", "-n", namespace, partition,
+					"--ignore-not-found", "-o", "name")
+				g.Expect(getErr).NotTo(HaveOccurred())
+				g.Expect(out).To(BeEmpty())
+			}, 180*time.Second, 5*time.Second).Should(Succeed())
+		}
+
+		createPVC("a")
+		createPVC("b")
+		createPod("consumer-a", "a")
+		createPod("consumer-b", "b")
+		partitionA, pathA := partitionForPVC("a")
+		partitionB, pathB := partitionForPVC("b")
+		Expect(pathA).NotTo(Equal(pathB))
+		Expect([]string{pathA, pathB}).To(ConsistOf(
+			MatchRegexp(`p1$`),
+			MatchRegexp(`p2$`),
+		))
+		deletePod("consumer-a")
+		deletePod("consumer-b")
+
+		deletePVCAndWait("a", partitionA)
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmepartition", "-n", namespace, partitionB,
+				"-o", "jsonpath={.status.state} {.status.backendVolumeID}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Exported " + pathB))
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
+
+		createPVC("c")
+		createPod("consumer-c", "c")
+		partitionC, pathC := partitionForPVC("c")
+		Expect(pathC).To(Equal(pathA), "the lowest deleted partition number should be reused")
+		deletePod("consumer-c")
+
+		deletePVCAndWait("b", partitionB)
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmepartition", "-n", namespace, partitionC,
+				"-o", "jsonpath={.status.state} {.status.backendVolumeID}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Exported " + pathC))
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
+		deletePVCAndWait("c", partitionC)
+	})
+})
+
 var _ = Describe("Review finding API and authorization regressions", Label("known-failure"), func() {
 	It("rejects zero and negative partition sizes at the API boundary", Label("F7", "admission"), func() {
 		requireKnownE2E("F7")

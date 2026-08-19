@@ -141,7 +141,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 4. Fix SPDK teardown to address the exact created lvol
 
-- [ ] **F5 — Critical — Highly likely**
+- [x] **F5 — Critical — Resolved**
 - Affected:
   - `internal/agent/partition_manager.go`
   - `internal/agent/plugins/vol_spdk_lvol.go`
@@ -158,10 +158,17 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - SPDK fake RPC test verifying create/delete name symmetry.
   - E2E query of `nvmf_get_subsystems`, `bdev_get_bdevs`, and lvstores after deletion.
   - Crash after unexport but before lvol deletion, followed by retry.
+- Resolution:
+  - Volume provisioning now returns and persists the exact SPDK namespace base bdev, lvstore name and UUID, lvol name and UUID, backend alias, and NQN.
+  - Teardown resolves every persisted identifier against live SPDK state and requires them to identify the same lvol. A missing, ambiguous, mismatched, or reused identity returns an error and retains the finalizer.
+  - Legacy objects without the new fields recover through their persisted backend alias and external identity only when those stable identifiers resolve uniquely. Legacy ambiguity fails safely instead of guessing.
+  - Both subsystem and lvol deletion re-query SPDK to verify absence. If an RPC succeeded but its response was lost, the verified absence is accepted, making cleanup idempotent across partial success and agent restart.
+  - The reusable lvstore and attached controller remain in place after deleting an individual lvol.
+- Verification (2026-08-19): fake-RPC tests covered exact create/delete symmetry, unique legacy recovery, alias-reuse rejection, and lost delete responses. Agent reconciliation retained the finalizer after a simulated crash between unexport and lvol deletion, then removed it after a successful retry. The focused Vagrant F5 scenario manually removed the subsystem before deleting the partition and verified through `nvmf_get_subsystems`, `bdev_get_bdevs`, and `bdev_lvol_get_lvstores` that the subsystem and exact lvol were absent while the lvstore remained. The complete green hardware suite passed 10 specs with four known-failure scenarios skipped.
 
 ### 5. Prevent kernel volumes from aliasing partition 1
 
-- [ ] **F3 — Critical — Confirmed**
+- [x] **F3 — Critical — Resolved**
 - Affected:
   - `internal/agent/plugins/vol_partition.go`
   - device/partition allocation metadata
@@ -173,12 +180,18 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   2. Persist partition UID to physical partition-number/path mapping.
   3. Verify ownership before deletion.
 - Acceptance criteria:
-  - No two logical volumes can reference the same physical partition unless explicitly designed as shared storage.
+  - Each allocated logical volume receives its own physical partition; shared partitions are not supported.
   - Deleting one volume never removes another volume's partition.
 - Regression tests:
-  - Two kernel PVCs on the same device have different major/minor devices and isolated data.
-  - Delete in both orders and verify the surviving volume.
-  - Agent restart preserves the partition mapping.
+  - Two kernel PVCs on the same device receive different partition paths.
+  - Delete in both orders, verify the surviving mapping, and reuse each freed partition number.
+  - Agent restart recovers the partition mapping from the GPT partition label.
+- Resolution:
+  - The partition manager reads the current GPT table and free extents, allocates the lowest available partition number, and creates the volume in the first suitably sized MiB-aligned extent.
+  - Each GPT partition is labeled with the volume's immutable external ID. Reconciliation and restart recovery use that label instead of assuming partition 1.
+  - Deletion uses the persisted backend path and verifies the GPT label before removing the partition. A stale deletion cannot remove a partition number that has since been reassigned.
+  - Allocation and deletion are serialized per physical device so concurrent reconciles cannot select the same free number or extent.
+- Verification (2026-08-19): unit regressions covered distinct `p1`/`p2` allocation, restart recovery, deletion in both orders, number reuse, stale-delete rejection, and preservation of a pre-existing `p2` table. The focused Vagrant F3 hardware test provisioned two live kernel exports on one namespace, observed distinct `p1` and `p2` backend paths, deleted each independently, verified the survivor remained exported, and confirmed that the freed partition number was reused.
 
 ### 6. Validate capacity and allocate at least the CSI request
 

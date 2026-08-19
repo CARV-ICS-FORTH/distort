@@ -106,9 +106,9 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 |---|---|---|
 | F1 (resolved) | Available devices and mismatched claim UIDs cannot reach plugins; valid live ownership provisions; ownerless client placement is rejected | Agent unit + envtest + E2E admission/full stack |
 | F2 (resolved) | Shell metacharacters in `spdk-core-mask` cannot execute; validation and the direct command vector are captured | Plugin, CSI, admission + Vagrant SPDK E2E |
-| F3 | Two kernel volumes cannot resolve to the same partition path | Plugin unit; two-PVC E2E remains required when allocation metadata exists |
+| F3 (resolved) | Multiple kernel volumes receive distinct reusable partition numbers; deletion preserves surviving mappings | Plugin unit + Vagrant kernel E2E |
 | F4 (resolved) | Same names in different namespaces receive distinct CSI IDs/NQNs/lvols; exact deletion is verified in both orders | CSI/agent unit + Vagrant SPDK E2E |
-| F5 | SPDK teardown must use the exact namespace bdev identity | Agent unit; deletion RPC verification remains in the E2E acceptance criteria |
+| F5 (resolved) | Exact SPDK base-bdev/lvstore/lvol identities are persisted and verified absent across partial cleanup and retry | Plugin/agent unit + Vagrant SPDK E2E |
 | F6 | Concurrent reservations cannot exceed device capacity | Envtest concurrency |
 | F7 | Capacity-range validation, negative legacy objects, and upward rounding for kernel/SPDK | CSI, plugin, envtest, CRD contract + E2E admission |
 | F8 | A failing `parted` command must fail volume creation | Plugin command-failure unit |
@@ -132,7 +132,7 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 
 ## Last verified lab run
 
-On 2026-08-17, a clean reset followed by the complete hardware suite produced eight passing green specs, zero failures, and four explicitly quarantined skips. SPDK and kernel targets both passed cross-node provisioning, mounting, graceful same-node Pod recreation, persistence, and cleanup. The focused namespace-isolation scenario also created equal-named SPDK volumes in two namespaces and deleted them in both orders while proving the surviving NQN remained available.
+On 2026-08-19, a clean reset followed by the complete hardware suite produced ten passing green specs, zero failures, and four explicitly quarantined skips. SPDK and kernel targets both passed cross-node provisioning, mounting, graceful same-node Pod recreation, persistence, and cleanup. The suite also covered same-device kernel partition-number reuse and exact SPDK lvol teardown after the subsystem had already been removed.
 
 The host `make test-suite` and `make test-race` gates passed at that point. `make lint` still reported the 19-item F23 backlog and must not be described as green.
 

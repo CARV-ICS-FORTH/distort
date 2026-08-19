@@ -241,6 +241,25 @@ spec:
               portalPort:
                 description: 'PortalPort is the RDMA port (default: 4420).'
                 type: integer
+              spdkBaseBdev:
+                description: SPDKBaseBdev is the exact SPDK namespace bdev backing
+                  the logical volume.
+                type: string
+              spdkLvolName:
+                description: SPDKLvolName is the logical volume name within its store.
+                type: string
+              spdkLvolUUID:
+                description: SPDKLvolUUID is the immutable UUID of the logical volume
+                  bdev.
+                type: string
+              spdkLvstoreName:
+                description: SPDKLvstoreName is the logical volume store name used
+                  during provisioning.
+                type: string
+              spdkLvstoreUUID:
+                description: SPDKLvstoreUUID is the immutable UUID of the logical
+                  volume store.
+                type: string
               state:
                 default: Pending
                 description: State is the current status of the partition creation/export.

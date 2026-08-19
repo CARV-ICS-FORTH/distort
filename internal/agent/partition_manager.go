@@ -46,6 +46,17 @@ func identitiesForPartition(partition *storagev1alpha1.NVMePartition) (externalI
 	return externalID, volumeID
 }
 
+func backendVolumeIdentity(status storagev1alpha1.NVMePartitionStatus) plugins.VolumeIdentity {
+	return plugins.VolumeIdentity{
+		BackendVolumeID: status.BackendVolumeID,
+		BaseBdev:        status.SPDKBaseBdev,
+		VolumeStoreName: status.SPDKLvstoreName,
+		VolumeStoreUUID: status.SPDKLvstoreUUID,
+		VolumeName:      status.SPDKLvolName,
+		VolumeUUID:      status.SPDKLvolUUID,
+	}
+}
+
 // PartitionManager watches for NVMePartitions assigned to this node and acts on them.
 type PartitionManager struct {
 	client.Client
@@ -250,7 +261,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 					}
 				}
 
-				if err := volManager.DeleteVolume(ctx, devPath, devBaseName, externalID); err != nil {
+				if err := volManager.DeleteVolume(ctx, devPath, devBaseName, externalID, backendVolumeIdentity(partition.Status)); err != nil {
 					logger.Error(err, "Failed to delete volume from backend", "volume", externalID)
 					return ctrl.Result{}, err
 				}
@@ -436,19 +447,33 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
 		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
 	}
-	blockPath, err := volManager.CreateVolume(ctx, devPath, devBaseName, externalID, partition.Spec.Size.Value())
+	createdVolume, err := volManager.CreateVolume(ctx, devPath, devBaseName, externalID, partition.Spec.Size.Value())
 	if err != nil {
 		logger.Error(err, "Failed to carve volume from device")
 		return ctrl.Result{}, err
 	}
-	if partition.Status.BackendVolumeID != blockPath {
+	if createdVolume.BackendVolumeID == "" {
+		return ctrl.Result{}, fmt.Errorf("volume manager %s returned an empty backend volume ID", vmName)
+	}
+	if backendVolumeIdentity(partition.Status) != createdVolume {
 		if err := p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
-			status.BackendVolumeID = blockPath
+			status.BackendVolumeID = createdVolume.BackendVolumeID
+			status.SPDKBaseBdev = createdVolume.BaseBdev
+			status.SPDKLvstoreName = createdVolume.VolumeStoreName
+			status.SPDKLvstoreUUID = createdVolume.VolumeStoreUUID
+			status.SPDKLvolName = createdVolume.VolumeName
+			status.SPDKLvolUUID = createdVolume.VolumeUUID
 		}); err != nil {
 			return ctrl.Result{}, err
 		}
-		partition.Status.BackendVolumeID = blockPath
+		partition.Status.BackendVolumeID = createdVolume.BackendVolumeID
+		partition.Status.SPDKBaseBdev = createdVolume.BaseBdev
+		partition.Status.SPDKLvstoreName = createdVolume.VolumeStoreName
+		partition.Status.SPDKLvstoreUUID = createdVolume.VolumeStoreUUID
+		partition.Status.SPDKLvolName = createdVolume.VolumeName
+		partition.Status.SPDKLvolUUID = createdVolume.VolumeUUID
 	}
+	blockPath := createdVolume.BackendVolumeID
 
 	// Fetch K8s Node IP for the export portal
 	portalIP := "127.0.0.1"
