@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"distort/internal/capacity"
 )
 
 const partitionAlignmentBytes int64 = 1024 * 1024
@@ -212,6 +214,10 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 	lock.Lock()
 	defer lock.Unlock()
 
+	allocatedBytes, err := capacity.RoundUp(sizeBytes)
+	if err != nil {
+		return VolumeIdentity{}, err
+	}
 	partitions, freeExtents, err := readPartedTable(ctx, devicePath, true)
 	if err != nil {
 		return VolumeIdentity{}, err
@@ -225,11 +231,15 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 		if err := waitForPartition(ctx, path); err != nil {
 			return VolumeIdentity{}, err
 		}
-		return VolumeIdentity{BackendVolumeID: path, VolumeName: volumeName}, nil
+		return VolumeIdentity{
+			BackendVolumeID: path,
+			CapacityBytes:   existing[0].end - existing[0].start + 1,
+			VolumeName:      volumeName,
+		}, nil
 	}
 
 	partitionNumber := lowestAvailablePartitionNumber(partitions)
-	start, end, err := selectFreeExtent(freeExtents, sizeBytes)
+	start, end, err := selectFreeExtent(freeExtents, allocatedBytes)
 	if err != nil {
 		return VolumeIdentity{}, err
 	}
@@ -254,7 +264,11 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 	if err := waitForPartition(ctx, path); err != nil {
 		return VolumeIdentity{}, err
 	}
-	return VolumeIdentity{BackendVolumeID: path, VolumeName: volumeName}, nil
+	return VolumeIdentity{
+		BackendVolumeID: path,
+		CapacityBytes:   created[0].end - created[0].start + 1,
+		VolumeName:      volumeName,
+	}, nil
 }
 
 func (pv *PartedVolumeManager) DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, identity VolumeIdentity) error {

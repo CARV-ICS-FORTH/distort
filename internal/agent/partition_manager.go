@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -17,6 +18,7 @@ import (
 
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/agent/plugins"
+	"distort/internal/capacity"
 	"distort/internal/volumeidentity"
 )
 
@@ -49,6 +51,7 @@ func identitiesForPartition(partition *storagev1alpha1.NVMePartition) (externalI
 func backendVolumeIdentity(status storagev1alpha1.NVMePartitionStatus) plugins.VolumeIdentity {
 	return plugins.VolumeIdentity{
 		BackendVolumeID: status.BackendVolumeID,
+		CapacityBytes:   status.AllocatedCapacity.Value(),
 		BaseBdev:        status.SPDKBaseBdev,
 		VolumeStoreName: status.SPDKLvstoreName,
 		VolumeStoreUUID: status.SPDKLvstoreUUID,
@@ -447,6 +450,10 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
 		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
 	}
+	requestedAllocation, err := capacity.RoundUp(partition.Spec.Size.Value())
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("invalid partition capacity %q: %w", partition.Spec.Size.String(), err)
+	}
 	createdVolume, err := volManager.CreateVolume(ctx, devPath, devBaseName, externalID, partition.Spec.Size.Value())
 	if err != nil {
 		logger.Error(err, "Failed to carve volume from device")
@@ -455,9 +462,13 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if createdVolume.BackendVolumeID == "" {
 		return ctrl.Result{}, fmt.Errorf("volume manager %s returned an empty backend volume ID", vmName)
 	}
+	if createdVolume.CapacityBytes < requestedAllocation {
+		return ctrl.Result{}, fmt.Errorf("volume manager %s allocated %d bytes, below required %d", vmName, createdVolume.CapacityBytes, requestedAllocation)
+	}
 	if backendVolumeIdentity(partition.Status) != createdVolume {
 		if err := p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
 			status.BackendVolumeID = createdVolume.BackendVolumeID
+			status.AllocatedCapacity = *resource.NewQuantity(createdVolume.CapacityBytes, resource.BinarySI)
 			status.SPDKBaseBdev = createdVolume.BaseBdev
 			status.SPDKLvstoreName = createdVolume.VolumeStoreName
 			status.SPDKLvstoreUUID = createdVolume.VolumeStoreUUID
@@ -467,6 +478,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, err
 		}
 		partition.Status.BackendVolumeID = createdVolume.BackendVolumeID
+		partition.Status.AllocatedCapacity = *resource.NewQuantity(createdVolume.CapacityBytes, resource.BinarySI)
 		partition.Status.SPDKBaseBdev = createdVolume.BaseBdev
 		partition.Status.SPDKLvstoreName = createdVolume.VolumeStoreName
 		partition.Status.SPDKLvstoreUUID = createdVolume.VolumeStoreUUID

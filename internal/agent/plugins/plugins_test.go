@@ -218,24 +218,17 @@ func TestPartedCreateReturnsCommandFailure(t *testing.T) {
 }
 
 func TestPartedRoundsCapacityUp(t *testing.T) {
-	knownfailure.Require(t, "F7")
-	fakeBin := t.TempDir()
-	capture := filepath.Join(t.TempDir(), "arguments")
-	body := fmt.Sprintf("printf '%%s\\n' \"$@\" > %q\ntouch \"${4}p1\"", capture)
-	writeTestExecutable(t, fakeBin, "parted", body)
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	device := filepath.Join(t.TempDir(), "nvme0n1")
-	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), device, "nvme0", "rounded", 1024*1024+1)
+	disk := installFakePartedDisk(t)
+	manager := &PartedVolumeManager{}
+	if err := manager.SetupStorage(context.Background(), disk.devicePath, "nvme0"); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := manager.CreateVolume(context.Background(), disk.devicePath, "nvme0", "rounded", 1024*1024+1)
 	if err != nil {
 		t.Fatalf("CreateVolume returned error: %v", err)
 	}
-	arguments, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatalf("reading captured parted arguments: %v", err)
-	}
-	if !strings.Contains(string(arguments), "3MB") {
-		t.Fatalf("parted arguments did not round the end upward to 3MB:\n%s", arguments)
+	if identity.CapacityBytes != 2*1024*1024 {
+		t.Fatalf("allocated capacity = %d, want 2 MiB", identity.CapacityBytes)
 	}
 }
 
@@ -439,6 +432,7 @@ esac`, state, state, deleted, state)
 	}
 	want := (VolumeIdentity{
 		BackendVolumeID: "lvs_base-n1/volume-id",
+		CapacityBytes:   64 * 1024 * 1024,
 		BaseBdev:        "base-n1",
 		VolumeStoreName: "lvs_base-n1",
 		VolumeStoreUUID: "store-uuid",
@@ -548,7 +542,6 @@ esac`, state, state)
 }
 
 func TestSPDKLvolRoundsCapacityUp(t *testing.T) {
-	knownfailure.Require(t, "F7")
 	fakeBin := t.TempDir()
 	capture := filepath.Join(t.TempDir(), "lvol-create-arguments")
 	rpcBody := fmt.Sprintf(`
@@ -568,7 +561,7 @@ esac`, capture, capture)
 	spdkRPCExecutable = rpc
 	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
 
-	_, err := (&SPDKLvolManager{}).CreateVolume(context.Background(), "device", "device", "volume", 1024*1024+1)
+	identity, err := (&SPDKLvolManager{}).CreateVolume(context.Background(), "device", "device", "volume", 1024*1024+1)
 	if err != nil {
 		t.Fatalf("CreateVolume returned error: %v", err)
 	}
@@ -579,5 +572,8 @@ esac`, capture, capture)
 	lines := strings.Fields(string(arguments))
 	if len(lines) == 0 || lines[len(lines)-1] != "2" {
 		t.Fatalf("SPDK lvol size was not rounded upward to 2 MiB:\n%s", arguments)
+	}
+	if identity.CapacityBytes != 2*1024*1024 {
+		t.Fatalf("allocated capacity = %d, want 2 MiB", identity.CapacityBytes)
 	}
 }

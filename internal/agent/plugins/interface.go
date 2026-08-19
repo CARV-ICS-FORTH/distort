@@ -27,6 +27,7 @@ type TargetBackend interface {
 // need to set BackendVolumeID.
 type VolumeIdentity struct {
 	BackendVolumeID string
+	CapacityBytes   int64
 	BaseBdev        string
 	VolumeStoreName string
 	VolumeStoreUUID string

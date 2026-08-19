@@ -18,14 +18,17 @@ package controller
 
 import (
 	"context"
-	"os"
+	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -33,9 +36,42 @@ import (
 	storagev1alpha1 "distort/api/v1alpha1"
 )
 
+type conflictOnceClient struct {
+	client.Client
+	conflicts atomic.Int32
+}
+
+func (c *conflictOnceClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if _, ok := obj.(*storagev1alpha1.NVMePartition); ok && c.conflicts.CompareAndSwap(0, 1) {
+		return apierrors.NewConflict(
+			schema.GroupResource{Group: "storage.distort.io", Resource: "nvmepartitions"},
+			obj.GetName(),
+			errors.New("injected update conflict"),
+		)
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+type listRejectingClient struct {
+	client.Client
+}
+
+func (c *listRejectingClient) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return errors.New("cached list must not be used for placement")
+}
+
 var _ = Describe("NVMePartition placement", func() {
 	const namespace = "default"
 	ctx := context.Background()
+	var reconciler *NVMePartitionReconciler
+
+	BeforeEach(func() {
+		reconciler = &NVMePartitionReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+		}
+	})
 
 	AfterEach(func() {
 		var partitions storagev1alpha1.NVMePartitionList
@@ -54,14 +90,14 @@ var _ = Describe("NVMePartition placement", func() {
 		}
 	})
 
-	createDevice := func(name, node, serial, free, backend string, state storagev1alpha1.NVMeDeviceState) {
+	createDeviceWithTotal := func(name, node, serial, total, free, backend string, state storagev1alpha1.NVMeDeviceState) {
 		device := &storagev1alpha1.NVMeDevice{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"test.distort.io/suite": "placement"}},
 			Spec: storagev1alpha1.NVMeDeviceSpec{
 				NodeName:      node,
 				PCIAddress:    "0000:01:00.0",
 				SerialNumber:  serial,
-				TotalCapacity: resource.MustParse("10Gi"),
+				TotalCapacity: resource.MustParse(total),
 			},
 		}
 		Expect(k8sClient.Create(ctx, device)).To(Succeed())
@@ -77,6 +113,9 @@ var _ = Describe("NVMePartition placement", func() {
 		}
 		Expect(k8sClient.Status().Update(ctx, device)).To(Succeed())
 	}
+	createDevice := func(name, node, serial, free, backend string, state storagev1alpha1.NVMeDeviceState) {
+		createDeviceWithTotal(name, node, serial, "10Gi", free, backend, state)
+	}
 
 	createPartition := func(name, size, backend string) {
 		partition := &storagev1alpha1.NVMePartition{
@@ -89,17 +128,37 @@ var _ = Describe("NVMePartition placement", func() {
 		}
 		Expect(k8sClient.Create(ctx, partition)).To(Succeed())
 	}
+	createAssignedPartition := func(name, size, node, serial string, finalizers []string) {
+		partition := &storagev1alpha1.NVMePartition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       name,
+				Namespace:  namespace,
+				Labels:     map[string]string{"test.distort.io/suite": "placement"},
+				Finalizers: finalizers,
+			},
+			Spec: storagev1alpha1.NVMePartitionSpec{
+				Size:                     resource.MustParse(size),
+				NodeName:                 node,
+				ParentDeviceSerialNumber: serial,
+				ClaimRef: &storagev1alpha1.NVMeDeviceClaimReference{
+					Namespace: namespace,
+					Name:      "placement-claim",
+					UID:       types.UID("placement-claim-uid"),
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, partition)).To(Succeed())
+	}
 
 	reconcilePartition := func(name string) (reconcile.Result, error) {
-		reconciler := &NVMePartitionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		return reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}})
 	}
 
 	It("chooses the claimed compatible device with the most free capacity", func() {
-		createDevice("placement-small", "node-small", "serial-small", "3Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
-		createDevice("placement-large", "node-large", "serial-large", "8Gi", "spdk", storagev1alpha1.NVMeDeviceStateClaimed)
-		createDevice("placement-available", "node-available", "serial-available", "10Gi", "", storagev1alpha1.NVMeDeviceStateAvailable)
-		createDevice("placement-kernel", "node-kernel", "serial-kernel", "9Gi", "kernel", storagev1alpha1.NVMeDeviceStateClaimed)
+		createDeviceWithTotal("placement-small", "node-small", "serial-small", "3Gi", "3Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createDeviceWithTotal("placement-large", "node-large", "serial-large", "8Gi", "8Gi", "spdk", storagev1alpha1.NVMeDeviceStateClaimed)
+		createDeviceWithTotal("placement-available", "node-available", "serial-available", "10Gi", "10Gi", "", storagev1alpha1.NVMeDeviceStateAvailable)
+		createDeviceWithTotal("placement-kernel", "node-kernel", "serial-kernel", "9Gi", "9Gi", "kernel", storagev1alpha1.NVMeDeviceStateClaimed)
 		createPartition("placement-request", "2Gi", "spdk")
 
 		result, err := reconcilePartition("placement-request")
@@ -118,7 +177,7 @@ var _ = Describe("NVMePartition placement", func() {
 	})
 
 	It("requeues without mutating when no claimed device has enough capacity", func() {
-		createDevice("placement-small", "node-small", "serial-small", "1Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createDeviceWithTotal("placement-small", "node-small", "serial-small", "1Gi", "1Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
 		createPartition("placement-request", "2Gi", "spdk")
 
 		result, err := reconcilePartition("placement-request")
@@ -130,6 +189,64 @@ var _ = Describe("NVMePartition placement", func() {
 		Expect(actual.Spec.NodeName).To(BeEmpty())
 		Expect(actual.Spec.ParentDeviceSerialNumber).To(BeEmpty())
 		Expect(actual.Spec.ClaimRef).To(BeNil())
+	})
+
+	It("reserves the upward-rounded allocation size", func() {
+		createDeviceWithTotal("placement-rounded", "node-rounded", "serial-rounded", "1048577", "1048577", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createPartition("placement-request", "1048577", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+	})
+
+	It("uses assigned partitions instead of stale reported free capacity", func() {
+		createDevice("placement-stale-high", "node-stale", "serial-stale", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createAssignedPartition("placement-existing", "9500Mi", "node-stale", "serial-stale", nil)
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+	})
+
+	It("can reserve capacity before stale reported free capacity catches up", func() {
+		createDevice("placement-stale-low", "node-stale", "serial-stale", "0", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeZero())
+
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.ParentDeviceSerialNumber).To(Equal("serial-stale"))
+	})
+
+	It("uses the uncached API reader for placement lists", func() {
+		createDevice("placement-reader", "node-reader", "serial-reader", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createPartition("placement-request", "1Gi", "spdk")
+		reconciler = &NVMePartitionReconciler{
+			Client:    &listRejectingClient{Client: k8sClient},
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+		}
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeZero())
+
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.ParentDeviceSerialNumber).To(Equal("serial-reader"))
 	})
 
 	It("rejects client-supplied placement without an owning claim reference", func() {
@@ -178,15 +295,8 @@ var _ = Describe("NVMePartition placement", func() {
 		}
 	})
 
-	It("never assigns concurrent reservations beyond device capacity", func() {
-		if os.Getenv("DISTORT_RUN_KNOWN_FAILURES") != "1" {
-			Skip("F6 is a known defect")
-		}
-		if finding := os.Getenv("DISTORT_FINDING"); finding != "" && finding != "F6" {
-			Skip("F6 is not selected")
-		}
-
-		createDevice("placement-one-device", "node-one", "serial-one", "1Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+	It("never assigns concurrent reservations beyond device capacity", Label("release-gate", "capacity-concurrency"), func() {
+		createDeviceWithTotal("placement-one-device", "node-one", "serial-one", "1Gi", "1Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
 		createPartition("placement-concurrent-a", "700Mi", "spdk")
 		createPartition("placement-concurrent-b", "700Mi", "spdk")
 
@@ -207,13 +317,73 @@ var _ = Describe("NVMePartition placement", func() {
 		}
 
 		assigned := 0
+		var reservedBytes int64
 		for _, name := range []string{"placement-concurrent-a", "placement-concurrent-b"} {
 			var actual storagev1alpha1.NVMePartition
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &actual)).To(Succeed())
 			if actual.Spec.ParentDeviceSerialNumber == "serial-one" {
 				assigned++
+				reservedBytes += actual.Spec.Size.Value()
 			}
 		}
-		Expect(assigned).To(BeNumerically("<=", 1), "two 700Mi reservations cannot fit on a 1Gi device")
+		Expect(assigned).To(Equal(1), "exactly one of two 700Mi reservations should fit on a 1Gi device")
+		capacity := resource.MustParse("1Gi")
+		Expect(reservedBytes).To(BeNumerically("<=", capacity.Value()))
+	})
+
+	It("retries a conflicting partition reservation", func() {
+		createDevice("placement-conflict", "node-conflict", "serial-conflict", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createPartition("placement-request", "1Gi", "spdk")
+		conflictingClient := &conflictOnceClient{Client: k8sClient}
+		reconciler = &NVMePartitionReconciler{
+			Client:    conflictingClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+		}
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeZero())
+		Expect(conflictingClient.conflicts.Load()).To(Equal(int32(1)))
+
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.ParentDeviceSerialNumber).To(Equal("serial-conflict"))
+	})
+
+	It("keeps terminating partitions reserved until cleanup completes", func() {
+		createDevice("placement-delete", "node-delete", "serial-delete", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		createAssignedPartition("placement-terminating", "9Gi", "node-delete", "serial-delete", []string{"test.distort.io/cleanup"})
+		var terminating storagev1alpha1.NVMePartition
+		terminatingKey := types.NamespacedName{Name: "placement-terminating", Namespace: namespace}
+		Expect(k8sClient.Get(ctx, terminatingKey, &terminating)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &terminating)).To(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, terminatingKey, &terminating)).To(Succeed())
+			g.Expect(terminating.DeletionTimestamp.IsZero()).To(BeFalse())
+		}).Should(Succeed())
+
+		createPartition("placement-request", "2Gi", "spdk")
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+
+		var actual storagev1alpha1.NVMePartition
+		requestKey := types.NamespacedName{Name: "placement-request", Namespace: namespace}
+		Expect(k8sClient.Get(ctx, requestKey, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+
+		terminating.Finalizers = nil
+		Expect(k8sClient.Update(ctx, &terminating)).To(Succeed())
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, terminatingKey, &terminating)
+			return apierrors.IsNotFound(err)
+		}).Should(BeTrue())
+
+		result, err = reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeZero())
+		Expect(k8sClient.Get(ctx, requestKey, &actual)).To(Succeed())
+		Expect(actual.Spec.ParentDeviceSerialNumber).To(Equal("serial-delete"))
 	})
 })

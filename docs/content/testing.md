@@ -109,8 +109,8 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 | F3 (resolved) | Multiple kernel volumes receive distinct reusable partition numbers; deletion preserves surviving mappings | Plugin unit + Vagrant kernel E2E |
 | F4 (resolved) | Same names in different namespaces receive distinct CSI IDs/NQNs/lvols; exact deletion is verified in both orders | CSI/agent unit + Vagrant SPDK E2E |
 | F5 (resolved) | Exact SPDK base-bdev/lvstore/lvol identities are persisted and verified absent across partial cleanup and retry | Plugin/agent unit + Vagrant SPDK E2E |
-| F6 | Concurrent reservations cannot exceed device capacity | Envtest concurrency |
-| F7 | Capacity-range validation, negative legacy objects, and upward rounding for kernel/SPDK | CSI, plugin, envtest, CRD contract + E2E admission |
+| F6 (resolved) | Concurrent reservations, stale status/cache reads, update conflicts, and terminating-volume capacity retention | Envtest concurrency and conflict injection |
+| F7 (resolved) | Capacity-range validation, negative legacy objects, upward rounding for kernel/SPDK, and persisted actual allocation | CSI, plugin, envtest, CRD contract + E2E admission/SPDK |
 | F8 | A failing `parted` command must fail volume creation | Plugin command-failure unit |
 | F9 | CreateVolume retries compare size, manager, filesystem, access mode, and options | CSI unit |
 | F10 | Unsupported capabilities are rejected and read-only publish uses read-only mounts | CSI controller/node unit |
@@ -132,7 +132,7 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 
 ## Last verified lab run
 
-On 2026-08-19, a clean reset followed by the complete hardware suite produced ten passing green specs, zero failures, and four explicitly quarantined skips. SPDK and kernel targets both passed cross-node provisioning, mounting, graceful same-node Pod recreation, persistence, and cleanup. The suite also covered same-device kernel partition-number reuse and exact SPDK lvol teardown after the subsystem had already been removed.
+On 2026-08-19, a clean reset followed by the complete hardware suite produced 11 passing green specs, zero failures, and three explicitly quarantined skips. SPDK and kernel targets both passed cross-node provisioning, mounting, graceful same-node Pod recreation, persistence, and cleanup. The suite also covered concurrency-safe capacity scheduling, same-device kernel partition-number reuse, exact SPDK lvol teardown after the subsystem had already been removed, API capacity rejection, and upward-rounded allocation reporting.
 
 The host `make test-suite` and `make test-race` gates passed at that point. `make lint` still reported the 19-item F23 backlog and must not be described as green.
 

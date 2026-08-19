@@ -44,6 +44,7 @@ const (
 type NVMePartitionSpec struct {
 	// Size is the requested capacity for the volume.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036853727232')) <= 0",message="size must be positive and safely roundable to a 1 MiB allocation unit"
 	Size resource.Quantity `json:"size"`
 
 	// NodeName is the node where this partition should be created.
@@ -105,6 +106,10 @@ type NVMePartitionStatus struct {
 	// BackendVolumeID is the block path or logical-volume identity returned by the volume manager.
 	// +optional
 	BackendVolumeID string `json:"backendVolumeID,omitempty"`
+
+	// AllocatedCapacity is the actual backend capacity after allocation-unit rounding.
+	// +optional
+	AllocatedCapacity resource.Quantity `json:"allocatedCapacity,omitempty"`
 
 	// SPDKBaseBdev is the exact SPDK namespace bdev backing the logical volume.
 	// +optional

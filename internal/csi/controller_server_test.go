@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/capacity"
 	"distort/internal/volumeidentity"
 	"distort/test/knownfailure"
 )
@@ -51,6 +52,11 @@ func (c *immediatelyExportingClient) Create(ctx context.Context, obj client.Obje
 	stored.Status.ExternalID = identity.ExternalID
 	stored.Status.VolumeID = identity.VolumeHandle
 	stored.Status.BackendVolumeID = "lvs_test/" + identity.ExternalID
+	allocatedBytes, err := capacity.RoundUp(stored.Spec.Size.Value())
+	if err != nil {
+		return err
+	}
+	stored.Status.AllocatedCapacity = *resource.NewQuantity(allocatedBytes, resource.BinarySI)
 	stored.Status.NQN = volumeidentity.NQN(identity.ExternalID)
 	stored.Status.PortalIP = "192.0.2.10"
 	stored.Status.PortalPort = 4420
@@ -222,14 +228,17 @@ func TestCreateVolumeCompatibleRetryIsIdempotent(t *testing.T) {
 }
 
 func TestCreateVolumeRejectsInvalidCapacityRanges(t *testing.T) {
-	knownfailure.Require(t, "F7")
 	tests := []struct {
 		name     string
 		required int64
 		limit    int64
 	}{
+		{name: "zero", required: 0},
 		{name: "negative", required: -1},
+		{name: "negative limit", required: 1, limit: -1},
 		{name: "required exceeds limit", required: 2 * 1024 * 1024, limit: 1024 * 1024},
+		{name: "rounded allocation exceeds limit", required: 1024*1024 + 1, limit: 1024*1024 + 1},
+		{name: "rounding overflows", required: capacity.MaxAllocatableBytes + 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -238,6 +247,32 @@ func TestCreateVolumeRejectsInvalidCapacityRanges(t *testing.T) {
 			req.CapacityRange = &csipb.CapacityRange{RequiredBytes: test.required, LimitBytes: test.limit}
 			_, err := server.CreateVolume(context.Background(), req)
 			requireCode(t, err, codes.InvalidArgument)
+		})
+	}
+}
+
+func TestCreateVolumeDefaultsMissingRangeAndReturnsRoundedCapacity(t *testing.T) {
+	tests := []struct {
+		name     string
+		range_   *csipb.CapacityRange
+		wantSize int64
+	}{
+		{name: "missing range", wantSize: defaultVolumeCapacityBytes},
+		{name: "sub MiB", range_: &csipb.CapacityRange{RequiredBytes: 1, LimitBytes: capacity.AllocationUnitBytes}, wantSize: capacity.AllocationUnitBytes},
+		{name: "one MiB plus one", range_: &csipb.CapacityRange{RequiredBytes: capacity.AllocationUnitBytes + 1}, wantSize: 2 * capacity.AllocationUnitBytes},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, _ := newControllerTestServer(t)
+			req := validCreateRequest("rounded-"+strings.ReplaceAll(test.name, " ", "-"), "default")
+			req.CapacityRange = test.range_
+			response, err := server.CreateVolume(context.Background(), req)
+			if err != nil {
+				t.Fatalf("CreateVolume returned error: %v", err)
+			}
+			if response.Volume.CapacityBytes != test.wantSize {
+				t.Fatalf("CapacityBytes = %d, want %d", response.Volume.CapacityBytes, test.wantSize)
+			}
 		})
 	}
 }

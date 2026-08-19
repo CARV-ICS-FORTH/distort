@@ -195,7 +195,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 6. Validate capacity and allocate at least the CSI request
 
-- [ ] **F7 — High — Confirmed**
+- [x] **F7 — High — Resolved**
 - Affected:
   - `api/v1alpha1/nvmepartition_types.go`
   - `internal/csi/controller_server.go`
@@ -220,10 +220,16 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 - Regression tests:
   - Zero, negative, sub-MiB, 1 MiB + 1 byte, required greater than limit, and near-overflow values.
   - Capacity reconciliation with malformed legacy objects.
+- Resolution:
+  - A shared capacity helper rejects non-positive and non-roundable-overflow values, and rounds every positive request upward to the 1 MiB backend allocation unit. Positive sub-MiB requests therefore allocate 1 MiB.
+  - The CRD rejects invalid quantities at admission. The CSI boundary rejects explicitly non-positive required bytes, negative limits, requests above their limits, and cases where upward rounding would exceed the limit. An omitted capacity range defaults to 1 GiB.
+  - `spec.size` preserves the requested capacity while `status.allocatedCapacity` records the actual backend allocation. CSI returns that actual allocation and refuses a backend result below the request or above its limit.
+  - Kernel partitions and SPDK lvols both allocate the rounded size. Scheduling and free-capacity reconciliation reserve the same rounded amount, while malformed legacy objects return an error instead of increasing free capacity.
+- Verification (2026-08-19): unit, fake-plugin, CSI, controller envtest, and CRD contract coverage passed for zero, negative, omitted, sub-MiB, unaligned, limited, and overflow requests. The focused Vagrant F7 test proved API rejection of unsafe sizes and verified that a 1 MiB + 1 byte SPDK request reached `Exported` with `status.allocatedCapacity: 2Mi`. A clean complete hardware run then passed all 11 green specs with the three remaining known defects skipped.
 
 ### 7. Make device capacity reservation concurrency-safe
 
-- [ ] **F6 — High — Confirmed known limitation**
+- [x] **F6 — High — Resolved**
 - Affected:
   - `internal/controller/nvmepartition_controller.go`
   - `internal/controller/nvmedevice_controller.go`
@@ -239,6 +245,12 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Concurrently schedule requests whose sum exceeds capacity.
   - Inject update conflicts and stale cache reads.
   - Delete/recreate requests while placement is running.
+- Resolution:
+  - Placement no longer treats asynchronously derived `status.freeCapacity` as the reservation source of truth. It uses the manager's uncached API reader to list current devices and partitions, then calculates each candidate's capacity from total capacity minus all persisted assignments.
+  - Reservations are serialized by physical-device serial number inside the single active, leader-elected manager. After taking the device lock, the controller re-fetches the partition and device and recalculates assigned capacity immediately before persisting placement.
+  - Partition update conflicts are retried with a fresh API read and a repeated capacity check, preventing a conflict retry from using an obsolete reservation decision.
+  - Terminating partitions remain charged until their finalizer completes and the object disappears, so replacement requests cannot reuse capacity while backend cleanup is still running.
+- Verification (2026-08-19): the original concurrent envtest failed before the fix by assigning both 700 MiB requests to one 1 GiB device. After the fix, controller regressions passed for concurrent requests, stale high and low capacity status, forced cached-list rejection, an injected update conflict, and delete/recreate while the old partition remained terminating. The complete host and race suites passed, followed by all 11 green hardware specs with zero failures and three known-defect skips.
 
 ### 8. Fail kernel partition creation when the command or udev fails
 
@@ -502,11 +514,11 @@ Before considering the implementation production-ready, require all of the follo
 - [ ] Lint and vet pass.
 - [x] Generated CRDs, RBAC, DeepCopy code, and Helm CRDs have no drift.
 - [ ] CSI conformance tests pass for the explicitly supported capability set.
-- [ ] Two-volume isolation tests pass for every enabled backend.
+- [x] Two-volume isolation tests pass for every enabled backend.
 - [x] Same-name/different-namespace isolation tests pass.
 - [ ] Single-writer attachment fencing prevents concurrent cross-node filesystem use.
-- [ ] Finalizer cleanup proves backend resources are gone.
-- [ ] Capacity concurrency tests prove no overcommit.
+- [x] Finalizer cleanup proves backend resources are gone.
+- [x] Capacity concurrency tests prove no overcommit.
 - [ ] SPDK target crash and agent restart recovery tests pass.
 - [ ] RDMA link/node failure produces actionable non-ready state rather than a false `Exported` result.
 - [ ] Helm RBAC allow/deny matrix passes.

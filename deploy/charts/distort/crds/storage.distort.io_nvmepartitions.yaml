@@ -116,6 +116,11 @@ spec:
                 description: Size is the requested capacity for the volume.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: size must be positive and safely roundable to a 1 MiB allocation
+                    unit
+                  rule: quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036853727232'))
+                    <= 0
               targetBackend:
                 default: spdk
                 description: TargetBackend specifies the export technology (e.g.,
@@ -161,6 +166,14 @@ spec:
           status:
             description: status defines the observed state of NVMePartition
             properties:
+              allocatedCapacity:
+                anyOf:
+                - type: integer
+                - type: string
+                description: AllocatedCapacity is the actual backend capacity after
+                  allocation-unit rounding.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
               backendVolumeID:
                 description: BackendVolumeID is the block path or logical-volume identity
                   returned by the volume manager.

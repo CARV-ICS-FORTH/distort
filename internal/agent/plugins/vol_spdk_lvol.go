@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"distort/internal/capacity"
 )
 
 type SPDKLvolManager struct{}
@@ -101,7 +103,7 @@ func matchingBdevs(bdevs []spdkBdev, match func(spdkBdev) bool) []int {
 	return matches
 }
 
-func lvolIdentity(bdev spdkBdev, store spdkLvstore, volumeName string) VolumeIdentity {
+func lvolIdentity(bdev spdkBdev, store spdkLvstore, volumeName string, capacityBytes int64) VolumeIdentity {
 	alias := store.Name + "/" + volumeName
 	uuid := bdev.UUID
 	if uuid == "" {
@@ -109,6 +111,7 @@ func lvolIdentity(bdev spdkBdev, store spdkLvstore, volumeName string) VolumeIde
 	}
 	return VolumeIdentity{
 		BackendVolumeID: alias,
+		CapacityBytes:   capacityBytes,
 		BaseBdev:        store.BaseBdev,
 		VolumeStoreName: store.Name,
 		VolumeStoreUUID: store.UUID,
@@ -129,6 +132,10 @@ func findCreatedLvol(bdevs []spdkBdev, alias, uuid string) (spdkBdev, error) {
 }
 
 func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, sizeBytes int64) (VolumeIdentity, error) {
+	allocatedBytes, err := capacity.RoundUp(sizeBytes)
+	if err != nil {
+		return VolumeIdentity{}, err
+	}
 	stores, err := listSPDKLvstores()
 	if err != nil {
 		return VolumeIdentity{}, err
@@ -145,7 +152,7 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 	}
 	existing, err := findCreatedLvol(bdevs, alias, "")
 	if err == nil {
-		return lvolIdentity(existing, store, volumeName), nil
+		return lvolIdentity(existing, store, volumeName, allocatedBytes), nil
 	}
 	if matches := matchingBdevs(bdevs, func(bdev spdkBdev) bool {
 		return bdev.Name == alias || slices.Contains(bdev.Aliases, alias)
@@ -153,10 +160,7 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 		return VolumeIdentity{}, fmt.Errorf("multiple SPDK lvol bdevs use alias %q", alias)
 	}
 
-	if sizeBytes < 1024*1024 {
-		return VolumeIdentity{}, fmt.Errorf("requested lvol size %d bytes is smaller than SPDK's 1 MiB RPC unit", sizeBytes)
-	}
-	sizeMB := (sizeBytes + 1024*1024 - 1) / (1024 * 1024)
+	sizeMB := allocatedBytes / capacity.AllocationUnitBytes
 	var uuid string
 	if err := CallSPDKRPC("bdev_lvol_create", &uuid, "-l", store.Name, volumeName, fmt.Sprintf("%d", sizeMB)); err != nil {
 		return VolumeIdentity{}, err
@@ -170,7 +174,7 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 	if err != nil {
 		return VolumeIdentity{}, err
 	}
-	identity := lvolIdentity(created, store, volumeName)
+	identity := lvolIdentity(created, store, volumeName, allocatedBytes)
 	if uuid != "" {
 		identity.VolumeUUID = uuid
 	}

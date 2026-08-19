@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/capacity"
 	"distort/internal/storageoptions"
 	"distort/internal/volumeidentity"
 )
@@ -28,6 +29,33 @@ type ControllerServer struct {
 	k8sClient                  client.Client
 	partitionReadyPollInterval time.Duration
 	partitionReadyTimeout      time.Duration
+}
+
+const defaultVolumeCapacityBytes int64 = 1024 * 1024 * 1024
+
+func normalizeCapacityRange(capacityRange *csi.CapacityRange) (int64, int64, error) {
+	if capacityRange == nil {
+		return defaultVolumeCapacityBytes, defaultVolumeCapacityBytes, nil
+	}
+	requiredBytes := capacityRange.GetRequiredBytes()
+	limitBytes := capacityRange.GetLimitBytes()
+	if requiredBytes <= 0 {
+		return 0, 0, fmt.Errorf("required_bytes must be positive when CapacityRange is provided")
+	}
+	if limitBytes < 0 {
+		return 0, 0, fmt.Errorf("limit_bytes cannot be negative")
+	}
+	if limitBytes > 0 && requiredBytes > limitBytes {
+		return 0, 0, fmt.Errorf("required_bytes %d exceeds limit_bytes %d", requiredBytes, limitBytes)
+	}
+	allocatedBytes, err := capacity.RoundUp(requiredBytes)
+	if err != nil {
+		return 0, 0, err
+	}
+	if limitBytes > 0 && allocatedBytes > limitBytes {
+		return 0, 0, fmt.Errorf("required capacity rounds up to %d bytes, exceeding limit_bytes %d", allocatedBytes, limitBytes)
+	}
+	return requiredBytes, allocatedBytes, nil
 }
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -45,10 +73,9 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid filesystem configuration: %v", err)
 	}
 
-	requiredBytes := req.GetCapacityRange().GetRequiredBytes()
-	if requiredBytes == 0 {
-		// Default to 1Gi if not specified, though usually the provisioner provides it
-		requiredBytes = 1024 * 1024 * 1024
+	requiredBytes, expectedAllocation, err := normalizeCapacityRange(req.GetCapacityRange())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid capacity range: %v", err)
 	}
 
 	klog.Infof("CreateVolume: Name=%s, SizeBytes=%d", name, requiredBytes)
@@ -134,6 +161,18 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 		volumeID = identity.VolumeHandle
 	}
+	allocatedBytes := partition.Status.AllocatedCapacity.Value()
+	if allocatedBytes == 0 {
+		// Compatibility for objects exported by agents predating persisted actual
+		// capacity. New provisioning must always populate AllocatedCapacity.
+		allocatedBytes = expectedAllocation
+	}
+	if allocatedBytes < requiredBytes {
+		return nil, status.Errorf(codes.Internal, "backend allocated %d bytes, below required_bytes %d", allocatedBytes, requiredBytes)
+	}
+	if limitBytes := req.GetCapacityRange().GetLimitBytes(); limitBytes > 0 && allocatedBytes > limitBytes {
+		return nil, status.Errorf(codes.Internal, "backend allocated %d bytes, exceeding limit_bytes %d", allocatedBytes, limitBytes)
+	}
 
 	// Construct context for the Node Stage/Publish calls
 	volCtx := map[string]string{
@@ -146,7 +185,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      volumeID,
-			CapacityBytes: requiredBytes,
+			CapacityBytes: allocatedBytes,
 			VolumeContext: volCtx,
 		},
 	}, nil

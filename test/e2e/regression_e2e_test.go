@@ -36,7 +36,7 @@ spec:
 	})
 })
 
-var _ = Describe("Global volume identity", Label("green", "F4"), func() {
+var _ = Describe("Global volume identity", Label("green", "F4", "release-gate", "volume-isolation", "backend-cleanup"), func() {
 	It("keeps same-named partitions distinct and deletes only the requested object", func() {
 		const claimName = "regression-f4-claim"
 		serial := serialForNode("distort-master")
@@ -74,6 +74,14 @@ spec:
 		)
 		Expect(err).NotTo(HaveOccurred())
 		agentPod = strings.TrimSpace(agentPod)
+		rpc := func(method string) string {
+			out, rpcErr := kubectl(
+				"exec", "-n", "distort-system", agentPod, "--",
+				"/opt/spdk/scripts/rpc.py", method,
+			)
+			Expect(rpcErr).NotTo(HaveOccurred())
+			return out
+		}
 
 		for cycle, deletionOrder := range [][]string{{namespaces[0], namespaces[1]}, {namespaces[1], namespaces[0]}} {
 			partitionName := fmt.Sprintf("same-name-%d", cycle)
@@ -114,21 +122,23 @@ spec:
 			Expect(identities[namespaces[0]]).NotTo(Equal(identities[namespaces[1]]))
 			Expect(nqns[namespaces[0]]).NotTo(Equal(nqns[namespaces[1]]))
 			Expect(backendVolumes[namespaces[0]]).NotTo(Equal(backendVolumes[namespaces[1]]))
+			for _, namespace := range namespaces {
+				Expect(rpc("nvmf_get_subsystems")).To(ContainSubstring(nqns[namespace]))
+				Expect(rpc("bdev_get_bdevs")).To(ContainSubstring(backendVolumes[namespace]))
+			}
 
 			for index, namespace := range deletionOrder {
 				_, err := kubectl("delete", "nvmepartition", "-n", namespace, partitionName, "--wait=true", "--timeout=120s")
 				Expect(err).NotTo(HaveOccurred())
+				Expect(rpc("nvmf_get_subsystems")).NotTo(ContainSubstring(nqns[namespace]))
+				Expect(rpc("bdev_get_bdevs")).NotTo(ContainSubstring(backendVolumes[namespace]))
 				if index == 0 {
 					other := deletionOrder[1]
 					out, getErr := kubectl("get", "nvmepartition", "-n", other, partitionName, "-o", "jsonpath={.status.state}")
 					Expect(getErr).NotTo(HaveOccurred())
 					Expect(out).To(Equal("Exported"))
-					out, getErr = kubectl(
-						"exec", "-n", "distort-system", agentPod, "--",
-						"/opt/spdk/scripts/rpc.py", "nvmf_get_subsystems",
-					)
-					Expect(getErr).NotTo(HaveOccurred())
-					Expect(out).To(ContainSubstring(nqns[other]))
+					Expect(rpc("nvmf_get_subsystems")).To(ContainSubstring(nqns[other]))
+					Expect(rpc("bdev_get_bdevs")).To(ContainSubstring(backendVolumes[other]))
 				}
 			}
 		}
@@ -230,7 +240,7 @@ spec:
 	})
 })
 
-var _ = Describe("Kernel partition isolation", Label("green", "F3", "kernel"), func() {
+var _ = Describe("Kernel partition isolation", Label("green", "F3", "kernel", "release-gate", "volume-isolation", "backend-cleanup"), func() {
 	It("allocates reusable partition numbers without damaging surviving volumes", func() {
 		const (
 			namespace = "distort-f3"
@@ -238,12 +248,24 @@ var _ = Describe("Kernel partition isolation", Label("green", "F3", "kernel"), f
 			className = "regression-f3-kernel"
 		)
 		serial := serialForNode("distort-worker-2")
+		agentPod, err := kubectl(
+			"get", "pod", "-n", "distort-system",
+			"-l", "app.kubernetes.io/component=agent",
+			"--field-selector", "spec.nodeName=distort-worker-2",
+			"-o", "jsonpath={.items[0].metadata.name}",
+		)
+		Expect(err).NotTo(HaveOccurred())
+		agentPod = strings.TrimSpace(agentPod)
+		partitionNodeExists := func(path string) bool {
+			_, statErr := kubectl("exec", "-n", "distort-system", agentPod, "--", "test", "-b", path)
+			return statErr == nil
+		}
 		DeferCleanup(func() {
 			_, _ = kubectl("delete", "namespace", namespace, "--ignore-not-found", "--wait=false")
 			_, _ = kubectl("delete", "storageclass", className, "--ignore-not-found", "--wait=false")
 		})
 
-		_, err := applyManifest(fmt.Sprintf(`
+		_, err = applyManifest(fmt.Sprintf(`
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -357,10 +379,14 @@ spec:
 			MatchRegexp(`p1$`),
 			MatchRegexp(`p2$`),
 		))
+		Expect(partitionNodeExists(pathA)).To(BeTrue())
+		Expect(partitionNodeExists(pathB)).To(BeTrue())
 		deletePod("consumer-a")
 		deletePod("consumer-b")
 
 		deletePVCAndWait("a", partitionA)
+		Eventually(partitionNodeExists, 30*time.Second, time.Second).WithArguments(pathA).Should(BeFalse())
+		Expect(partitionNodeExists(pathB)).To(BeTrue())
 		Eventually(func(g Gomega) {
 			out, getErr := kubectl("get", "nvmepartition", "-n", namespace, partitionB,
 				"-o", "jsonpath={.status.state} {.status.backendVolumeID}")
@@ -375,6 +401,8 @@ spec:
 		deletePod("consumer-c")
 
 		deletePVCAndWait("b", partitionB)
+		Eventually(partitionNodeExists, 30*time.Second, time.Second).WithArguments(pathB).Should(BeFalse())
+		Expect(partitionNodeExists(pathC)).To(BeTrue())
 		Eventually(func(g Gomega) {
 			out, getErr := kubectl("get", "nvmepartition", "-n", namespace, partitionC,
 				"-o", "jsonpath={.status.state} {.status.backendVolumeID}")
@@ -382,13 +410,13 @@ spec:
 			g.Expect(out).To(Equal("Exported " + pathC))
 		}, 90*time.Second, 2*time.Second).Should(Succeed())
 		deletePVCAndWait("c", partitionC)
+		Eventually(partitionNodeExists, 30*time.Second, time.Second).WithArguments(pathC).Should(BeFalse())
 	})
 })
 
-var _ = Describe("Review finding API and authorization regressions", Label("known-failure"), func() {
-	It("rejects zero and negative partition sizes at the API boundary", Label("F7", "admission"), func() {
-		requireKnownE2E("F7")
-		for _, size := range []string{"0", "-1Mi"} {
+var _ = Describe("Capacity validation", Label("green", "F7"), func() {
+	It("rejects unsafe sizes and persists upward-rounded capacity", func() {
+		for _, size := range []string{"0", "-1Mi", "9223372036853727233"} {
 			name := "regression-f7-" + strings.NewReplacer("-", "negative-", "Mi", "mi").Replace(size)
 			DeferCleanup(func() {
 				_, _ = kubectl("delete", "nvmepartition", name, "--ignore-not-found", "--wait=false")
@@ -403,8 +431,48 @@ spec:
 `, name, size))
 			Expect(err).To(HaveOccurred(), "the API admitted size %s", size)
 		}
-	})
 
+		const (
+			claimName     = "regression-f7-claim"
+			partitionName = "regression-f7-rounded"
+		)
+		serial := serialForNode("distort-master")
+		DeferCleanup(func() {
+			_, _ = kubectl("delete", "nvmepartition", partitionName, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "nvmedeviceclaim", claimName, "--ignore-not-found", "--wait=false")
+		})
+		_, err := applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: %s
+spec:
+  serialNumber: %s
+---
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: %s
+spec:
+  size: 1048577
+  targetBackend: spdk
+  volumeManager: partition
+`, claimName, serial, partitionName))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmepartition", partitionName,
+				"-o", "jsonpath={.status.state} {.status.allocatedCapacity}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Exported 2Mi"))
+		}, 180*time.Second, 5*time.Second).Should(Succeed())
+		_, err = kubectl("delete", "nvmepartition", partitionName, "--wait=true", "--timeout=120s")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = kubectl("delete", "nvmedeviceclaim", claimName, "--wait=true", "--timeout=120s")
+		Expect(err).NotTo(HaveOccurred())
+	})
+})
+
+var _ = Describe("Review finding API and authorization regressions", Label("known-failure"), func() {
 	It("prevents the shared workload identity from mutating Nodes", Label("F18", "rbac"), func() {
 		requireKnownE2E("F18")
 		out, err := kubectl(

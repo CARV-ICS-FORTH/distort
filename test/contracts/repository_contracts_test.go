@@ -133,7 +133,6 @@ func TestCRDDoesNotAdvertiseUnimplementedLVM(t *testing.T) {
 }
 
 func TestCRDRejectsNonPositivePartitionSizes(t *testing.T) {
-	knownfailure.Require(t, "F7")
 	crd := readRepositoryFile(t, "config/crd/bases/storage.distort.io_nvmepartitions.yaml")
 	start := strings.Index(crd, "\n              size:\n")
 	end := strings.Index(crd, "\n              targetBackend:\n")

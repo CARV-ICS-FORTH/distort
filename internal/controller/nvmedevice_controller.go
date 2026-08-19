@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"math"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,7 +31,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/capacity"
 )
+
+func allocatedCapacityForDevice(partitions []storagev1alpha1.NVMePartition, serialNumber string) (int64, error) {
+	usedCapacity := int64(0)
+	for i := range partitions {
+		partition := &partitions[i]
+		if partition.Spec.ParentDeviceSerialNumber != serialNumber {
+			continue
+		}
+		allocatedBytes, err := capacity.RoundUp(partition.Spec.Size.Value())
+		if err != nil {
+			return 0, fmt.Errorf("NVMePartition %s/%s has invalid capacity %q: %w",
+				partition.Namespace, partition.Name, partition.Spec.Size.String(), err)
+		}
+		if usedCapacity > math.MaxInt64-allocatedBytes {
+			return 0, fmt.Errorf("allocated capacity overflow for device serial %s", serialNumber)
+		}
+		usedCapacity += allocatedBytes
+	}
+	return usedCapacity, nil
+}
 
 // NVMeDeviceReconciler reconciles a NVMeDevice object
 type NVMeDeviceReconciler struct {
@@ -59,13 +82,10 @@ func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	totalCapacity := device.Spec.TotalCapacity.Value()
-	usedCapacity := int64(0)
-
-	for i := range partitionList.Items {
-		p := &partitionList.Items[i]
-		if p.Spec.ParentDeviceSerialNumber == device.Spec.SerialNumber {
-			usedCapacity += p.Spec.Size.Value()
-		}
+	usedCapacity, err := allocatedCapacityForDevice(partitionList.Items, device.Spec.SerialNumber)
+	if err != nil {
+		logger.Error(err, "Could not calculate NVMeDevice free capacity", "device", device.Name)
+		return ctrl.Result{}, err
 	}
 
 	freeCapacity := max(totalCapacity-usedCapacity,

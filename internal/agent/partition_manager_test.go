@@ -46,7 +46,7 @@ func (m *countingVolumeManager) SetupStorage(context.Context, string, string) er
 	return nil
 }
 func (m *countingVolumeManager) CreateVolume(context.Context, string, string, string, int64) (plugins.VolumeIdentity, error) {
-	return plugins.VolumeIdentity{BackendVolumeID: "/dev/test"}, nil
+	return plugins.VolumeIdentity{BackendVolumeID: "/dev/test", CapacityBytes: 1024 * 1024 * 1024}, nil
 }
 func (m *countingVolumeManager) DeleteVolume(context.Context, string, string, string, plugins.VolumeIdentity) error {
 	return nil
@@ -395,6 +395,7 @@ func TestSPDKTeardownPassesThePersistedLvolIdentity(t *testing.T) {
 	}
 	wantIdentity := plugins.VolumeIdentity{
 		BackendVolumeID: "lvs_node-a-serial-1n1/volume-id",
+		CapacityBytes:   0,
 		BaseBdev:        "node-a-serial-1n1",
 		VolumeStoreName: "lvs_node-a-serial-1n1",
 		VolumeStoreUUID: "store-uuid",

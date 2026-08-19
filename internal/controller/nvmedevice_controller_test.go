@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"os"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -107,23 +106,26 @@ var _ = Describe("NVMeDevice capacity reconciliation", func() {
 		Expect(actual.Status.FreeCapacity.IsZero()).To(BeTrue())
 	})
 
-	It("rejects malformed negative allocations instead of increasing capacity", func() {
-		if os.Getenv("DISTORT_RUN_KNOWN_FAILURES") != "1" {
-			Skip("F7 is a known defect")
-		}
-		finding := os.Getenv("DISTORT_FINDING")
-		if finding != "" && finding != "F7" {
-			Skip("F7 is not selected")
-		}
-
+	It("subtracts the upward-rounded allocation size", func() {
 		createDevice()
 		Expect(k8sClient.Create(ctx, &storagev1alpha1.NVMePartition{
-			ObjectMeta: metav1.ObjectMeta{Name: "capacity-negative", Namespace: namespace},
-			Spec:       assignedSpec("-1Gi", "capacity-serial"),
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-a", Namespace: namespace},
+			Spec:       assignedSpec("1048577", "capacity-serial"),
 		})).To(Succeed())
 
 		actual, err := reconcileDevice()
+		Expect(err).NotTo(HaveOccurred())
+		want := resource.MustParse("10735321088") // 10 GiB - 2 MiB
+		Expect(actual.Status.FreeCapacity.Cmp(want)).To(Equal(0))
+	})
+
+	It("rejects malformed negative allocations instead of increasing capacity", func() {
+		partitions := []storagev1alpha1.NVMePartition{{
+			ObjectMeta: metav1.ObjectMeta{Name: "capacity-negative", Namespace: namespace},
+			Spec:       assignedSpec("-1Gi", "capacity-serial"),
+		}}
+		used, err := allocatedCapacityForDevice(partitions, "capacity-serial")
 		Expect(err).To(HaveOccurred())
-		Expect(actual.Status.FreeCapacity.Cmp(actual.Spec.TotalCapacity)).To(BeNumerically("<=", 0))
+		Expect(used).To(BeZero())
 	})
 })
