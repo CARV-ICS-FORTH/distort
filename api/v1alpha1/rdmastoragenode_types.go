@@ -59,6 +59,10 @@ type RDMAStorageNodeSpec struct {
 
 // RDMAStorageNodeStatus defines the observed state of RDMAStorageNode.
 type RDMAStorageNodeStatus struct {
+	// LastHeartbeatTime is the last successful reporter observation for this node.
+	// +optional
+	LastHeartbeatTime metav1.Time `json:"lastHeartbeatTime,omitempty"`
+
 	// TotalCapacity is the sum of capacities of all Available or Claimed NVMeDevices on this node.
 	TotalCapacity resource.Quantity `json:"totalCapacity,omitempty"`
 

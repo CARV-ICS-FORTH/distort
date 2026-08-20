@@ -25,6 +25,7 @@ var spdkStartMu sync.Mutex
 var spdkTransportMu sync.Mutex
 var spdkTargetExecutable = "nvmf_tgt"
 var prepareSPDKProcess = raiseMemlockLimit
+var spdkManagedExit chan error
 
 func init() {
 	RegisterTargetBackend(&SPDKBackend{})
@@ -45,6 +46,16 @@ func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 	if err := storageoptions.ValidateSPDKCoreMask(coreMask); err != nil {
 		return err
 	}
+	if spdkManagedExit != nil {
+		select {
+		case err := <-spdkManagedExit:
+			if err != nil {
+				klog.ErrorS(err, "Managed nvmf_tgt process exited")
+			}
+			spdkManagedExit = nil
+		default:
+		}
+	}
 
 	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
 		klog.Info("Starting nvmf_tgt daemon in the background...")
@@ -59,29 +70,27 @@ func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 		if err := prepareSPDKProcess(); err != nil {
 			return fmt.Errorf("prepare nvmf_tgt process limits: %w", err)
 		}
-		cmd := exec.CommandContext(ctx, spdkTargetExecutable, args...)
+		cmd := exec.Command(spdkTargetExecutable, args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start nvmf_tgt: %v", err)
 		}
-		go func() {
-			if err := cmd.Wait(); err != nil {
-				klog.Errorf("nvmf_tgt exited with error: %v", err)
-			}
-		}()
+		spdkManagedExit = make(chan error, 1)
+		go func(exit chan<- error) { exit <- cmd.Wait() }(spdkManagedExit)
 
 		if configureIobufPools {
 			if err := waitForSPDKRPC(ctx); err != nil {
+				_ = cmd.Process.Kill()
 				return err
 			}
-			if err := CallSPDKRPC("iobuf_set_options", nil, iobufArgs...); err != nil {
+			if err := CallSPDKRPCContext(ctx, "iobuf_set_options", nil, iobufArgs...); err != nil {
 				return fmt.Errorf("failed to configure SPDK iobuf pools: %w", err)
 			}
-			if err := CallSPDKRPC("framework_start_init", nil); err != nil {
+			if err := CallSPDKRPCContext(ctx, "framework_start_init", nil); err != nil {
 				return fmt.Errorf("failed to start SPDK framework initialization: %w", err)
 			}
-			if err := CallSPDKRPC("framework_wait_init", nil); err != nil {
+			if err := CallSPDKRPCContext(ctx, "framework_wait_init", nil); err != nil {
 				return fmt.Errorf("SPDK framework initialization failed: %w", err)
 			}
 		}
@@ -106,7 +115,7 @@ func waitForSPDKRPC(ctx context.Context) error {
 	var lastErr error
 	for attempt := 1; attempt <= 30; attempt++ {
 		var methods []string
-		if err := CallSPDKRPC("rpc_get_methods", &methods); err == nil {
+		if err := CallSPDKRPCContext(ctx, "rpc_get_methods", &methods); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -152,7 +161,7 @@ func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, device
 	}
 
 	// Verify if already attached to avoid re-attaching
-	attached, err := isNVMeControllerAttached(deviceName)
+	attached, err := isNVMeControllerAttached(ctx, deviceName)
 	if err == nil && attached {
 		return nil
 	}
@@ -163,7 +172,7 @@ func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, device
 	deviceSetupMu.Lock()
 	defer deviceSetupMu.Unlock()
 
-	attached, err = isNVMeControllerAttached(deviceName)
+	attached, err = isNVMeControllerAttached(ctx, deviceName)
 	if err == nil && attached {
 		return nil
 	}
@@ -175,9 +184,9 @@ func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, device
 	}
 
 	klog.Infof("Attaching Physical NVMe controller %s at %s to SPDK", deviceName, pciAddress)
-	if err := CallSPDKRPC("bdev_nvme_attach_controller", nil, "-b", deviceName, "-t", "PCIe", "-a", pciAddress); err != nil {
+	if err := CallSPDKRPCContext(ctx, "bdev_nvme_attach_controller", nil, "-b", deviceName, "-t", "PCIe", "-a", pciAddress); err != nil {
 		// An earlier timed-out RPC may have completed on the server.
-		if attached, checkErr := isNVMeControllerAttached(deviceName); checkErr == nil && attached {
+		if attached, checkErr := isNVMeControllerAttached(ctx, deviceName); checkErr == nil && attached {
 			return nil
 		}
 		return fmt.Errorf("failed to attach NVMe %s to SPDK: %w", pciAddress, err)
@@ -186,11 +195,11 @@ func (s *SPDKBackend) SetupDevice(ctx context.Context, pciAddress string, device
 	return nil
 }
 
-func isNVMeControllerAttached(deviceName string) (bool, error) {
+func isNVMeControllerAttached(ctx context.Context, deviceName string) (bool, error) {
 	var controllers []struct {
 		Name string `json:"name"`
 	}
-	if err := CallSPDKRPC("bdev_nvme_get_controllers", &controllers); err != nil {
+	if err := CallSPDKRPCContext(ctx, "bdev_nvme_get_controllers", &controllers); err != nil {
 		return false, err
 	}
 	for _, controller := range controllers {
@@ -228,7 +237,7 @@ func runSPDKSetup(ctx context.Context, pciAddress string) error {
 	return fmt.Errorf("spdk_setup.sh failed after 5 attempts: %v, output: %s", lastErr, lastOutput)
 }
 
-func EnsureNVMeTransport() error {
+func EnsureNVMeTransport(ctx context.Context) error {
 	spdkTransportMu.Lock()
 	defer spdkTransportMu.Unlock()
 
@@ -240,7 +249,7 @@ func EnsureNVMeTransport() error {
 	var transports []struct {
 		Trtype string `json:"trtype"`
 	}
-	if err := CallSPDKRPC("nvmf_get_transports", &transports); err != nil {
+	if err := CallSPDKRPCContext(ctx, "nvmf_get_transports", &transports); err != nil {
 		return fmt.Errorf("failed to list SPDK NVMe-oF transports: %w", err)
 	}
 	for _, transport := range transports {
@@ -249,7 +258,7 @@ func EnsureNVMeTransport() error {
 		}
 	}
 
-	if err := CallSPDKRPC("nvmf_create_transport", nil, args...); err != nil {
+	if err := CallSPDKRPCContext(ctx, "nvmf_create_transport", nil, args...); err != nil {
 		return fmt.Errorf("failed to create SPDK RDMA transport: %w", err)
 	}
 	return nil
@@ -268,43 +277,104 @@ func spdkNVMfTransportArgs() ([]string, error) {
 	return append(args, "-s", maxSRQDepth), nil
 }
 
+type spdkSubsystem struct {
+	NQN        string `json:"nqn"`
+	Namespaces []struct {
+		Name     string `json:"name"`
+		BdevName string `json:"bdev_name"`
+	} `json:"namespaces"`
+	ListenAddresses []struct {
+		Trtype  string `json:"trtype"`
+		Traddr  string `json:"traddr"`
+		Trsvcid string `json:"trsvcid"`
+	} `json:"listen_addresses"`
+}
+
+func (s *SPDKBackend) findSubsystem(ctx context.Context, nqn string) (*spdkSubsystem, error) {
+	var subsystems []spdkSubsystem
+	if err := CallSPDKRPCContext(ctx, "nvmf_get_subsystems", &subsystems); err != nil {
+		return nil, err
+	}
+	for i := range subsystems {
+		if subsystems[i].NQN == nqn {
+			return &subsystems[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// CheckExport restores the supervised target if necessary and verifies the
+// subsystem namespace, listener address, port, and backing bdev.
+func (s *SPDKBackend) CheckExport(ctx context.Context, nqn, blockPath, portalIP string, portalPort int, options map[string]string) error {
+	if err := EnsureSPDKRunning(ctx, options[storageoptions.SPDKCoreMaskOption]); err != nil {
+		return err
+	}
+	subsystem, err := s.findSubsystem(ctx, nqn)
+	if err != nil {
+		return fmt.Errorf("list SPDK subsystems: %w", err)
+	}
+	if subsystem == nil {
+		return fmt.Errorf("SPDK subsystem %s is missing", nqn)
+	}
+	namespaceMatches := false
+	for _, namespace := range subsystem.Namespaces {
+		if namespace.Name == blockPath || namespace.BdevName == blockPath {
+			namespaceMatches = true
+			break
+		}
+	}
+	if !namespaceMatches {
+		return fmt.Errorf("SPDK subsystem %s does not use backing bdev %s", nqn, blockPath)
+	}
+	listenerMatches := false
+	for _, listener := range subsystem.ListenAddresses {
+		if strings.EqualFold(listener.Trtype, "RDMA") && listener.Traddr == portalIP && listener.Trsvcid == strconv.Itoa(portalPort) {
+			listenerMatches = true
+			break
+		}
+	}
+	if !listenerMatches {
+		return fmt.Errorf("SPDK subsystem %s has no RDMA listener on %s:%d", nqn, portalIP, portalPort)
+	}
+	return nil
+}
+
 func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error) {
 	nqn := volumeidentity.NQN(volumeName)
 	klog.Infof("Exporting %s as NVMe-oF target %s on %s:%d via SPDK", blockPath, nqn, portalIP, portalPort)
 
-	// Check if already exported (subsystem exists)
-	var subsystems []struct {
-		NQN string `json:"nqn"`
+	if err := s.CheckExport(ctx, nqn, blockPath, portalIP, portalPort, options); err == nil {
+		return nqn, nil
 	}
-	if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err == nil {
-		for _, sub := range subsystems {
-			if sub.NQN == nqn {
-				return nqn, nil
-			}
+	if existing, err := s.findSubsystem(ctx, nqn); err != nil {
+		return "", fmt.Errorf("inspect existing SPDK subsystem %s: %w", nqn, err)
+	} else if existing != nil {
+		if err := CallSPDKRPCContext(ctx, "nvmf_delete_subsystem", nil, nqn); err != nil {
+			return "", fmt.Errorf("replace unhealthy SPDK subsystem %s: %w", nqn, err)
 		}
 	}
 
-	if err := EnsureNVMeTransport(); err != nil {
+	if err := EnsureNVMeTransport(ctx); err != nil {
 		return "", err
 	}
 
 	// 1. Create Subsystem
-	err := CallSPDKRPC("nvmf_create_subsystem", nil, nqn, "-s", "distort")
+	err := CallSPDKRPCContext(ctx, "nvmf_create_subsystem", nil, nqn, "-s", "distort")
 	if err != nil {
 		return "", fmt.Errorf("failed to create SPDK subsystem %s: %w", nqn, err)
 	}
 
 	// 2. Add Namespace
-	err = CallSPDKRPC("nvmf_subsystem_add_ns", nil, nqn, blockPath)
+	err = CallSPDKRPCContext(ctx, "nvmf_subsystem_add_ns", nil, nqn, blockPath)
 	if err != nil {
-		_ = CallSPDKRPC("nvmf_delete_subsystem", nil, nqn)
+		_ = CallSPDKRPCContext(ctx, "nvmf_delete_subsystem", nil, nqn)
 		return "", fmt.Errorf("failed to add namespace %s to subsystem: %w", blockPath, err)
 	}
 
 	// 3. Add Listener
-	err = CallSPDKRPC("nvmf_subsystem_add_listener", nil, nqn, "-t", "RDMA", "-a", portalIP, "-s", fmt.Sprintf("%d", portalPort))
+	err = CallSPDKRPCContext(ctx, "nvmf_subsystem_add_listener", nil, nqn, "-t", "RDMA", "-a", portalIP, "-s", fmt.Sprintf("%d", portalPort))
 	if err != nil {
-		_ = CallSPDKRPC("nvmf_delete_subsystem", nil, nqn)
+		_ = CallSPDKRPCContext(ctx, "nvmf_delete_subsystem", nil, nqn)
 		return "", fmt.Errorf("failed to add RDMA listener to subsystem: %w", err)
 	}
 
@@ -323,7 +393,7 @@ func (s *SPDKBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN stri
 		} `json:"hosts"`
 	}
 	var subsystems []subsystemRecord
-	if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err != nil {
+	if err := CallSPDKRPCContext(ctx, "nvmf_get_subsystems", &subsystems); err != nil {
 		return fmt.Errorf("list SPDK subsystems before reconciling host access: %w", err)
 	}
 	var current *subsystemRecord
@@ -346,7 +416,7 @@ func (s *SPDKBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN stri
 		return nil
 	}
 	if current.AllowAnyHost {
-		if err := CallSPDKRPC("nvmf_subsystem_allow_any_host", nil, nqn, "-d"); err != nil {
+		if err := CallSPDKRPCContext(ctx, "nvmf_subsystem_allow_any_host", nil, nqn, "-d"); err != nil {
 			return fmt.Errorf("disable unrestricted host access for %s: %w", nqn, err)
 		}
 	}
@@ -356,12 +426,12 @@ func (s *SPDKBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN stri
 		}
 		// SPDK v26.01 folds controller disconnection into remove_host. The RPC
 		// returns only after matching connections are gone or this timeout expires.
-		if err := CallSPDKRPC("nvmf_subsystem_remove_host", nil, nqn, host.NQN, "--timeout-ms", "10000"); err != nil {
+		if err := CallSPDKRPCContext(ctx, "nvmf_subsystem_remove_host", nil, nqn, host.NQN, "--timeout-ms", "10000"); err != nil {
 			return fmt.Errorf("disconnect and remove stale host %s from %s: %w", host.NQN, nqn, err)
 		}
 	}
 	if hostNQN != "" {
-		if err := CallSPDKRPC("nvmf_subsystem_add_host", nil, nqn, hostNQN); err != nil {
+		if err := CallSPDKRPCContext(ctx, "nvmf_subsystem_add_host", nil, nqn, hostNQN); err != nil {
 			return fmt.Errorf("authorize host %s for %s: %w", hostNQN, nqn, err)
 		}
 	}
@@ -374,7 +444,7 @@ func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 		var subsystems []struct {
 			NQN string `json:"nqn"`
 		}
-		if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err != nil {
+		if err := CallSPDKRPCContext(ctx, "nvmf_get_subsystems", &subsystems); err != nil {
 			return false, fmt.Errorf("failed to list SPDK NVMe-oF subsystems: %w", err)
 		}
 		for _, subsystem := range subsystems {
@@ -391,7 +461,7 @@ func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 	if !found {
 		return nil
 	}
-	deleteErr := CallSPDKRPC("nvmf_delete_subsystem", nil, nqn)
+	deleteErr := CallSPDKRPCContext(ctx, "nvmf_delete_subsystem", nil, nqn)
 	found, verifyErr := subsystemExists()
 	if verifyErr != nil {
 		return fmt.Errorf("verify SPDK subsystem %s absence: %w", nqn, verifyErr)

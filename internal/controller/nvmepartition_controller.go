@@ -32,6 +32,7 @@ import (
 
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/capacity"
+	"distort/internal/rdmahealth"
 )
 
 // NVMePartitionReconciler reconciles a NVMePartition object
@@ -100,10 +101,23 @@ func (r *NVMePartitionReconciler) placementCandidates(
 	if err := reader.List(ctx, &partitions); err != nil {
 		return nil, err
 	}
+	var rdmaNodes storagev1alpha1.RDMAStorageNodeList
+	if err := reader.List(ctx, &rdmaNodes); err != nil {
+		return nil, err
+	}
+	readyNodes := make(map[string]struct{}, len(rdmaNodes.Items))
+	for i := range rdmaNodes.Items {
+		if err := rdmahealth.Validate(&rdmaNodes.Items[i], time.Now()); err == nil {
+			readyNodes[rdmaNodes.Items[i].Spec.NodeName] = struct{}{}
+		}
+	}
 
 	candidates := make([]placementCandidate, 0, len(devices.Items))
 	for i := range devices.Items {
 		device := &devices.Items[i]
+		if _, ready := readyNodes[device.Spec.NodeName]; !ready {
+			continue
+		}
 		if !deviceCanHostPartition(device, partition) {
 			continue
 		}
@@ -158,6 +172,13 @@ func (r *NVMePartitionReconciler) reserveCandidate(
 			return err
 		}
 		if device.Spec.SerialNumber != candidate.serial || !deviceCanHostPartition(&device, &partition) {
+			return nil
+		}
+		var rdmaNode storagev1alpha1.RDMAStorageNode
+		if err := reader.Get(ctx, client.ObjectKey{Name: device.Spec.NodeName}, &rdmaNode); err != nil {
+			return err
+		}
+		if err := rdmahealth.Validate(&rdmaNode, time.Now()); err != nil {
 			return nil
 		}
 

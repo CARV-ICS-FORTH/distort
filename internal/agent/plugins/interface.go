@@ -27,6 +27,13 @@ type TargetBackend interface {
 	ReconcileHostAccess(ctx context.Context, nqn string, hostNQN string) error
 }
 
+// ExportHealthChecker verifies the complete persisted export identity. Backends
+// implementing it may also restore their supervised target process before the
+// check; a failed check causes idempotent reprovisioning.
+type ExportHealthChecker interface {
+	CheckExport(ctx context.Context, nqn, blockPath, portalIP string, portalPort int, options map[string]string) error
+}
+
 // VolumeIdentity contains the stable backend identifiers needed to address one
 // carved volume exactly. Managers that do not expose structured identities only
 // need to set BackendVolumeID.

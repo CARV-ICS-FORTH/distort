@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -23,6 +22,7 @@ import (
 	"distort/internal/agent/plugins"
 	attachmentidentity "distort/internal/attachment"
 	"distort/internal/capacity"
+	"distort/internal/rdmahealth"
 	"distort/internal/storageoptions"
 	"distort/internal/volumeidentity"
 )
@@ -34,6 +34,8 @@ const claimAuthorizationCondition = "ClaimAuthorized"
 const partitionProvisioningCondition = "ProvisioningReady"
 
 const spdkTargetBackend = "spdk"
+
+const exportedHealthInterval = 15 * time.Second
 
 func partitionHasTerminalFailure(partition *storagev1alpha1.NVMePartition) bool {
 	condition := meta.FindStatusCondition(partition.Status.Conditions, partitionProvisioningCondition)
@@ -194,6 +196,17 @@ func (p *PartitionManager) updateDeviceStatus(ctx context.Context, key types.Nam
 	base := latest.DeepCopy()
 	updateFn(&latest.Status)
 	return p.Status().Patch(ctx, &latest, client.MergeFrom(base))
+}
+
+func (p *PartitionManager) rdmaEndpoint(ctx context.Context) (string, error) {
+	var node storagev1alpha1.RDMAStorageNode
+	if err := p.Get(ctx, types.NamespacedName{Name: p.NodeName}, &node); err != nil {
+		return "", fmt.Errorf("resolve RDMAStorageNode %s: %w", p.NodeName, err)
+	}
+	if err := rdmahealth.Validate(&node, time.Now()); err != nil {
+		return "", err
+	}
+	return node.Spec.RDMAIP, nil
 }
 
 func claimReferencesEqual(a, b *storagev1alpha1.NVMeDeviceClaimReference) bool {
@@ -505,34 +518,29 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// If it's already exported or failed, verify its existence or return
-	if partition.Status.State == storagev1alpha1.NVMePartitionStateExported {
-		if err := p.reconcileAttachmentAccess(ctx, &partition, backend); err != nil {
-			logger.Error(err, "Failed to reconcile exclusive NVMe host access", "nqn", partition.Status.NQN)
+	switch partition.Status.State {
+	case storagev1alpha1.NVMePartitionStateExported:
+		portalIP, err := p.rdmaEndpoint(ctx)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if targetBackendName == spdkTargetBackend {
-			nqn := partition.Status.NQN
-			var subsystems []struct {
-				NQN string `json:"nqn"`
+		healthy := true
+		if checker, ok := backend.(plugins.ExportHealthChecker); ok {
+			healthErr := checker.CheckExport(ctx, partition.Status.NQN, partition.Status.BackendVolumeID,
+				portalIP, partition.Status.PortalPort, partition.Spec.TargetOptions)
+			if healthErr != nil {
+				healthy = false
+				logger.Error(healthErr, "Export health check failed; re-provisioning", "nqn", partition.Status.NQN)
 			}
-			exists := false
-			if err := plugins.CallSPDKRPC("nvmf_get_subsystems", &subsystems); err == nil {
-				for _, sub := range subsystems {
-					if sub.NQN == nqn {
-						exists = true
-						break
-					}
-				}
-			}
-			if exists {
-				return ctrl.Result{}, nil
-			}
-			logger.Info("Partition is marked Exported but subsystem is missing from SPDK. Re-provisioning...", "nqn", nqn)
-			// Fall through to re-provision
-		} else {
-			return ctrl.Result{}, nil
 		}
-	} else if partition.Status.State == storagev1alpha1.NVMePartitionStateFailed {
+		if healthy {
+			if err := p.reconcileAttachmentAccess(ctx, &partition, backend); err != nil {
+				logger.Error(err, "Failed to reconcile exclusive NVMe host access", "nqn", partition.Status.NQN)
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: exportedHealthInterval}, nil
+		}
+	case storagev1alpha1.NVMePartitionStateFailed:
 		// Retry failures classified as transient. Idempotent plugin operations can
 		// recover resources created before an RPC response or status update failed.
 		logger.Info("Retrying failed NVMePartition provisioning")
@@ -546,6 +554,9 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
 	}
 	deviceName := dev.Name
+	if _, err := p.rdmaEndpoint(ctx); err != nil {
+		return p.retryableProvisioningFailure(ctx, &partition, "RDMAEndpointUnavailable", err)
+	}
 
 	if dev.Status.ActiveBackend != "" && dev.Status.ActiveBackend != targetBackendName {
 		err := fmt.Errorf("device is currently locked to backend %s, requested %s", dev.Status.ActiveBackend, targetBackendName)
@@ -642,20 +653,10 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	blockPath := createdVolume.BackendVolumeID
 
-	// Fetch K8s Node IP for the export portal
-	portalIP := "127.0.0.1"
-	k8sNode := &corev1.Node{}
-	if err := p.Get(ctx, types.NamespacedName{Name: p.NodeName}, k8sNode); err == nil {
-		for _, addr := range k8sNode.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP {
-				portalIP = addr.Address
-				break
-			}
-		}
-	} else {
-		logger.Error(err, "Failed to fetch node IP for portal")
+	portalIP, err := p.rdmaEndpoint(ctx)
+	if err != nil {
+		return p.retryableProvisioningFailure(ctx, &partition, "RDMAEndpointUnavailable", err)
 	}
-
 	portalPort := 4420
 	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
 		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
@@ -684,7 +685,7 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	logger.Info("Successfully provisioned and exported partition", "partition", partition.Name)
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: exportedHealthInterval}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

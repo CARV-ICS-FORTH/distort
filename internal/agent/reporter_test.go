@@ -14,7 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "distort/api/v1alpha1"
-	"distort/test/knownfailure"
+	"distort/internal/rdmahealth"
 )
 
 const loopbackAddress = "127.0.0.1"
@@ -32,7 +32,12 @@ func newReporterTestClient(t *testing.T, objects ...runtime.Object) *Reporter {
 	copy(clientObjects, objects)
 	builder := fake.NewClientBuilder().WithScheme(testScheme).WithRuntimeObjects(clientObjects...).
 		WithStatusSubresource(&storagev1alpha1.RDMAStorageNode{}, &storagev1alpha1.NVMeDevice{})
-	return &Reporter{Client: builder.Build(), NodeName: "distort-worker-1"}
+	return &Reporter{
+		Client: builder.Build(), NodeName: "distort-worker-1",
+		discoverRDMA: func() (RDMAEndpoint, error) {
+			return RDMAEndpoint{Interface: "rdma0", IP: "192.168.56.11", Transport: storagev1alpha1.RDMATransportRoCEv2, LinkSpeed: "100 Gb/sec"}, nil
+		},
+	}
 }
 
 func TestReporterPublishesNodeInternalIPAndCapacity(t *testing.T) {
@@ -141,8 +146,8 @@ func TestReporterDoesNotMarkHardwareMissingWhenDiscoveryFails(t *testing.T) {
 }
 
 func TestReporterDoesNotAdvertiseLoopbackWithoutANodeIP(t *testing.T) {
-	knownfailure.Require(t, "F16")
 	reporter := newReporterTestClient(t)
+	reporter.discoverRDMA = func() (RDMAEndpoint, error) { return RDMAEndpoint{}, errors.New("no RDMA interface") }
 	reporter.reportNode(context.Background(), 0, 0)
 
 	var actual storagev1alpha1.RDMAStorageNode
@@ -150,10 +155,13 @@ func TestReporterDoesNotAdvertiseLoopbackWithoutANodeIP(t *testing.T) {
 	if err == nil && actual.Spec.RDMAIP == loopbackAddress {
 		t.Fatalf("missing Kubernetes Node was advertised as a usable loopback RDMA endpoint: %#v", actual)
 	}
+	condition := meta.FindStatusCondition(actual.Status.Conditions, rdmahealth.ReadyCondition)
+	if condition == nil || condition.Status != metav1.ConditionFalse {
+		t.Fatalf("RDMA readiness = %#v, want False", condition)
+	}
 }
 
 func TestReporterCountsActiveExports(t *testing.T) {
-	knownfailure.Require(t, "F16")
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "distort-worker-1"},
 		Status:     corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "192.168.56.11"}}},

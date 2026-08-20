@@ -549,6 +549,50 @@ esac`)
 	}
 }
 
+func TestCallSPDKRPCContextTerminatesHungCommand(t *testing.T) {
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", `sleep 10`)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := CallSPDKRPCContext(ctx, "hung", nil)
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("hung RPC error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("hung RPC took %s to terminate", elapsed)
+	}
+}
+
+func TestSPDKExportHealthChecksBackingBdevAndListener(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeTestExecutable(t, fakeBin, "pidof", "exit 0")
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	rpc := writeTestExecutable(t, fakeBin, "rpc.py", `
+case "$1" in
+  rpc_get_methods) printf '[]\n' ;;
+  nvmf_get_subsystems) printf '[{"nqn":"nqn.test","namespaces":[{"bdev_name":"lvs/volume"}],"listen_addresses":[{"trtype":"RDMA","traddr":"192.0.2.10","trsvcid":"4420"}]}]\n' ;;
+  *) printf 'unexpected method %s\n' "$1" >&2; exit 8 ;;
+esac`)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	backend := &SPDKBackend{}
+	if err := backend.CheckExport(context.Background(), "nqn.test", "lvs/volume", "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("healthy export rejected: %v", err)
+	}
+	if err := backend.CheckExport(context.Background(), "nqn.test", "lvs/wrong", "192.0.2.10", 4420, nil); err == nil {
+		t.Fatal("wrong backing bdev was accepted")
+	}
+	if err := backend.CheckExport(context.Background(), "nqn.test", "lvs/volume", "192.0.2.11", 4420, nil); err == nil {
+		t.Fatal("wrong listener address was accepted")
+	}
+}
+
 func TestSPDKLvolPersistsAndDeletesExactCreatedIdentity(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "lvol-exists")
 	deleted := filepath.Join(t.TempDir(), "deleted-uuid")

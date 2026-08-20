@@ -164,6 +164,11 @@ spec:
                   Used by the Mgmt-Controller to schedule new NVMePartitions.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+              lastHeartbeatTime:
+                description: LastHeartbeatTime is the last successful reporter observation
+                  for this node.
+                format: date-time
+                type: string
               totalCapacity:
                 anyOf:
                 - type: integer

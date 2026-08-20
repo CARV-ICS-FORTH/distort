@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,6 +21,7 @@ import (
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/agent/plugins"
 	attachmentidentity "distort/internal/attachment"
+	"distort/internal/rdmahealth"
 )
 
 const testNQN = "nqn.test"
@@ -164,8 +166,27 @@ func newPartitionManagerClient(t *testing.T, objects ...client.Object) client.Cl
 	if err := storagev1alpha1.AddToScheme(testScheme); err != nil {
 		t.Fatal(err)
 	}
+	hasRDMANode := false
+	for _, object := range objects {
+		if node, ok := object.(*storagev1alpha1.RDMAStorageNode); ok && node.Name == "node-a" {
+			hasRDMANode = true
+		}
+	}
+	if !hasRDMANode {
+		rdmaNode := &storagev1alpha1.RDMAStorageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Spec: storagev1alpha1.RDMAStorageNodeSpec{
+				NodeName: "node-a", RDMAIP: "192.0.2.10", Transport: storagev1alpha1.RDMATransportRoCEv2,
+			},
+			Status: storagev1alpha1.RDMAStorageNodeStatus{LastHeartbeatTime: metav1.NewTime(time.Now())},
+		}
+		meta.SetStatusCondition(&rdmaNode.Status.Conditions, metav1.Condition{
+			Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, Reason: "TestReady", Message: "Test RDMA endpoint is ready",
+		})
+		objects = append(objects, rdmaNode)
+	}
 	return fake.NewClientBuilder().WithScheme(testScheme).
-		WithStatusSubresource(&storagev1alpha1.NVMeDevice{}, &storagev1alpha1.NVMePartition{}, &storagev1alpha1.NVMeVolumeAttachment{}).
+		WithStatusSubresource(&storagev1alpha1.NVMeDevice{}, &storagev1alpha1.NVMePartition{}, &storagev1alpha1.NVMeVolumeAttachment{}, &storagev1alpha1.RDMAStorageNode{}).
 		WithObjects(objects...).Build()
 }
 

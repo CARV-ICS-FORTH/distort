@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/rdmahealth"
 )
 
 // Reporter handles hardware discovery and submitting RDMAStorageNode + NVMeDevice CRs.
@@ -22,6 +22,7 @@ type Reporter struct {
 	NodeName        string
 	Interval        time.Duration
 	discoverDevices func() ([]HardwareNVMe, error)
+	discoverRDMA    func() (RDMAEndpoint, error)
 }
 
 const hardwareAvailableCondition = "HardwareAvailable"
@@ -31,6 +32,13 @@ func (r *Reporter) discoverNVMe() ([]HardwareNVMe, error) {
 		return r.discoverDevices()
 	}
 	return DiscoverNVMe()
+}
+
+func (r *Reporter) discoverRDMAEndpoint() (RDMAEndpoint, error) {
+	if r.discoverRDMA != nil {
+		return r.discoverRDMA()
+	}
+	return DiscoverRDMAEndpoint()
 }
 
 // Start runs the periodic discovery reporting loop.
@@ -61,20 +69,7 @@ func (r *Reporter) report(ctx context.Context) {
 
 func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity int64) {
 	logger := log.FromContext(ctx)
-
-	// Fetch K8s Node to determine Internal IP for RDMA
-	rdmaIP := "127.0.0.1" // Fallback
-	k8sNode := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, k8sNode); err == nil {
-		for _, addr := range k8sNode.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP {
-				rdmaIP = addr.Address
-				break
-			}
-		}
-	} else {
-		logger.Error(err, "Failed to get K8s Node for RDMAIP")
-	}
+	endpoint, discoveryErr := r.discoverRDMAEndpoint()
 
 	nodeCR := &storagev1alpha1.RDMAStorageNode{}
 	err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, nodeCR)
@@ -87,19 +82,24 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 	if !exists {
 		nodeCR.Name = r.NodeName
 		nodeCR.Spec.NodeName = r.NodeName
-		nodeCR.Spec.RDMAIP = rdmaIP
-		nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
+		nodeCR.Spec.RDMAIP = endpoint.IP
+		nodeCR.Spec.Transport = endpoint.Transport
+		if nodeCR.Spec.Transport == "" {
+			nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
+		}
+		nodeCR.Spec.LinkSpeed = endpoint.LinkSpeed
 		if err := r.Create(ctx, nodeCR); err != nil {
 			logger.Error(err, "Failed to create RDMAStorageNode")
 			return
 		}
-	} else if nodeCR.Spec.NodeName != r.NodeName ||
-		nodeCR.Spec.RDMAIP != rdmaIP ||
-		nodeCR.Spec.Transport != storagev1alpha1.RDMATransportRoCEv2 {
+	} else if discoveryErr == nil && (nodeCR.Spec.NodeName != r.NodeName ||
+		nodeCR.Spec.RDMAIP != endpoint.IP || nodeCR.Spec.Transport != endpoint.Transport ||
+		nodeCR.Spec.LinkSpeed != endpoint.LinkSpeed) {
 		base := nodeCR.DeepCopy()
 		nodeCR.Spec.NodeName = r.NodeName
-		nodeCR.Spec.RDMAIP = rdmaIP
-		nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
+		nodeCR.Spec.RDMAIP = endpoint.IP
+		nodeCR.Spec.Transport = endpoint.Transport
+		nodeCR.Spec.LinkSpeed = endpoint.LinkSpeed
 		if err := r.Patch(ctx, nodeCR, client.MergeFrom(base)); err != nil {
 			logger.Error(err, "Failed to update RDMAStorageNode Spec")
 			return
@@ -109,7 +109,30 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 	base := nodeCR.DeepCopy()
 	nodeCR.Status.TotalCapacity = *resource.NewQuantity(totalCapacity, resource.BinarySI)
 	nodeCR.Status.FreeCapacity = *resource.NewQuantity(freeCapacity, resource.BinarySI)
+	var partitions storagev1alpha1.NVMePartitionList
+	if err := r.List(ctx, &partitions); err != nil {
+		logger.Error(err, "Failed to count active NVMe exports")
+		return
+	}
 	nodeCR.Status.ActiveExports = 0
+	for i := range partitions.Items {
+		if partitions.Items[i].Spec.NodeName == r.NodeName &&
+			partitions.Items[i].Status.State == storagev1alpha1.NVMePartitionStateExported &&
+			partitions.Items[i].DeletionTimestamp.IsZero() {
+			nodeCR.Status.ActiveExports++
+		}
+	}
+	nodeCR.Status.LastHeartbeatTime = metav1.Now()
+	condition := metav1.Condition{
+		Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, ObservedGeneration: nodeCR.Generation,
+		Reason: "RDMAEndpointReady", Message: "An active RDMA interface has a usable non-loopback IP address",
+	}
+	if discoveryErr != nil {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = "RDMAEndpointUnavailable"
+		condition.Message = discoveryErr.Error()
+	}
+	meta.SetStatusCondition(&nodeCR.Status.Conditions, condition)
 	err = r.Status().Patch(ctx, nodeCR, client.MergeFrom(base))
 	if err != nil {
 		logger.Error(err, "Failed to report RDMAStorageNode")

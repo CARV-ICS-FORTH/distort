@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"distort/test/knownfailure"
 )
 
 func writeDiscoveryFile(t *testing.T, path, value string) {
@@ -50,6 +48,7 @@ func setupDiscoveryFixture(t *testing.T) string {
 	t.Setenv("NVME_EXCLUDE_DEVICES", "")
 	t.Setenv("LSBLK_FAIL", "0")
 	t.Setenv("LSBLK_OUTPUT", "")
+	t.Setenv(unsafeMountInspectionEnv, "false")
 	return "0000:01:00.0"
 }
 
@@ -84,24 +83,55 @@ func TestDiscoverKernelNVMeSkipsMountedNamespaces(t *testing.T) {
 }
 
 func TestDiscoveryFiltersUseExactCommaSeparatedPCIAddresses(t *testing.T) {
-	knownfailure.Require(t, "F15")
 	pciAddress := setupDiscoveryFixture(t)
 	t.Setenv("NVME_ALLOWED_DEVICES", "prefix-"+pciAddress+"-suffix")
 	devices, err := discoverKernelNVMe()
-	if err != nil {
-		t.Fatalf("discoverKernelNVMe returned error: %v", err)
-	}
-	if len(devices) != 0 {
+	if err == nil && len(devices) != 0 {
 		t.Fatalf("substring allow-list entry incorrectly admitted %s", pciAddress)
 	}
 }
 
 func TestDiscoveryFailsSafeWhenMountInspectionFails(t *testing.T) {
-	knownfailure.Require(t, "F15")
 	setupDiscoveryFixture(t)
 	t.Setenv("LSBLK_FAIL", "1")
 	devices, err := discoverKernelNVMe()
 	if err == nil && len(devices) != 0 {
 		t.Fatalf("device was admitted after lsblk failed: %#v", devices)
+	}
+}
+
+func TestDiscoveryNormalizesAndDeduplicatesPCIAddressLists(t *testing.T) {
+	pciAddress := setupDiscoveryFixture(t)
+	t.Setenv("NVME_ALLOWED_DEVICES", " 0000:01:00.0,0000:01:00.0 ")
+	devices, err := discoverKernelNVMe()
+	if err != nil || len(devices) != 1 || devices[0].PCIAddress != pciAddress {
+		t.Fatalf("normalized allow list returned devices=%#v err=%v", devices, err)
+	}
+	t.Setenv("NVME_EXCLUDE_DEVICES", " 0000:01:00.0 ")
+	devices, err = discoverKernelNVMe()
+	if err != nil || len(devices) != 0 {
+		t.Fatalf("exact exclusion returned devices=%#v err=%v", devices, err)
+	}
+}
+
+func TestDiscoveryRejectsMalformedPCIAddressLists(t *testing.T) {
+	setupDiscoveryFixture(t)
+	for _, value := range []string{"0000:01:00.0,", "not-a-pci-address", "0000:01:00.8"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("NVME_ALLOWED_DEVICES", value)
+			if _, err := discoverKernelNVMe(); err == nil {
+				t.Fatalf("malformed allow list %q was accepted", value)
+			}
+		})
+	}
+}
+
+func TestUnsafeMountInspectionOverrideIsExplicit(t *testing.T) {
+	setupDiscoveryFixture(t)
+	t.Setenv("LSBLK_FAIL", "1")
+	t.Setenv(unsafeMountInspectionEnv, "true")
+	devices, err := discoverKernelNVMe()
+	if err != nil || len(devices) != 1 {
+		t.Fatalf("unsafe override returned devices=%#v err=%v", devices, err)
 	}
 }

@@ -22,10 +22,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -34,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/rdmahealth"
 )
 
 type conflictOnceClient struct {
@@ -61,7 +64,10 @@ func (c *listRejectingClient) List(context.Context, client.ObjectList, ...client
 }
 
 var _ = Describe("NVMePartition placement", func() {
-	const namespace = "default"
+	const (
+		namespace           = "default"
+		placementSuiteLabel = "placement"
+	)
 	ctx := context.Background()
 	var reconciler *NVMePartitionReconciler
 
@@ -77,22 +83,44 @@ var _ = Describe("NVMePartition placement", func() {
 		var partitions storagev1alpha1.NVMePartitionList
 		Expect(k8sClient.List(ctx, &partitions, client.InNamespace(namespace))).To(Succeed())
 		for i := range partitions.Items {
-			if partitions.Items[i].Labels["test.distort.io/suite"] == "placement" {
+			if partitions.Items[i].Labels["test.distort.io/suite"] == placementSuiteLabel {
 				_ = k8sClient.Delete(ctx, &partitions.Items[i])
 			}
 		}
 		var devices storagev1alpha1.NVMeDeviceList
 		Expect(k8sClient.List(ctx, &devices)).To(Succeed())
 		for i := range devices.Items {
-			if devices.Items[i].Labels["test.distort.io/suite"] == "placement" {
+			if devices.Items[i].Labels["test.distort.io/suite"] == placementSuiteLabel {
 				_ = k8sClient.Delete(ctx, &devices.Items[i])
+			}
+		}
+		var rdmaNodes storagev1alpha1.RDMAStorageNodeList
+		Expect(k8sClient.List(ctx, &rdmaNodes)).To(Succeed())
+		for i := range rdmaNodes.Items {
+			if rdmaNodes.Items[i].Labels["test.distort.io/suite"] == placementSuiteLabel {
+				_ = k8sClient.Delete(ctx, &rdmaNodes.Items[i])
 			}
 		}
 	})
 
 	createDeviceWithTotal := func(name, node, serial, total, free, backend string, state storagev1alpha1.NVMeDeviceState) {
+		var rdmaNode storagev1alpha1.RDMAStorageNode
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: node}, &rdmaNode); apierrors.IsNotFound(err) {
+			rdmaNode = storagev1alpha1.RDMAStorageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: node, Labels: map[string]string{"test.distort.io/suite": placementSuiteLabel}},
+				Spec: storagev1alpha1.RDMAStorageNodeSpec{
+					NodeName: node, RDMAIP: "192.0.2.10", Transport: storagev1alpha1.RDMATransportRoCEv2,
+				},
+			}
+			Expect(k8sClient.Create(ctx, &rdmaNode)).To(Succeed())
+			rdmaNode.Status.LastHeartbeatTime = metav1.NewTime(time.Now())
+			meta.SetStatusCondition(&rdmaNode.Status.Conditions, metav1.Condition{
+				Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, Reason: "TestReady", Message: "Test RDMA endpoint is ready",
+			})
+			Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
+		}
 		device := &storagev1alpha1.NVMeDevice{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"test.distort.io/suite": "placement"}},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"test.distort.io/suite": placementSuiteLabel}},
 			Spec: storagev1alpha1.NVMeDeviceSpec{
 				NodeName:      node,
 				PCIAddress:    "0000:01:00.0",
@@ -122,7 +150,7 @@ var _ = Describe("NVMePartition placement", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
 				Namespace: namespace,
-				Labels:    map[string]string{"test.distort.io/suite": "placement"},
+				Labels:    map[string]string{"test.distort.io/suite": placementSuiteLabel},
 			},
 			Spec: storagev1alpha1.NVMePartitionSpec{Size: resource.MustParse(size), TargetBackend: backend},
 		}
@@ -133,7 +161,7 @@ var _ = Describe("NVMePartition placement", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:       name,
 				Namespace:  namespace,
-				Labels:     map[string]string{"test.distort.io/suite": "placement"},
+				Labels:     map[string]string{"test.distort.io/suite": placementSuiteLabel},
 				Finalizers: finalizers,
 			},
 			Spec: storagev1alpha1.NVMePartitionSpec{
@@ -189,6 +217,22 @@ var _ = Describe("NVMePartition placement", func() {
 		Expect(actual.Spec.NodeName).To(BeEmpty())
 		Expect(actual.Spec.ParentDeviceSerialNumber).To(BeEmpty())
 		Expect(actual.Spec.ClaimRef).To(BeNil())
+	})
+
+	It("does not place storage on a node with a stale RDMA heartbeat", func() {
+		createDevice("placement-stale-rdma", "node-stale-rdma", "serial-stale-rdma", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		var rdmaNode storagev1alpha1.RDMAStorageNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "node-stale-rdma"}, &rdmaNode)).To(Succeed())
+		rdmaNode.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(-2 * rdmahealth.FreshnessWindow))
+		Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
 	})
 
 	It("reserves the upward-rounded allocation size", func() {

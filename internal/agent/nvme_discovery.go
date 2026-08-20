@@ -1,13 +1,14 @@
 package agent
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
-
-	"k8s.io/klog/v2"
 
 	"distort/internal/agent/plugins"
 )
@@ -25,14 +26,75 @@ type HardwareNVMe struct {
 var sysClassNVMe = "/sys/class/nvme"
 var sysClassBlock = "/sys/class/block"
 
+const unsafeMountInspectionEnv = "NVME_ALLOW_UNSAFE_MOUNT_INSPECTION"
+
+var pciAddressPattern = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$`)
+
+type discoveryPolicy struct {
+	allowed               map[string]struct{}
+	excluded              map[string]struct{}
+	unsafeMountInspection bool
+}
+
+func parsePCIAddressSet(name, value string) (map[string]struct{}, error) {
+	result := make(map[string]struct{})
+	if strings.TrimSpace(value) == "" {
+		return result, nil
+	}
+	for raw := range strings.SplitSeq(value, ",") {
+		address := strings.ToLower(strings.TrimSpace(raw))
+		if address == "" || !pciAddressPattern.MatchString(address) {
+			return nil, fmt.Errorf("%s contains invalid PCI address %q", name, raw)
+		}
+		result[address] = struct{}{}
+	}
+	return result, nil
+}
+
+func currentDiscoveryPolicy() (discoveryPolicy, error) {
+	allowed, err := parsePCIAddressSet("NVME_ALLOWED_DEVICES", os.Getenv("NVME_ALLOWED_DEVICES"))
+	if err != nil {
+		return discoveryPolicy{}, err
+	}
+	excluded, err := parsePCIAddressSet("NVME_EXCLUDE_DEVICES", os.Getenv("NVME_EXCLUDE_DEVICES"))
+	if err != nil {
+		return discoveryPolicy{}, err
+	}
+	unsafe := false
+	if value := os.Getenv(unsafeMountInspectionEnv); value != "" {
+		unsafe, err = strconv.ParseBool(value)
+		if err != nil {
+			return discoveryPolicy{}, fmt.Errorf("%s must be a boolean: %w", unsafeMountInspectionEnv, err)
+		}
+	}
+	return discoveryPolicy{allowed: allowed, excluded: excluded, unsafeMountInspection: unsafe}, nil
+}
+
+func (p discoveryPolicy) permits(pciAddress string) bool {
+	address := strings.ToLower(strings.TrimSpace(pciAddress))
+	if _, excluded := p.excluded[address]; excluded {
+		return false
+	}
+	if len(p.allowed) == 0 {
+		return true
+	}
+	_, allowed := p.allowed[address]
+	return allowed
+}
+
 // DiscoverNVMe scans both the Linux sysfs tree (for kernel-bound NVMe devices)
 // and SPDK JSON-RPC (for SPDK-bound NVMe devices), returning a unified list.
 func DiscoverNVMe() ([]HardwareNVMe, error) {
+	policy, err := currentDiscoveryPolicy()
+	if err != nil {
+		return nil, err
+	}
 	var devices []HardwareNVMe
 	seenSerials := make(map[string]bool)
+	var discoveryErrors []error
 
 	// 1. Scan kernel-bound devices from sysfs
-	kernelDevs, err := discoverKernelNVMe()
+	kernelDevs, err := discoverKernelNVMeWithPolicy(policy)
 	if err == nil {
 		for _, d := range kernelDevs {
 			serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
@@ -42,11 +104,11 @@ func DiscoverNVMe() ([]HardwareNVMe, error) {
 			}
 		}
 	} else {
-		klog.Warningf("Failed to discover kernel NVMe devices: %v", err)
+		discoveryErrors = append(discoveryErrors, fmt.Errorf("kernel NVMe discovery: %w", err))
 	}
 
 	// 2. Scan SPDK-bound devices if SPDK is running
-	spdkDevs, err := discoverSPDKNVMe()
+	spdkDevs, err := discoverSPDKNVMeWithPolicy(policy)
 	if err == nil {
 		for _, d := range spdkDevs {
 			serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
@@ -56,13 +118,21 @@ func DiscoverNVMe() ([]HardwareNVMe, error) {
 			}
 		}
 	} else {
-		klog.Warningf("Failed to discover SPDK NVMe devices: %v", err)
+		discoveryErrors = append(discoveryErrors, fmt.Errorf("SPDK NVMe discovery: %w", err))
 	}
 
-	return devices, nil
+	return devices, errors.Join(discoveryErrors...)
 }
 
 func discoverKernelNVMe() ([]HardwareNVMe, error) {
+	policy, err := currentDiscoveryPolicy()
+	if err != nil {
+		return nil, err
+	}
+	return discoverKernelNVMeWithPolicy(policy)
+}
+
+func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) {
 	var devices []HardwareNVMe
 
 	entries, err := os.ReadDir(sysClassNVMe)
@@ -118,29 +188,25 @@ func discoverKernelNVMe() ([]HardwareNVMe, error) {
 			hwDev.PCIAddress = filepath.Base(link)
 		}
 
-		// Check environment variables
-		if excludeList := os.Getenv("NVME_EXCLUDE_DEVICES"); excludeList != "" {
-			if strings.Contains(excludeList, hwDev.PCIAddress) {
-				//klog.Infof("Skipping device %s (%s) because it is in NVME_EXCLUDE_DEVICES", devName, hwDev.PCIAddress)
-
-				continue
-			}
-		}
-		if allowList := os.Getenv("NVME_ALLOWED_DEVICES"); allowList != "" {
-			if !strings.Contains(allowList, hwDev.PCIAddress) {
-				klog.Infof("Skipping device %s (%s) because it is not in NVME_ALLOWED_DEVICES", devName, hwDev.PCIAddress)
-				continue
-			}
+		if !policy.permits(hwDev.PCIAddress) {
+			continue
 		}
 
 		// Check for mounted filesystems using lsblk
-		if isDeviceMounted(devName) {
-			klog.Infof("Skipping device %s (%s) because it has mounted filesystems", devName, hwDev.PCIAddress)
+		mounted, err := inspectDeviceMounts(devName)
+		if err != nil {
+			if !policy.unsafeMountInspection {
+				return nil, fmt.Errorf("inspect mount state for %s: %w", devName, err)
+			}
+		} else if mounted {
 			continue
 		}
 
 		// Calculate total bytes from matching namespace blocks
-		hwDev.TotalBytes = calculateTotalBytes(devName)
+		hwDev.TotalBytes, err = calculateTotalBytes(devName)
+		if err != nil {
+			return nil, fmt.Errorf("calculate capacity for %s: %w", devName, err)
+		}
 
 		devices = append(devices, hwDev)
 	}
@@ -148,13 +214,13 @@ func discoverKernelNVMe() ([]HardwareNVMe, error) {
 	return devices, nil
 }
 
-func isDeviceMounted(devName string) bool {
+func inspectDeviceMounts(devName string) (bool, error) {
 	// devName is an NVMe controller (e.g. "nvme1"), which is a character device.
 	// lsblk only works on block devices, so we must check the namespaces
 	// (e.g. nvme1n1, nvme1n2) found under /sys/class/block.
 	entries, err := os.ReadDir(sysClassBlock)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	for _, entry := range entries {
@@ -164,40 +230,41 @@ func isDeviceMounted(devName string) bool {
 		}
 		out, err := exec.Command("lsblk", "/dev/"+bName, "-n", "-o", "MOUNTPOINT").Output()
 		if err != nil {
-			klog.Warningf("lsblk failed for namespace %s: %v", bName, err)
-			continue
+			return false, fmt.Errorf("lsblk namespace %s: %w", bName, err)
 		}
-		lines := strings.Split(string(out), "\n")
-		klog.Infof("lsblk mountpoints for namespace %s: %v", bName, lines)
-		for _, line := range lines {
+		lines := strings.SplitSeq(string(out), "\n")
+		for line := range lines {
 			if strings.TrimSpace(line) != "" {
-				klog.Infof("Namespace %s is mounted (mountpoint: %q), skipping controller %s", bName, strings.TrimSpace(line), devName)
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
-func calculateTotalBytes(nvmeName string) int64 {
+func calculateTotalBytes(nvmeName string) (int64, error) {
 	var total int64
 	entries, err := os.ReadDir(sysClassBlock)
 	if err != nil {
-		return 0
+		return 0, err
 	}
 
 	for _, entry := range entries {
 		bName := entry.Name()
 		if strings.HasPrefix(bName, nvmeName+"n") {
 			sizePath := filepath.Join(sysClassBlock, bName, "size")
-			if b, err := os.ReadFile(sizePath); err == nil {
-				if blocks, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil {
-					total += blocks * 512
-				}
+			b, err := os.ReadFile(sizePath)
+			if err != nil {
+				return 0, err
 			}
+			blocks, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			total += blocks * 512
 		}
 	}
-	return total
+	return total, nil
 }
 
 type SpdkBdev struct {
@@ -225,7 +292,7 @@ type SpdkNVMeController struct {
 	} `json:"ctrlr"`
 }
 
-func discoverSPDKNVMe() ([]HardwareNVMe, error) {
+func discoverSPDKNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) {
 	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
 		return nil, nil // SPDK not running
 	}
@@ -249,7 +316,9 @@ func discoverSPDKNVMe() ([]HardwareNVMe, error) {
 			TotalBytes:   bdev.NumBlocks * bdev.BlockSize,
 			NUMANode:     -1,
 		}
-		devices = append(devices, hwDev)
+		if policy.permits(hwDev.PCIAddress) {
+			devices = append(devices, hwDev)
+		}
 	}
 
 	return devices, nil
