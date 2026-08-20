@@ -20,6 +20,11 @@ type TargetBackend interface {
 
 	// UnexportVolume removes the NVMe-oF target export for the given volume.
 	UnexportVolume(ctx context.Context, nqn string) error
+
+	// ReconcileHostAccess makes hostNQN the only host authorized for the
+	// subsystem. An empty hostNQN revokes all access. Implementations must revoke
+	// old connections before authorizing a replacement host.
+	ReconcileHostAccess(ctx context.Context, nqn string, hostNQN string) error
 }
 
 // VolumeIdentity contains the stable backend identifiers needed to address one

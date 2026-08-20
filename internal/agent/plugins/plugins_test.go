@@ -43,6 +43,85 @@ func TestBuiltInPluginsAreRegistered(t *testing.T) {
 	}
 }
 
+func TestKernelHostAccessRevokesOldHostBeforeAuthorizingReplacement(t *testing.T) {
+	oldNVMetPath := nvmetPath
+	nvmetPath = t.TempDir()
+	t.Cleanup(func() { nvmetPath = oldNVMetPath })
+	nqn := "nqn.test:kernel-fencing"
+	subsystemPath := filepath.Join(nvmetPath, "subsystems", nqn)
+	allowedHostsPath := filepath.Join(subsystemPath, "allowed_hosts")
+	portSubsystemsPath := filepath.Join(nvmetPath, "ports", "1", "subsystems")
+	for _, path := range []string{allowedHostsPath, portSubsystemsPath, filepath.Join(nvmetPath, "hosts")} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(subsystemPath, "attr_allow_any_host"), []byte("1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(subsystemPath, filepath.Join(portSubsystemsPath, nqn)); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &KernelBackend{}
+	firstHost := "nqn.2026-01.io.distort:host-11111111111111111111111111111111"
+	secondHost := "nqn.2026-01.io.distort:host-22222222222222222222222222222222"
+	for _, host := range []string{firstHost, secondHost, ""} {
+		if err := backend.ReconcileHostAccess(context.Background(), nqn, host); err != nil {
+			t.Fatalf("reconciling host %q: %v", host, err)
+		}
+		entries, err := os.ReadDir(allowedHostsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if host == "" && len(entries) != 0 {
+			t.Fatalf("revocation retained allowed hosts: %#v", entries)
+		}
+		if host != "" && (len(entries) != 1 || entries[0].Name() != host) {
+			t.Fatalf("allowed hosts after reconciling %q: %#v", host, entries)
+		}
+		if _, err := os.Lstat(filepath.Join(portSubsystemsPath, nqn)); err != nil {
+			t.Fatalf("subsystem port link was not restored: %v", err)
+		}
+	}
+	allowAny, err := os.ReadFile(filepath.Join(subsystemPath, "attr_allow_any_host"))
+	if err != nil || strings.TrimSpace(string(allowAny)) != "0" {
+		t.Fatalf("allow-any-host remains enabled: value=%q err=%v", allowAny, err)
+	}
+}
+
+func TestSPDKHostAccessRevokesOldHostBeforeAuthorizingReplacement(t *testing.T) {
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "rpc-calls")
+	script := `printf '%s\n' "$*" >> "$RPC_LOG"
+if [ "$1" = nvmf_get_subsystems ]; then
+  printf '[{"nqn":"nqn.test:spdk-fencing","allow_any_host":true,"hosts":[{"nqn":"nqn.test:old-host"}]}]\n'
+else
+  printf 'true\n'
+fi`
+	executable := writeTestExecutable(t, fakeBin, "rpc.py", script)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = executable
+	t.Setenv("RPC_LOG", logPath)
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	newHost := "nqn.2026-01.io.distort:host-33333333333333333333333333333333"
+	if err := (&SPDKBackend{}).ReconcileHostAccess(context.Background(), "nqn.test:spdk-fencing", newHost); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(calls)
+	disable := strings.Index(text, "nvmf_subsystem_allow_any_host nqn.test:spdk-fencing -d")
+	remove := strings.Index(text, "nvmf_subsystem_remove_host nqn.test:spdk-fencing nqn.test:old-host --timeout-ms 10000")
+	add := strings.Index(text, "nvmf_subsystem_add_host nqn.test:spdk-fencing "+newHost)
+	if disable < 0 || remove < disable || add < remove || strings.Contains(text, "nvmf_subsystem_disconnect_host") {
+		t.Fatalf("unsafe SPDK host transition order:\n%s", text)
+	}
+}
+
 func TestPartedSetupStorageIsIdempotentWhenPartitionExists(t *testing.T) {
 	disk := installFakePartedDisk(t)
 	disk.initialized = true

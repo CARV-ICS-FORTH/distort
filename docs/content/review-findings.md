@@ -312,7 +312,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 11. Validate NodeStageVolume before side effects and roll back failures
 
-- [ ] **F11 — High — Confirmed**
+- [x] **F11 — High — Resolved**
 - Affected:
   - `internal/csi/node_server.go`
   - `internal/csi/nvme.go`
@@ -325,10 +325,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 - Regression tests:
   - Inject failure after every staging step and assert no leaked connection or mount.
   - Cancellation during udev wait and external commands.
+- Resolution:
+  - Node staging now validates the volume ID, absolute non-root staging path, capability, filesystem, portal address and port, and attachment publish context before creating a directory or running `nvme connect`.
+  - Connect reports whether the call may have created a connection. Staging tracks directory, connection, and mount ownership and rolls back only state created by that call, using an independent bounded cleanup context so request cancellation cannot suppress cleanup.
+  - NVMe connect/discovery, device polling, filesystem probing/formatting, mount, and rollback commands now honor context cancellation.
+- Verification (2026-08-20): focused CSI regressions passed for validation before connect, discovery and mount failures, directory/connection/mount rollback, cancellation during device discovery, and cancellation of `nvme connect`. The complete unit, vet, contract, and controller envtest suite passed.
 
 ### 12. Verify mount source during idempotent stage/publish
 
-- [ ] **F12 — High — Confirmed**
+- [x] **F12 — High — Resolved**
 - Affected: `internal/csi/node_server.go`
 - Problem: Any mount at the target path is accepted as success without verifying source device, bind relationship, filesystem, or flags.
 - Required fix:
@@ -339,10 +344,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Wrong bind source at publish target.
   - Correct existing mount remains idempotent.
   - Correct source with incompatible flags is rejected or remounted safely.
+- Resolution:
+  - Stage and publish idempotency now use strict `/proc/self/mountinfo` parsing instead of accepting any mount at the requested path.
+  - Existing staging mounts must match the expected block-device major/minor number, normalized filesystem, and writable state. Existing publications must refer to the same bind source and match the requested read-only state.
+  - A conflicting mount returns `FailedPrecondition`; a newly issued mount is verified after the command and rolled back if kernel mount state does not match the request.
+- Verification (2026-08-20): mountinfo and node regressions passed for escaped paths, wrong staging devices, filesystem and flag mismatches, wrong bind sources, read-only mismatches, and idempotent correct mounts. The complete unit, vet, contract, and controller envtest suite passed.
 
 ### 13. Make claims converge when hardware appears, moves, or disappears
 
-- [ ] **F13 — High — Confirmed known limitation**
+- [x] **F13 — High — Resolved**
 - Affected:
   - `internal/controller/nvmedeviceclaim_controller.go`
   - `internal/agent/reporter.go`
@@ -354,10 +364,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   4. Represent unavailable/stale hardware explicitly.
 - Regression tests:
   - Claim before device, device recreation, PCI move, node move, disappearance, and duplicate serial.
+- Resolution:
+  - The hardware reporter now refreshes device location and capacity metadata, publishes a `HardwareAvailable` condition, and marks missing hardware `Unavailable` without discarding its claim owner.
+  - Rediscovery restores the device to `Claimed` or `Available` according to its retained ownership. Claims watch device events and also revalidate periodically so both pending and active claims converge.
+  - Claim matching fails closed when more than one available device reports the same serial. A unique replacement is adopted after a move and stale ownership is released only after the new binding is persisted.
+- Verification (2026-08-20): reporter regressions passed for disappearance, retained ownership, metadata refresh, reactivation, and discovery failure. Controller envtests passed for late devices, node movement, unavailable devices, and duplicate serials. The complete unit, vet, contract, and controller envtest suite passed.
 
 ### 14. Make claim deletion ownership-safe and retryable
 
-- [ ] **F14 — High — Confirmed**
+- [x] **F14 — High — Resolved**
 - Affected: `internal/controller/nvmedeviceclaim_controller.go`
 - Problem: Claim deletion does not check dependent partitions or explicit ownership. Any device `Get` error is ignored before the finalizer is removed.
 - Required fix:
@@ -366,6 +381,11 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   3. Ignore only confirmed NotFound; retry timeouts, authorization errors, conflicts, and other failures.
 - Regression tests:
   - Active partitions, replacement claim, NotFound, Forbidden, timeout, conflict, and already-released device.
+- Resolution:
+  - Claim deletion waits until every partition referencing the claim UID has disappeared and watches partition events to resume cleanup promptly.
+  - Device release verifies the full namespace/name/UID owner identity. Replacement-owned and already-released devices are left untouched, while every device still owned by the deleting UID is released to avoid interrupted-move leftovers.
+  - Only a confirmed missing device is treated as already released; list, read, status patch, conflict, and finalizer update failures retain the finalizer and retry.
+- Verification (2026-08-20): controller regressions passed for dependent partitions, missing devices, replacement ownership, already-released hardware, Forbidden and timeout reads, and status conflicts. The complete unit, vet, contract, and controller envtest suite passed.
 
 ### 15. Make discovery filtering exact and mount inspection fail safe
 
@@ -433,7 +453,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 19. Distinguish retryable and terminal partition failures
 
-- [ ] **F19 — High — Confirmed**
+- [x] **F19 — High — Resolved**
 - Affected: `internal/agent/partition_manager.go`
 - Problem: Some transient kernel errors set `Failed`; the following reconciliation immediately returns success for every failed kernel partition, permanently suppressing recovery.
 - Required fix:
@@ -443,6 +463,11 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 - Regression tests:
   - Temporary device/API failure followed by recovery.
   - Permanent invalid configuration remains terminal without hot-looping.
+- Resolution:
+  - Provisioning failures now publish a generation-aware `ProvisioningReady` condition with explicit `Retryable...` or `Terminal...` reasons.
+  - Transient driver, discovery, backend-availability, storage, export, and API failures return errors for controller-runtime backoff even when state is `Failed`; kernel partitions are no longer suppressed solely by that state.
+  - Invalid plugins, options, capacity, and invalid volume-manager results become terminal for the observed generation. A successful retry replaces the failure condition with `Provisioned=True`, clearing the obsolete error.
+- Verification (2026-08-20): agent regressions passed for retry after a temporary device-setup failure and terminal invalid configuration without hot-looping. The complete unit, vet, contract, and controller envtest suite passed.
 
 ### 20. Do not admit unimplemented `lvm` configuration
 
@@ -501,7 +526,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 25. Enforce single-writer attachment fencing
 
-- [ ] **F25 — High — Confirmed known limitation**
+- [ ] **F25 — High — Fix implemented; hardware verification pending**
 - Affected:
   - CSI controller service and advertised capabilities
   - `CSIDriver` chart configuration
@@ -519,6 +544,11 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Competing consumers on two nodes and a forced migration sequence.
   - Stale-owner recovery after node loss.
   - Repeated publish and unpublish calls for the same volume/node pair.
+- Implemented fix:
+  - Controller publish/unpublish now owns one deterministic, namespaced `NVMeVolumeAttachment` per immutable partition UID. Its immutable node, deterministic host NQN, unique attachment lifetime, status condition, and fencing finalizer make retries observable and prevent a delayed unpublish from deleting a replacement owner.
+  - Kernel and SPDK targets default to closed host access and authorize exactly the attachment owner. The provider agent revokes and disconnects the old host before releasing the attachment finalizer. A competing node is rejected unless an administrator explicitly annotates the current attachment with `storage.distort.io/force-detach-node=<current-node>` after independently fencing that node.
+  - The CSI controller advertises publish/unpublish support, the chart enables `attachRequired`, deploys the external-attacher, and grants its required attachment/status permissions. The guarded Vagrant deploy recreates the immutable `CSIDriver` registration when upgrading the lab.
+- Verification status (2026-08-20): controller, agent, target-backend, chart contract, and E2E compile regressions pass, including same-node retry, competing-node rejection, explicit takeover, stale unpublish, ACL ordering, and finalizer release. In the isolated lab, initial SPDK attach and concurrent-node rejection passed and exposed two integration gaps that were corrected: missing `volumeattachments/status` RBAC and use of a nonexistent standalone SPDK disconnect RPC. The final two-node rerun remains pending because permission to rebuild the corrected local agent image was declined.
 
 ## Cross-cutting release gates
 

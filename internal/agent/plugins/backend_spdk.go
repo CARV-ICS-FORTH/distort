@@ -289,7 +289,7 @@ func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, block
 	}
 
 	// 1. Create Subsystem
-	err := CallSPDKRPC("nvmf_create_subsystem", nil, nqn, "-a", "-s", "distort")
+	err := CallSPDKRPC("nvmf_create_subsystem", nil, nqn, "-s", "distort")
 	if err != nil {
 		return "", fmt.Errorf("failed to create SPDK subsystem %s: %w", nqn, err)
 	}
@@ -309,6 +309,63 @@ func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, block
 	}
 
 	return nqn, nil
+}
+
+func (s *SPDKBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	type subsystemRecord struct {
+		NQN          string `json:"nqn"`
+		AllowAnyHost bool   `json:"allow_any_host"`
+		Hosts        []struct {
+			NQN string `json:"nqn"`
+		} `json:"hosts"`
+	}
+	var subsystems []subsystemRecord
+	if err := CallSPDKRPC("nvmf_get_subsystems", &subsystems); err != nil {
+		return fmt.Errorf("list SPDK subsystems before reconciling host access: %w", err)
+	}
+	var current *subsystemRecord
+	for index := range subsystems {
+		if subsystems[index].NQN == nqn {
+			current = &subsystems[index]
+			break
+		}
+	}
+	if current == nil {
+		return fmt.Errorf("SPDK subsystem %s does not exist", nqn)
+	}
+	exact := !current.AllowAnyHost && len(current.Hosts) <= 1
+	if hostNQN == "" {
+		exact = exact && len(current.Hosts) == 0
+	} else {
+		exact = exact && len(current.Hosts) == 1 && current.Hosts[0].NQN == hostNQN
+	}
+	if exact {
+		return nil
+	}
+	if current.AllowAnyHost {
+		if err := CallSPDKRPC("nvmf_subsystem_allow_any_host", nil, nqn, "-d"); err != nil {
+			return fmt.Errorf("disable unrestricted host access for %s: %w", nqn, err)
+		}
+	}
+	for _, host := range current.Hosts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// SPDK v26.01 folds controller disconnection into remove_host. The RPC
+		// returns only after matching connections are gone or this timeout expires.
+		if err := CallSPDKRPC("nvmf_subsystem_remove_host", nil, nqn, host.NQN, "--timeout-ms", "10000"); err != nil {
+			return fmt.Errorf("disconnect and remove stale host %s from %s: %w", host.NQN, nqn, err)
+		}
+	}
+	if hostNQN != "" {
+		if err := CallSPDKRPC("nvmf_subsystem_add_host", nil, nqn, hostNQN); err != nil {
+			return fmt.Errorf("authorize host %s for %s: %w", hostNQN, nqn, err)
+		}
+	}
+	return nil
 }
 
 func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {

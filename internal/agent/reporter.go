@@ -6,7 +6,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -17,8 +19,18 @@ import (
 // Reporter handles hardware discovery and submitting RDMAStorageNode + NVMeDevice CRs.
 type Reporter struct {
 	client.Client
-	NodeName string
-	Interval time.Duration
+	NodeName        string
+	Interval        time.Duration
+	discoverDevices func() ([]HardwareNVMe, error)
+}
+
+const hardwareAvailableCondition = "HardwareAvailable"
+
+func (r *Reporter) discoverNVMe() ([]HardwareNVMe, error) {
+	if r.discoverDevices != nil {
+		return r.discoverDevices()
+	}
+	return DiscoverNVMe()
 }
 
 // Start runs the periodic discovery reporting loop.
@@ -108,12 +120,13 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 	logger := log.FromContext(ctx)
 	var nodeTotalCap, nodeFreeCap int64
 
-	devices, err := DiscoverNVMe()
+	devices, err := r.discoverNVMe()
 	if err != nil {
 		logger.Error(err, "Failed to discover NVMe devices")
 		return 0, 0
 	}
 
+	seen := make(map[string]struct{}, len(devices))
 	for _, d := range devices {
 		serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
 		if serial == "" {
@@ -121,6 +134,7 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 		}
 		// Device name is usually nodeName-serial
 		deviceName := r.NodeName + "-" + serial
+		seen[deviceName] = struct{}{}
 
 		devCR := &storagev1alpha1.NVMeDevice{}
 		err := r.Get(ctx, types.NamespacedName{Name: deviceName}, devCR)
@@ -157,6 +171,11 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 				base := latest.DeepCopy()
 				latest.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
 				latest.Status.FreeCapacity = latest.Spec.TotalCapacity
+				meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+					Type: hardwareAvailableCondition, Status: metav1.ConditionTrue,
+					ObservedGeneration: latest.Generation, Reason: "DeviceDiscovered",
+					Message: "The reporting agent discovered the NVMe device",
+				})
 				err = r.Status().Patch(ctx, latest, client.MergeFrom(base))
 			}
 			if err != nil {
@@ -166,13 +185,66 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 			devTotal = d.TotalBytes
 			devFree = d.TotalBytes
 		} else {
-			devTotal = devCR.Spec.TotalCapacity.Value()
+			specBase := devCR.DeepCopy()
+			devCR.Spec.NodeName = r.NodeName
+			devCR.Spec.PCIAddress = d.PCIAddress
+			devCR.Spec.SerialNumber = d.SerialNumber
+			devCR.Spec.Model = d.Model
+			devCR.Spec.TotalCapacity = *resource.NewQuantity(d.TotalBytes, resource.BinarySI)
+			devCR.Spec.NUMANode = d.NUMANode
+			if err := r.Patch(ctx, devCR, client.MergeFrom(specBase)); err != nil {
+				logger.Error(err, "Failed to refresh NVMeDevice spec", "device", deviceName)
+				continue
+			}
+			statusBase := devCR.DeepCopy()
+			if devCR.Status.State == storagev1alpha1.NVMeDeviceStateUnavailable {
+				if devCR.Status.ClaimRef == nil {
+					devCR.Status.State = storagev1alpha1.NVMeDeviceStateAvailable
+				} else {
+					devCR.Status.State = storagev1alpha1.NVMeDeviceStateClaimed
+				}
+			}
+			meta.SetStatusCondition(&devCR.Status.Conditions, metav1.Condition{
+				Type: hardwareAvailableCondition, Status: metav1.ConditionTrue,
+				ObservedGeneration: devCR.Generation, Reason: "DeviceDiscovered",
+				Message: "The reporting agent discovered the NVMe device",
+			})
+			if err := r.Status().Patch(ctx, devCR, client.MergeFrom(statusBase)); err != nil {
+				logger.Error(err, "Failed to mark NVMeDevice available", "device", deviceName)
+				continue
+			}
+			devTotal = d.TotalBytes
 			devFree = devCR.Status.FreeCapacity.Value()
 		}
 
 		if devCR.Status.State == storagev1alpha1.NVMeDeviceStateClaimed {
 			nodeTotalCap += devTotal
 			nodeFreeCap += devFree
+		}
+	}
+
+	var reported storagev1alpha1.NVMeDeviceList
+	if err := r.List(ctx, &reported); err != nil {
+		logger.Error(err, "Failed to list reported NVMeDevices")
+		return nodeTotalCap, nodeFreeCap
+	}
+	for i := range reported.Items {
+		dev := &reported.Items[i]
+		if dev.Spec.NodeName != r.NodeName {
+			continue
+		}
+		if _, ok := seen[dev.Name]; ok {
+			continue
+		}
+		base := dev.DeepCopy()
+		dev.Status.State = storagev1alpha1.NVMeDeviceStateUnavailable
+		meta.SetStatusCondition(&dev.Status.Conditions, metav1.Condition{
+			Type: hardwareAvailableCondition, Status: metav1.ConditionFalse,
+			ObservedGeneration: dev.Generation, Reason: "DeviceNotDiscovered",
+			Message: "The reporting agent no longer discovers the NVMe device",
+		})
+		if err := r.Status().Patch(ctx, dev, client.MergeFrom(base)); err != nil {
+			logger.Error(err, "Failed to mark NVMeDevice unavailable", "device", dev.Name)
 		}
 	}
 

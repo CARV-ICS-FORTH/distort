@@ -2,16 +2,16 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	csipb "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"distort/test/knownfailure"
 )
 
 func TestNodeIdentityAndCapabilities(t *testing.T) {
@@ -55,8 +55,14 @@ func TestNodeUnstageAndUnpublishValidateRequiredFields(t *testing.T) {
 }
 
 func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
-	knownfailure.Require(t, "F11")
-	server := &NodeServer{}
+	connectCalls := 0
+	server := &NodeServer{
+		nodeID: "distort-worker-1",
+		connectRDMA: func(context.Context, string, string, string, string) (bool, error) {
+			connectCalls++
+			return true, nil
+		},
+	}
 	requests := []*csipb.NodeStageVolumeRequest{
 		{VolumeId: "volume", VolumeContext: map[string]string{}},
 		{
@@ -67,12 +73,30 @@ func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
 			},
 			VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		},
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.VolumeContext["portalIP"] = "127.0.0.1"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.VolumeContext["portalPort"] = "70000"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.PublishContext[publishContextHostNQN] = hostNQNForNode("other-node")
+			return req
+		}(),
 	}
 	for i, req := range requests {
 		_, err := server.NodeStageVolume(context.Background(), req)
-		if code := statusCode(err); code != codes.InvalidArgument {
-			t.Fatalf("request %d returned %s (%v), want InvalidArgument before nvme connect", i, code, err)
+		if code := statusCode(err); code != codes.InvalidArgument && code != codes.FailedPrecondition {
+			t.Fatalf("request %d returned %s (%v), want validation failure before nvme connect", i, code, err)
 		}
+	}
+	if connectCalls != 0 {
+		t.Fatalf("invalid requests reached nvme connect %d times", connectCalls)
 	}
 }
 
@@ -102,12 +126,28 @@ func TestNodePublishUsesAReadOnlyBindMount(t *testing.T) {
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("MOUNT_LOG", logPath)
+	oldReadMountInfo := readMountInfo
+	oldStatMountPath := statMountPath
+	oldSameMountFile := sameMountFile
+	readMountInfo = func() ([]byte, error) {
+		if arguments, err := os.ReadFile(logPath); err == nil && strings.Contains(string(arguments), "remount,bind,ro") {
+			return []byte("1 0 0:1 / " + filepath.Join(filepath.Dir(logPath), "target-placeholder") + " ro - none bind ro\n"), nil
+		}
+		return nil, nil
+	}
+	sameMountFile = func(os.FileInfo, os.FileInfo) bool { return true }
+	t.Cleanup(func() {
+		readMountInfo = oldReadMountInfo
+		statMountPath = oldStatMountPath
+		sameMountFile = oldSameMountFile
+	})
 
 	server := &NodeServer{}
+	targetPath := filepath.Join(filepath.Dir(logPath), "target-placeholder")
 	_, err := server.NodePublishVolume(context.Background(), &csipb.NodePublishVolumeRequest{
 		VolumeId:          "read-only-volume",
 		StagingTargetPath: t.TempDir(),
-		TargetPath:        filepath.Join(t.TempDir(), "target"),
+		TargetPath:        targetPath,
 		Readonly:          true,
 		VolumeCapability:  mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	})
@@ -124,7 +164,6 @@ func TestNodePublishUsesAReadOnlyBindMount(t *testing.T) {
 }
 
 func TestNodeStageRollsBackConnectionWhenDeviceDiscoveryFails(t *testing.T) {
-	knownfailure.Require(t, "F11")
 	fakeBin := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "nvme-calls")
 	script := `#!/usr/bin/env bash
@@ -142,15 +181,9 @@ exit 1
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("NVME_LOG", logPath)
 
-	server := &NodeServer{}
-	_, err := server.NodeStageVolume(context.Background(), &csipb.NodeStageVolumeRequest{
-		VolumeId:          "rollback-volume",
-		StagingTargetPath: t.TempDir(),
-		VolumeContext: map[string]string{
-			"nqn": "nqn.test:rollback", "portalIP": "192.0.2.10", "portalPort": "4420",
-		},
-		VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
-	})
+	server := &NodeServer{nodeID: "distort-worker-1"}
+	request := validNodeStageRequest(t, server.nodeID)
+	_, err := server.NodeStageVolume(context.Background(), request)
 	if err == nil {
 		t.Fatal("NodeStageVolume unexpectedly succeeded without a discovered device")
 	}
@@ -163,13 +196,115 @@ exit 1
 	}
 }
 
+func TestNodeStageRollsBackMountConnectionAndCreatedDirectory(t *testing.T) {
+	stagingPath := filepath.Join(t.TempDir(), "created-stage")
+	devicePath := filepath.Join(t.TempDir(), "nvme-test")
+	if err := os.WriteFile(devicePath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	disconnects := 0
+	unmounts := 0
+	server := &NodeServer{
+		nodeID: "distort-worker-1",
+		connectRDMA: func(context.Context, string, string, string, string) (bool, error) {
+			return true, nil
+		},
+		disconnectRDMA: func(context.Context, string) error {
+			disconnects++
+			return nil
+		},
+		getDeviceByNQN: func(context.Context, string) (string, error) { return devicePath, nil },
+		stageMount: func(context.Context, string, string, string) (bool, error) {
+			return true, errors.New("simulated failure after mount")
+		},
+		unstageMount: func(context.Context, string) error {
+			unmounts++
+			return nil
+		},
+	}
+	request := validNodeStageRequest(t, server.nodeID)
+	request.StagingTargetPath = stagingPath
+	_, err := server.NodeStageVolume(context.Background(), request)
+	if err == nil {
+		t.Fatal("NodeStageVolume unexpectedly succeeded")
+	}
+	if disconnects != 1 || unmounts != 1 {
+		t.Fatalf("rollback calls: disconnect=%d unmount=%d, want one each", disconnects, unmounts)
+	}
+	if _, err := os.Stat(stagingPath); !os.IsNotExist(err) {
+		t.Fatalf("created staging directory remains after rollback: %v", err)
+	}
+}
+
+func TestNodeStageCancellationDuringUdevWaitUsesIndependentRollbackContext(t *testing.T) {
+	disconnects := 0
+	server := &NodeServer{
+		nodeID: "distort-worker-1",
+		connectRDMA: func(context.Context, string, string, string, string) (bool, error) {
+			return true, nil
+		},
+		disconnectRDMA: func(ctx context.Context, _ string) error {
+			if ctx.Err() != nil {
+				t.Fatal("rollback inherited the canceled request context")
+			}
+			disconnects++
+			return nil
+		},
+		getDeviceByNQN:         func(context.Context, string) (string, error) { return "/dev/missing-test-device", nil },
+		devicePollInterval:     10 * time.Millisecond,
+		deviceDiscoveryTimeout: time.Second,
+	}
+	request := validNodeStageRequest(t, server.nodeID)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := server.NodeStageVolume(ctx, request)
+	requireCode(t, err, codes.Canceled)
+	if disconnects != 1 {
+		t.Fatalf("disconnect calls = %d, want 1", disconnects)
+	}
+}
+
+func TestNVMeConnectHonorsContextCancellation(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "nvme"), []byte("#!/usr/bin/env bash\nexec sleep 10\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	created, err := ConnectRDMA(ctx, "nqn.test:cancel", "192.0.2.10", "4420", hostNQNForNode("node-a"))
+	if err == nil || !created || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ConnectRDMA created=%t err=%v, want uncertain created connection and deadline", created, err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("canceled nvme command took %s", time.Since(started))
+	}
+}
+
 func TestExistingMountMustMatchExpectedSource(t *testing.T) {
-	knownfailure.Require(t, "F12")
-	if err := formatAndMount("/dev/definitely-not-root", "/", "ext4"); err == nil {
+	if _, err := formatAndMount(context.Background(), "/dev/definitely-not-root", "/", "ext4"); err == nil {
 		t.Fatal("formatAndMount accepted an existing mount with the wrong source")
 	}
 	if err := bindMount("/definitely-not-root", "/"); err == nil {
 		t.Fatal("bindMount accepted an existing bind target with the wrong source")
+	}
+}
+
+func validNodeStageRequest(t *testing.T, nodeID string) *csipb.NodeStageVolumeRequest {
+	t.Helper()
+	return &csipb.NodeStageVolumeRequest{
+		VolumeId:          "volume",
+		StagingTargetPath: t.TempDir(),
+		VolumeContext: map[string]string{
+			"nqn": "nqn.2026-01.io.distort:test", "portalIP": "192.0.2.10", "portalPort": "4420",
+		},
+		PublishContext: map[string]string{
+			publishContextNodeID:       nodeID,
+			publishContextHostNQN:      hostNQNForNode(nodeID),
+			publishContextAttachmentID: "attachment-id",
+		},
+		VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	}
 }
 

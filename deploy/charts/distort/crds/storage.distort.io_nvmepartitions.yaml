@@ -66,7 +66,12 @@ spec:
               accessMode:
                 description: AccessMode indicates the PVC access mode (e.g., ReadWriteOnce,
                   ReadOnlyMany).
+                enum:
+                - SINGLE_NODE_WRITER
                 type: string
+                x-kubernetes-validations:
+                - message: accessMode is immutable
+                  rule: self == oldSelf
               claimRef:
                 description: |-
                   ClaimRef identifies the exact live claim that authorized this allocation.
@@ -93,6 +98,16 @@ spec:
                   rule: self == oldSelf
                 - message: claimRef UID must not be empty
                   rule: size(self.uid) > 0
+              filesystem:
+                description: Filesystem is the canonical filesystem selected by the
+                  CSI request.
+                enum:
+                - ext4
+                - xfs
+                type: string
+                x-kubernetes-validations:
+                - message: filesystem is immutable
+                  rule: self == oldSelf
               nodeName:
                 description: |-
                   NodeName is the node where this partition should be created.
@@ -109,6 +124,14 @@ spec:
                 x-kubernetes-validations:
                 - message: parentDeviceSerialNumber is immutable after assignment
                   rule: self == oldSelf
+              requestFingerprint:
+                description: RequestFingerprint identifies all immutable CSI CreateVolume
+                  properties.
+                pattern: ^[a-f0-9]{64}$
+                type: string
+                x-kubernetes-validations:
+                - message: requestFingerprint is immutable
+                  rule: self == oldSelf
               size:
                 anyOf:
                 - type: integer
@@ -121,6 +144,8 @@ spec:
                     unit
                   rule: quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036853727232'))
                     <= 0
+                - message: size is immutable
+                  rule: self == oldSelf
               targetBackend:
                 default: spdk
                 description: TargetBackend specifies the export technology (e.g.,
@@ -129,6 +154,9 @@ spec:
                 - spdk
                 - kernel
                 type: string
+                x-kubernetes-validations:
+                - message: targetBackend is immutable
+                  rule: self == oldSelf
               targetOptions:
                 additionalProperties:
                   type: string
@@ -143,6 +171,8 @@ spec:
                     0x followed by hexadecimal digits
                   rule: '!(''spdk-core-mask'' in self) || (size(self[''spdk-core-mask''])
                     <= 258 && self[''spdk-core-mask''].matches(''^0x[0-9A-Fa-f]+$''))'
+                - message: targetOptions is immutable
+                  rule: self == oldSelf
               volumeManager:
                 default: partition
                 description: VolumeManager specifies the volume manager (e.g., "partition"
@@ -151,6 +181,9 @@ spec:
                 - partition
                 - lvm
                 type: string
+                x-kubernetes-validations:
+                - message: volumeManager is immutable
+                  rule: self == oldSelf
             required:
             - size
             type: object

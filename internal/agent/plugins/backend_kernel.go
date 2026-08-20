@@ -37,7 +37,7 @@ func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, devi
 	return nil
 }
 
-const nvmetPath = "/sys/kernel/config/nvmet"
+var nvmetPath = "/sys/kernel/config/nvmet"
 
 func isMountPoint(target string) bool {
 	target = filepath.Clean(target)
@@ -87,8 +87,8 @@ func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blo
 		return "", fmt.Errorf("failed to create subsystem %s: %w", subsysPath, err)
 	}
 
-	if err := os.WriteFile(filepath.Join(subsysPath, "attr_allow_any_host"), []byte("1"), 0644); err != nil {
-		return "", fmt.Errorf("failed to allow any host: %w", err)
+	if err := os.WriteFile(filepath.Join(subsysPath, "attr_allow_any_host"), []byte("0"), 0644); err != nil {
+		return "", fmt.Errorf("failed to disable unrestricted host access: %w", err)
 	}
 
 	// 2. Create Namespace (NSID 1)
@@ -133,6 +133,63 @@ func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blo
 	}
 
 	return nqn, nil
+}
+
+func (k *KernelBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	subsystemPath := filepath.Join(nvmetPath, "subsystems", nqn)
+	allowAnyPath := filepath.Join(subsystemPath, "attr_allow_any_host")
+	allowAny, err := os.ReadFile(allowAnyPath)
+	if err != nil {
+		return fmt.Errorf("read unrestricted host policy for %s: %w", nqn, err)
+	}
+	allowedHostsPath := filepath.Join(subsystemPath, "allowed_hosts")
+	entries, err := os.ReadDir(allowedHostsPath)
+	if err != nil {
+		return fmt.Errorf("list allowed hosts for %s: %w", nqn, err)
+	}
+	exact := strings.TrimSpace(string(allowAny)) == "0" && len(entries) <= 1
+	if hostNQN == "" {
+		exact = exact && len(entries) == 0
+	} else {
+		exact = exact && len(entries) == 1 && entries[0].Name() == hostNQN
+	}
+	if exact {
+		return nil
+	}
+
+	// Unlinking the subsystem from its port disconnects existing controllers.
+	// Keep it disconnected until every stale host has been removed.
+	linkPath := filepath.Join(nvmetPath, "ports", "1", "subsystems", nqn)
+	if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("disconnect subsystem %s before changing host access: %w", nqn, err)
+	}
+	if err := os.WriteFile(allowAnyPath, []byte("0"), 0644); err != nil {
+		return fmt.Errorf("disable unrestricted host access for %s: %w", nqn, err)
+	}
+	for _, entry := range entries {
+		if err := os.Remove(filepath.Join(allowedHostsPath, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale host %s from %s: %w", entry.Name(), nqn, err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if hostNQN != "" {
+		hostPath := filepath.Join(nvmetPath, "hosts", hostNQN)
+		if err := os.Mkdir(hostPath, 0755); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("create NVMe target host %s: %w", hostNQN, err)
+		}
+		if err := os.Symlink(hostPath, filepath.Join(allowedHostsPath, hostNQN)); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("authorize host %s for %s: %w", hostNQN, nqn, err)
+		}
+	}
+	if err := os.Symlink(subsystemPath, linkPath); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("reconnect subsystem %s after changing host access: %w", nqn, err)
+	}
+	return nil
 }
 
 func (k *KernelBackend) UnexportVolume(ctx context.Context, nqn string) error {

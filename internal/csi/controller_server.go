@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	attachmentidentity "distort/internal/attachment"
 	"distort/internal/capacity"
 	"distort/internal/storageoptions"
 	"distort/internal/volumeidentity"
@@ -29,6 +30,8 @@ type ControllerServer struct {
 	k8sClient                  client.Client
 	partitionReadyPollInterval time.Duration
 	partitionReadyTimeout      time.Duration
+	attachmentPollInterval     time.Duration
+	attachmentReadyTimeout     time.Duration
 }
 
 const defaultVolumeCapacityBytes int64 = 1024 * 1024 * 1024
@@ -247,6 +250,13 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		// replacement object which happens to reuse its namespace and name.
 		return &csi.DeleteVolumeResponse{}, nil
 	}
+	var attachment storagev1alpha1.NVMeVolumeAttachment
+	attachmentKey := types.NamespacedName{Namespace: partition.Namespace, Name: attachmentidentity.Name(partition.UID)}
+	if err := cs.k8sClient.Get(ctx, attachmentKey, &attachment); err == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume is still attached to node %q", attachment.Spec.NodeID)
+	} else if !apierrors.IsNotFound(err) {
+		return nil, status.Errorf(codes.Internal, "failed to check volume attachment: %v", err)
+	}
 	if err := cs.k8sClient.Delete(ctx, partition); err != nil && client.IgnoreNotFound(err) != nil {
 		klog.Errorf("Failed to delete NVMePartition %s: %v", key, err)
 		return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
@@ -327,7 +337,7 @@ func (cs *ControllerServer) waitForPartitionReady(ctx context.Context, name, nam
 	}
 }
 
-// ControllerGetCapabilities declares our supported capabilities (Create/Delete volume)
+// ControllerGetCapabilities declares our supported lifecycle capabilities.
 func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	return &csi.ControllerGetCapabilitiesResponse{
 		Capabilities: []*csi.ControllerServiceCapability{
@@ -335,6 +345,13 @@ func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *
 				Type: &csi.ControllerServiceCapability_Rpc{
 					Rpc: &csi.ControllerServiceCapability_RPC{
 						Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+					},
+				},
+			},
+			{
+				Type: &csi.ControllerServiceCapability_Rpc{
+					Rpc: &csi.ControllerServiceCapability_RPC{
+						Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 					},
 				},
 			},

@@ -6,6 +6,7 @@ resources:
 - bases/storage.distort.io_nvmedeviceclaims.yaml
 - bases/storage.distort.io_nvmepartitions.yaml
 - bases/storage.distort.io_rdmastoragenodes.yaml
+- bases/storage.distort.io_nvmevolumeattachments.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

@@ -472,6 +472,209 @@ spec:
 	})
 })
 
+var _ = Describe("Single-writer attachment fencing", Label("green", "F25", "csi", "spdk", "release-gate"), func() {
+	It("rejects a competing node and performs only an explicitly approved takeover", func() {
+		const (
+			claimName       = "regression-f25-claim"
+			storageClass    = "regression-f25-sc"
+			pvcName         = "regression-f25-pvc"
+			firstPod        = "regression-f25-a"
+			secondPod       = "regression-f25-b"
+			manualAttach    = "regression-f25-competing"
+			providerNode    = "distort-worker-1"
+			firstConsumer   = "distort-master"
+			secondConsumer  = "distort-worker-2"
+			forceAnnotation = "storage.distort.io/force-detach-node"
+		)
+
+		DeferCleanup(func() {
+			_, _ = kubectl("delete", "pod", firstPod, secondPod, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "volumeattachment", manualAttach, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "pvc", pvcName, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "storageclass", storageClass, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "nvmedeviceclaim", claimName, "--ignore-not-found", "--wait=false")
+		})
+
+		serial := serialForNode(providerNode)
+		_, err := applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: %s
+spec:
+  serialNumber: %s
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: %s
+provisioner: storage.distort.io
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  target-backend: spdk
+  volume-manager: partition
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: %s
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+  - name: consumer
+    image: busybox:1.36
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: %s
+`, claimName, serial, storageClass, pvcName, storageClass, firstPod, firstConsumer, pvcName))
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "pod", firstPod, "-o", "jsonpath={.status.phase}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Running"))
+		}, 240*time.Second, 5*time.Second).Should(Succeed())
+		_, err = kubectl("exec", firstPod, "--", "sh", "-c", "echo fenced-data > /data/f25.txt && sync")
+		Expect(err).NotTo(HaveOccurred())
+
+		pvName, err := kubectl("get", "pvc", pvcName, "-o", "jsonpath={.spec.volumeName}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(pvName)).NotTo(BeEmpty())
+		attachmentFields, err := kubectl("get", "nvmevolumeattachments", "-o",
+			`jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.nodeID}{" "}{.spec.hostNQN}{" "}{.spec.attachmentID}{"\n"}{end}`)
+		Expect(err).NotTo(HaveOccurred())
+		fields := strings.Fields(attachmentFields)
+		Expect(fields).To(HaveLen(5), "expected exactly one active DISTORT attachment, got %q", attachmentFields)
+		attachmentNamespace, attachmentName := fields[0], fields[1]
+		oldHostNQN, oldAttachmentID := fields[3], fields[4]
+		Expect(fields[2]).To(Equal(firstConsumer))
+
+		_, err = applyManifest(fmt.Sprintf(`
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttachment
+metadata:
+  name: %s
+spec:
+  attacher: storage.distort.io
+  nodeName: %s
+  source:
+    persistentVolumeName: %s
+`, manualAttach, secondConsumer, strings.TrimSpace(pvName)))
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Proving a competing node cannot acquire the single-writer attachment")
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "volumeattachment", manualAttach,
+				"-o", "jsonpath={.status.attachError.message}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(ContainSubstring("attached to node"))
+		}, 120*time.Second, 3*time.Second).Should(Succeed())
+		Consistently(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmevolumeattachment", "-n", attachmentNamespace, attachmentName,
+				"-o", "jsonpath={.spec.nodeID}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal(firstConsumer))
+		}, 15*time.Second, 2*time.Second).Should(Succeed())
+
+		By("Explicitly approving takeover only after the administrator has fenced the old node")
+		_, err = kubectl("annotate", "nvmevolumeattachment", "-n", attachmentNamespace, attachmentName,
+			forceAnnotation+"="+firstConsumer, "--overwrite")
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "volumeattachment", manualAttach, "-o", "jsonpath={.status.attached}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("true"))
+		}, 180*time.Second, 3*time.Second).Should(Succeed())
+
+		var newHostNQN string
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmevolumeattachment", "-n", attachmentNamespace, attachmentName,
+				"-o", `jsonpath={.spec.nodeID}{" "}{.spec.hostNQN}{" "}{.spec.attachmentID}{" "}{.status.conditions[?(@.type=="AccessReady")].status}`)
+			g.Expect(getErr).NotTo(HaveOccurred())
+			current := strings.Fields(out)
+			g.Expect(current).To(HaveLen(4))
+			g.Expect(current[0]).To(Equal(secondConsumer))
+			g.Expect(current[2]).NotTo(Equal(oldAttachmentID))
+			g.Expect(current[3]).To(Equal("True"))
+			newHostNQN = current[1]
+		}, 180*time.Second, 3*time.Second).Should(Succeed())
+		Expect(newHostNQN).NotTo(Equal(oldHostNQN))
+
+		partitionName, err := kubectl("get", "nvmevolumeattachment", "-n", attachmentNamespace, attachmentName,
+			"-o", "jsonpath={.spec.volumeRef.name}")
+		Expect(err).NotTo(HaveOccurred())
+		provider, err := kubectl("get", "nvmepartition", "-n", attachmentNamespace, partitionName,
+			"-o", "jsonpath={.spec.nodeName}")
+		Expect(err).NotTo(HaveOccurred())
+		agentPod, err := kubectl("get", "pod", "-n", "distort-system",
+			"-l", "app.kubernetes.io/component=agent", "--field-selector", "spec.nodeName="+provider,
+			"-o", "jsonpath={.items[0].metadata.name}")
+		Expect(err).NotTo(HaveOccurred())
+		subsystems, err := kubectl("exec", "-n", "distort-system", strings.TrimSpace(agentPod), "--",
+			"/opt/spdk/scripts/rpc.py", "nvmf_get_subsystems")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(subsystems).To(ContainSubstring(newHostNQN))
+		Expect(subsystems).NotTo(ContainSubstring(oldHostNQN))
+
+		By("Removing the stale consumer and proving its delayed unpublish cannot revoke the new owner")
+		_, err = kubectl("delete", "pod", firstPod, "--wait=true", "--timeout=120s")
+		Expect(err).NotTo(HaveOccurred())
+		Consistently(func(g Gomega) {
+			out, getErr := kubectl("get", "nvmevolumeattachment", "-n", attachmentNamespace, attachmentName,
+				"-o", "jsonpath={.spec.nodeID}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal(secondConsumer))
+		}, 15*time.Second, 2*time.Second).Should(Succeed())
+
+		_, err = applyManifest(fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
+  containers:
+  - name: consumer
+    image: busybox:1.36
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: %s
+`, secondPod, secondConsumer, pvcName))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			out, getErr := kubectl("get", "pod", secondPod, "-o", "jsonpath={.status.phase}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Running"))
+		}, 180*time.Second, 5*time.Second).Should(Succeed())
+		out, err := kubectl("exec", secondPod, "--", "cat", "/data/f25.txt")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(ContainSubstring("fenced-data"))
+	})
+})
+
 var _ = Describe("Review finding API and authorization regressions", Label("known-failure"), func() {
 	It("prevents the shared workload identity from mutating Nodes", Label("F18", "rbac"), func() {
 		requireKnownE2E("F18")

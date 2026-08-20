@@ -18,11 +18,11 @@ package controller
 
 import (
 	"context"
-	"os"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,14 +33,26 @@ import (
 )
 
 var _ = Describe("NVMeDeviceClaim lifecycle", func() {
-	const namespace = "default"
+	const (
+		namespace       = "default"
+		claimSuiteLabel = "claim"
+	)
 	ctx := context.Background()
 
 	AfterEach(func() {
+		var partitions storagev1alpha1.NVMePartitionList
+		Expect(k8sClient.List(ctx, &partitions, client.InNamespace(namespace))).To(Succeed())
+		for i := range partitions.Items {
+			if partitions.Items[i].Labels["test.distort.io/suite"] == claimSuiteLabel {
+				partitions.Items[i].Finalizers = nil
+				_ = k8sClient.Update(ctx, &partitions.Items[i])
+				_ = k8sClient.Delete(ctx, &partitions.Items[i])
+			}
+		}
 		var claims storagev1alpha1.NVMeDeviceClaimList
 		Expect(k8sClient.List(ctx, &claims, client.InNamespace(namespace))).To(Succeed())
 		for i := range claims.Items {
-			if claims.Items[i].Labels["test.distort.io/suite"] == "claim" {
+			if claims.Items[i].Labels["test.distort.io/suite"] == claimSuiteLabel {
 				claims.Items[i].Finalizers = nil
 				_ = k8sClient.Update(ctx, &claims.Items[i])
 				_ = k8sClient.Delete(ctx, &claims.Items[i])
@@ -49,7 +61,7 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 		var devices storagev1alpha1.NVMeDeviceList
 		Expect(k8sClient.List(ctx, &devices)).To(Succeed())
 		for i := range devices.Items {
-			if devices.Items[i].Labels["test.distort.io/suite"] == "claim" {
+			if devices.Items[i].Labels["test.distort.io/suite"] == claimSuiteLabel {
 				_ = k8sClient.Delete(ctx, &devices.Items[i])
 			}
 		}
@@ -57,7 +69,7 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 
 	createDevice := func(name, serial, node string, state storagev1alpha1.NVMeDeviceState) {
 		device := &storagev1alpha1.NVMeDevice{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"test.distort.io/suite": "claim"}},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"test.distort.io/suite": claimSuiteLabel}},
 			Spec: storagev1alpha1.NVMeDeviceSpec{
 				NodeName:      node,
 				PCIAddress:    "0000:02:00.0",
@@ -76,7 +88,7 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
 				Namespace: namespace,
-				Labels:    map[string]string{"test.distort.io/suite": "claim"},
+				Labels:    map[string]string{"test.distort.io/suite": claimSuiteLabel},
 			},
 			Spec: storagev1alpha1.NVMeDeviceClaimSpec{SerialNumber: serial},
 		})).To(Succeed())
@@ -136,7 +148,6 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 	})
 
 	It("requeues a claim when its hardware has not appeared yet", func() {
-		requireFinding("F13")
 		createClaim("claim-late-device", "late-serial")
 
 		result, err := reconcileClaim("claim-late-device")
@@ -145,7 +156,6 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 	})
 
 	It("refreshes an active claim after the device moves to another node", func() {
-		requireFinding("F13")
 		createDevice("claim-moving-device", "moving-serial", "node-old", storagev1alpha1.NVMeDeviceStateClaimed)
 		createClaim("claim-moving", "moving-serial")
 		var claim storagev1alpha1.NVMeDeviceClaim
@@ -169,7 +179,6 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 	})
 
 	It("does not release hardware now owned by a replacement claim", func() {
-		requireFinding("F14")
 		createDevice("claim-shared-device", "shared-serial", "node-a", storagev1alpha1.NVMeDeviceStateClaimed)
 		createClaim("claim-old", "shared-serial")
 		createClaim("claim-replacement", "shared-serial")
@@ -187,6 +196,14 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 
 		var old storagev1alpha1.NVMeDeviceClaim
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claim-old", Namespace: namespace}, &old)).To(Succeed())
+		var replacement storagev1alpha1.NVMeDeviceClaim
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claim-replacement", Namespace: namespace}, &replacement)).To(Succeed())
+		var ownedDevice storagev1alpha1.NVMeDevice
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claim-shared-device"}, &ownedDevice)).To(Succeed())
+		ownedDevice.Status.ClaimRef = &storagev1alpha1.NVMeDeviceClaimReference{
+			Namespace: replacement.Namespace, Name: replacement.Name, UID: replacement.UID,
+		}
+		Expect(k8sClient.Status().Update(ctx, &ownedDevice)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &old)).To(Succeed())
 		_, err := reconcileClaim("claim-old")
 		Expect(err).NotTo(HaveOccurred())
@@ -194,14 +211,77 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 		var device storagev1alpha1.NVMeDevice
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claim-shared-device"}, &device)).To(Succeed())
 		Expect(device.Status.State).To(Equal(storagev1alpha1.NVMeDeviceStateClaimed))
+		Expect(device.Status.ClaimRef.UID).To(Equal(replacement.UID))
+	})
+
+	It("fails closed when multiple available devices report the same serial", func() {
+		createDevice("claim-duplicate-a", "duplicate-serial", "node-a", storagev1alpha1.NVMeDeviceStateAvailable)
+		createDevice("claim-duplicate-b", "duplicate-serial", "node-b", storagev1alpha1.NVMeDeviceStateAvailable)
+		createClaim("claim-duplicate", "duplicate-serial")
+
+		result, err := reconcileClaim("claim-duplicate")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		var claim storagev1alpha1.NVMeDeviceClaim
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claim-duplicate", Namespace: namespace}, &claim)).To(Succeed())
+		Expect(claim.Status.Active).To(BeFalse())
+		condition := meta.FindStatusCondition(claim.Status.Conditions, claimBoundCondition)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Reason).To(Equal("AmbiguousDevices"))
+		for _, name := range []string{"claim-duplicate-a", "claim-duplicate-b"} {
+			var device storagev1alpha1.NVMeDevice
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name}, &device)).To(Succeed())
+			Expect(device.Status.ClaimRef).To(BeNil())
+		}
+	})
+
+	It("retains ownership but deactivates the claim while hardware is unavailable", func() {
+		createDevice("claim-missing-device", "missing-serial", "node-a", storagev1alpha1.NVMeDeviceStateUnavailable)
+		createClaim("claim-missing", "missing-serial")
+		var claim storagev1alpha1.NVMeDeviceClaim
+		key := types.NamespacedName{Name: "claim-missing", Namespace: namespace}
+		Expect(k8sClient.Get(ctx, key, &claim)).To(Succeed())
+		claim.Finalizers = []string{claimFinalizer}
+		Expect(k8sClient.Update(ctx, &claim)).To(Succeed())
+		claim.Status.Active = true
+		claim.Status.MatchedDevice = "claim-missing-device"
+		claim.Status.NodeName = "node-a"
+		Expect(k8sClient.Status().Update(ctx, &claim)).To(Succeed())
+		var device storagev1alpha1.NVMeDevice
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claim-missing-device"}, &device)).To(Succeed())
+		device.Status.ClaimRef = &storagev1alpha1.NVMeDeviceClaimReference{Namespace: namespace, Name: claim.Name, UID: claim.UID}
+		Expect(k8sClient.Status().Update(ctx, &device)).To(Succeed())
+
+		_, err := reconcileClaim(claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, &claim)).To(Succeed())
+		Expect(claim.Status.Active).To(BeFalse())
+		Expect(claim.Status.MatchedDevice).To(Equal(device.Name))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: device.Name}, &device)).To(Succeed())
+		Expect(device.Status.ClaimRef.UID).To(Equal(claim.UID))
+	})
+
+	It("keeps its finalizer while a dependent partition exists", func() {
+		createClaim("claim-with-partition", "partition-serial")
+		_, err := reconcileClaim("claim-with-partition")
+		Expect(err).NotTo(HaveOccurred())
+		var claim storagev1alpha1.NVMeDeviceClaim
+		key := types.NamespacedName{Name: "claim-with-partition", Namespace: namespace}
+		Expect(k8sClient.Get(ctx, key, &claim)).To(Succeed())
+		partition := &storagev1alpha1.NVMePartition{
+			ObjectMeta: metav1.ObjectMeta{Name: "claim-dependent", Namespace: namespace, Labels: map[string]string{"test.distort.io/suite": claimSuiteLabel}},
+			Spec: storagev1alpha1.NVMePartitionSpec{
+				Size: resource.MustParse("1Gi"), NodeName: "node-a", ParentDeviceSerialNumber: claim.Spec.SerialNumber,
+				ClaimRef: &storagev1alpha1.NVMeDeviceClaimReference{Namespace: namespace, Name: claim.Name, UID: claim.UID},
+			},
+		}
+		Expect(k8sClient.Create(ctx, partition)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &claim)).To(Succeed())
+
+		result, err := reconcileClaim(claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		Expect(k8sClient.Get(ctx, key, &claim)).To(Succeed())
+		Expect(claim.Finalizers).To(ContainElement(claimFinalizer))
 	})
 })
-
-func requireFinding(id string) {
-	if os.Getenv("DISTORT_RUN_KNOWN_FAILURES") != "1" {
-		Skip(id + " is a known defect")
-	}
-	if finding := os.Getenv("DISTORT_FINDING"); finding != "" && finding != id {
-		Skip(id + " is not selected")
-	}
-}

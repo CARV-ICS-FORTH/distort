@@ -19,8 +19,10 @@ import (
 
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/agent/plugins"
-	"distort/test/knownfailure"
+	attachmentidentity "distort/internal/attachment"
 )
+
+const testNQN = "nqn.test"
 
 type countingBackend struct {
 	setupCalls atomic.Int32
@@ -32,9 +34,29 @@ func (b *countingBackend) SetupDevice(context.Context, string, string, map[strin
 	return nil
 }
 func (b *countingBackend) ExportVolume(context.Context, string, string, string, int, map[string]string) (string, error) {
-	return "nqn.test", nil
+	return testNQN, nil
 }
-func (b *countingBackend) UnexportVolume(context.Context, string) error { return nil }
+func (b *countingBackend) UnexportVolume(context.Context, string) error              { return nil }
+func (b *countingBackend) ReconcileHostAccess(context.Context, string, string) error { return nil }
+
+type transientSetupBackend struct {
+	setupCalls atomic.Int32
+}
+
+func (b *transientSetupBackend) Name() string { return "transient-setup-backend" }
+func (b *transientSetupBackend) SetupDevice(context.Context, string, string, map[string]string) error {
+	if b.setupCalls.Add(1) == 1 {
+		return errors.New("temporary driver binding failure")
+	}
+	return nil
+}
+func (b *transientSetupBackend) ExportVolume(context.Context, string, string, string, int, map[string]string) (string, error) {
+	return testNQN, nil
+}
+func (b *transientSetupBackend) UnexportVolume(context.Context, string) error { return nil }
+func (b *transientSetupBackend) ReconcileHostAccess(context.Context, string, string) error {
+	return nil
+}
 
 type countingVolumeManager struct {
 	setupCalls atomic.Int32
@@ -62,12 +84,13 @@ func (b *namedTestBackend) SetupDevice(context.Context, string, string, map[stri
 	return nil
 }
 func (b *namedTestBackend) ExportVolume(context.Context, string, string, string, int, map[string]string) (string, error) {
-	return "nqn.test", nil
+	return testNQN, nil
 }
 func (b *namedTestBackend) UnexportVolume(context.Context, string) error {
 	b.unexportCalls.Add(1)
 	return nil
 }
+func (b *namedTestBackend) ReconcileHostAccess(context.Context, string, string) error { return nil }
 
 type recordingDeleteManager struct {
 	devicePath      string
@@ -142,8 +165,76 @@ func newPartitionManagerClient(t *testing.T, objects ...client.Object) client.Cl
 		t.Fatal(err)
 	}
 	return fake.NewClientBuilder().WithScheme(testScheme).
-		WithStatusSubresource(&storagev1alpha1.NVMeDevice{}, &storagev1alpha1.NVMePartition{}).
+		WithStatusSubresource(&storagev1alpha1.NVMeDevice{}, &storagev1alpha1.NVMePartition{}, &storagev1alpha1.NVMeVolumeAttachment{}).
 		WithObjects(objects...).Build()
+}
+
+type recordingHostAccessBackend struct{ hosts []string }
+
+func (b *recordingHostAccessBackend) Name() string { return "host-access-test" }
+func (b *recordingHostAccessBackend) SetupDevice(context.Context, string, string, map[string]string) error {
+	return nil
+}
+func (b *recordingHostAccessBackend) ExportVolume(context.Context, string, string, string, int, map[string]string) (string, error) {
+	return testNQN, nil
+}
+func (b *recordingHostAccessBackend) UnexportVolume(context.Context, string) error { return nil }
+func (b *recordingHostAccessBackend) ReconcileHostAccess(_ context.Context, _ string, host string) error {
+	b.hosts = append(b.hosts, host)
+	return nil
+}
+
+func TestPartitionManagerAuthorizesAndRevokesAttachmentHost(t *testing.T) {
+	partition := &storagev1alpha1.NVMePartition{
+		ObjectMeta: metav1.ObjectMeta{Name: "volume", Namespace: "default", UID: types.UID("11111111-1111-1111-1111-111111111111")},
+		Status:     storagev1alpha1.NVMePartitionStatus{NQN: "nqn.test:volume", State: storagev1alpha1.NVMePartitionStateExported},
+	}
+	attachment := &storagev1alpha1.NVMeVolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: attachmentidentity.Name(partition.UID), Namespace: partition.Namespace,
+			Finalizers: []string{attachmentidentity.Finalizer},
+		},
+		Spec: storagev1alpha1.NVMeVolumeAttachmentSpec{
+			VolumeRef:    storagev1alpha1.NVMeVolumeReference{Name: partition.Name, UID: string(partition.UID)},
+			NodeID:       "consumer-a",
+			HostNQN:      attachmentidentity.HostNQN("consumer-a"),
+			AttachmentID: "attachment-a",
+		},
+	}
+	testClient := newPartitionManagerClient(t, partition, attachment)
+	manager := &PartitionManager{Client: testClient, NodeName: "provider-a"}
+	backend := &recordingHostAccessBackend{}
+	if err := manager.reconcileAttachmentAccess(context.Background(), partition, backend); err != nil {
+		t.Fatalf("authorizing attachment: %v", err)
+	}
+	var ready storagev1alpha1.NVMeVolumeAttachment
+	key := client.ObjectKeyFromObject(attachment)
+	if err := testClient.Get(context.Background(), key, &ready); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(ready.Status.Conditions, attachmentidentity.AccessReadyCondition)
+	if ready.Status.ObservedAttachmentID != attachment.Spec.AttachmentID || condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("attachment was not marked ready: %#v", ready.Status)
+	}
+
+	if err := testClient.Delete(context.Background(), &ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := testClient.Get(context.Background(), key, &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.DeletionTimestamp.IsZero() {
+		t.Fatal("attachment did not enter deletion while fencing finalizer was present")
+	}
+	if err := manager.reconcileAttachmentAccess(context.Background(), partition, backend); err != nil {
+		t.Fatalf("revoking attachment: %v", err)
+	}
+	if len(backend.hosts) != 2 || backend.hosts[0] != attachment.Spec.HostNQN || backend.hosts[1] != "" {
+		t.Fatalf("host access transitions = %#v, want authorize then revoke", backend.hosts)
+	}
+	if err := testClient.Get(context.Background(), key, &ready); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment still exists after access revocation: %v", err)
+	}
 }
 
 func TestPartitionManagerRejectsUnclaimedDeviceBeforePluginCalls(t *testing.T) {
@@ -324,7 +415,6 @@ func TestPartitionManagerAcceptsMatchingLiveClaim(t *testing.T) {
 }
 
 func TestInvalidPluginConfigurationBecomesTerminalStatus(t *testing.T) {
-	knownfailure.Require(t, "F19")
 	partition := &storagev1alpha1.NVMePartition{
 		ObjectMeta: metav1.ObjectMeta{Name: "invalid-plugin", Namespace: "default"},
 		Spec: storagev1alpha1.NVMePartitionSpec{
@@ -347,6 +437,64 @@ func TestInvalidPluginConfigurationBecomesTerminalStatus(t *testing.T) {
 	}
 	if actual.Status.State != storagev1alpha1.NVMePartitionStateFailed {
 		t.Fatalf("state = %q, want Failed", actual.Status.State)
+	}
+	condition := meta.FindStatusCondition(actual.Status.Conditions, partitionProvisioningCondition)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "TerminalInvalidBackend" || condition.ObservedGeneration != actual.Generation {
+		t.Fatalf("provisioning condition = %#v, want terminal invalid-backend condition for the observed generation", condition)
+	}
+	result, err = reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace},
+	})
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("persisted terminal failure hot-looped, got result=%#v err=%v", result, err)
+	}
+}
+
+func TestRetryablePartitionFailureIsAttemptedAgain(t *testing.T) {
+	backend := &transientSetupBackend{}
+	manager := &countingVolumeManager{}
+	plugins.RegisterTargetBackend(backend)
+	plugins.RegisterVolumeManager(manager)
+	claim := &storagev1alpha1.NVMeDeviceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "retry-owner", Namespace: "default", UID: types.UID("retry-claim-uid")},
+		Spec:       storagev1alpha1.NVMeDeviceClaimSpec{SerialNumber: "RETRY-SERIAL"},
+		Status: storagev1alpha1.NVMeDeviceClaimStatus{
+			Active: true, MatchedDevice: "node-a-retry-serial", NodeName: "node-a",
+		},
+	}
+	claimRef := &storagev1alpha1.NVMeDeviceClaimReference{Namespace: claim.Namespace, Name: claim.Name, UID: claim.UID}
+	device := &storagev1alpha1.NVMeDevice{
+		ObjectMeta: metav1.ObjectMeta{Name: claim.Status.MatchedDevice},
+		Spec: storagev1alpha1.NVMeDeviceSpec{
+			NodeName: "node-a", PCIAddress: "0000:01:00.0", SerialNumber: claim.Spec.SerialNumber,
+			TotalCapacity: resource.MustParse("1Gi"),
+		},
+		Status: storagev1alpha1.NVMeDeviceStatus{State: storagev1alpha1.NVMeDeviceStateClaimed, ClaimRef: claimRef},
+	}
+	partition := &storagev1alpha1.NVMePartition{
+		ObjectMeta: metav1.ObjectMeta{Name: "retry-volume", Namespace: "default"},
+		Spec: storagev1alpha1.NVMePartitionSpec{
+			Size: resource.MustParse("100Mi"), NodeName: "node-a", ParentDeviceSerialNumber: claim.Spec.SerialNumber,
+			ClaimRef: claimRef, TargetBackend: backend.Name(), VolumeManager: manager.Name(),
+		},
+	}
+	testClient := newPartitionManagerClient(t, claim, device, partition)
+	reconciler := &PartitionManager{Client: testClient, NodeName: "node-a"}
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(partition)}
+	if _, err := reconciler.Reconcile(context.Background(), request); err == nil {
+		t.Fatal("temporary SetupDevice failure unexpectedly returned nil")
+	}
+	var failed storagev1alpha1.NVMePartition
+	if err := testClient.Get(context.Background(), request.NamespacedName, &failed); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(failed.Status.Conditions, partitionProvisioningCondition)
+	if condition == nil || condition.Reason != "RetryableDeviceSetupFailed" {
+		t.Fatalf("provisioning condition = %#v, want retryable setup failure", condition)
+	}
+	_, _ = reconciler.Reconcile(context.Background(), request)
+	if calls := backend.setupCalls.Load(); calls != 2 {
+		t.Fatalf("SetupDevice calls = %d, want retry after transient failure", calls)
 	}
 }
 

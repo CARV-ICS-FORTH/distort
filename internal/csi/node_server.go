@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +22,174 @@ import (
 
 type NodeServer struct {
 	csi.UnimplementedNodeServer
-	nodeID string
+	nodeID                 string
+	connectRDMA            func(context.Context, string, string, string, string) (bool, error)
+	disconnectRDMA         func(context.Context, string) error
+	getDeviceByNQN         func(context.Context, string) (string, error)
+	pathStat               func(string) (os.FileInfo, error)
+	mkdirAll               func(string, os.FileMode) error
+	removePath             func(string) error
+	stageMount             func(context.Context, string, string, string) (bool, error)
+	unstageMount           func(context.Context, string) error
+	devicePollInterval     time.Duration
+	deviceDiscoveryTimeout time.Duration
+}
+
+const (
+	publishContextNodeID       = "attachedNodeID"
+	publishContextHostNQN      = "hostNQN"
+	publishContextAttachmentID = "attachmentID"
+)
+
+type validatedNodeStageRequest struct {
+	volumeID          string
+	stagingTargetPath string
+	nqn               string
+	portalIP          string
+	portalPort        string
+	hostNQN           string
+	filesystem        string
+}
+
+func (ns *NodeServer) validateNodeStageRequest(req *csi.NodeStageVolumeRequest) (validatedNodeStageRequest, error) {
+	if req.GetVolumeId() == "" {
+		return validatedNodeStageRequest{}, status.Error(codes.InvalidArgument, "Volume ID must be provided")
+	}
+	stagingTargetPath := req.GetStagingTargetPath()
+	if stagingTargetPath == "" || !filepath.IsAbs(stagingTargetPath) || filepath.Clean(stagingTargetPath) == "/" {
+		return validatedNodeStageRequest{}, status.Error(codes.InvalidArgument, "Staging target path must be a non-root absolute path")
+	}
+	capability, err := validateVolumeCapabilities(req.GetVolumeContext(), []*csi.VolumeCapability{req.GetVolumeCapability()})
+	if err != nil {
+		return validatedNodeStageRequest{}, status.Errorf(codes.InvalidArgument, "Invalid volume capability: %v", err)
+	}
+	volumeContext := req.GetVolumeContext()
+	nqn := strings.TrimSpace(volumeContext["nqn"])
+	portalIP := strings.TrimSpace(volumeContext["portalIP"])
+	portalPort := strings.TrimSpace(volumeContext["portalPort"])
+	if nqn == "" {
+		return validatedNodeStageRequest{}, status.Error(codes.InvalidArgument, "Volume context NQN must be provided")
+	}
+	parsedIP := net.ParseIP(portalIP)
+	if parsedIP == nil || parsedIP.IsLoopback() || parsedIP.IsUnspecified() || parsedIP.IsMulticast() {
+		return validatedNodeStageRequest{}, status.Errorf(codes.InvalidArgument, "Volume context portalIP %q is not a usable remote IP", portalIP)
+	}
+	port, err := strconv.Atoi(portalPort)
+	if err != nil || port < 1 || port > 65535 {
+		return validatedNodeStageRequest{}, status.Errorf(codes.InvalidArgument, "Volume context portalPort %q is invalid", portalPort)
+	}
+	publishContext := req.GetPublishContext()
+	attachedNodeID := strings.TrimSpace(publishContext[publishContextNodeID])
+	hostNQN := strings.TrimSpace(publishContext[publishContextHostNQN])
+	attachmentID := strings.TrimSpace(publishContext[publishContextAttachmentID])
+	if ns.nodeID == "" || attachedNodeID != ns.nodeID {
+		return validatedNodeStageRequest{}, status.Errorf(codes.FailedPrecondition,
+			"Volume attachment belongs to node %q, not this node %q", attachedNodeID, ns.nodeID)
+	}
+	if attachmentID == "" || hostNQN != hostNQNForNode(ns.nodeID) {
+		return validatedNodeStageRequest{}, status.Error(codes.FailedPrecondition, "Volume attachment authorization is missing or invalid")
+	}
+	return validatedNodeStageRequest{
+		volumeID:          req.GetVolumeId(),
+		stagingTargetPath: filepath.Clean(stagingTargetPath),
+		nqn:               nqn,
+		portalIP:          portalIP,
+		portalPort:        strconv.Itoa(port),
+		hostNQN:           hostNQN,
+		filesystem:        capability.Filesystem,
+	}, nil
+}
+
+func nodeOperationError(ctx context.Context, message string, err error) error {
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	return status.Errorf(codes.Internal, "%s: %v", message, err)
+}
+
+func (ns *NodeServer) connect(ctx context.Context, nqn, ip, port, hostNQN string) (bool, error) {
+	if ns.connectRDMA != nil {
+		return ns.connectRDMA(ctx, nqn, ip, port, hostNQN)
+	}
+	return ConnectRDMA(ctx, nqn, ip, port, hostNQN)
+}
+
+func (ns *NodeServer) disconnect(ctx context.Context, nqn string) error {
+	if ns.disconnectRDMA != nil {
+		return ns.disconnectRDMA(ctx, nqn)
+	}
+	return DisconnectRDMA(ctx, nqn)
+}
+
+func (ns *NodeServer) findDevice(ctx context.Context, nqn string) (string, error) {
+	if ns.getDeviceByNQN != nil {
+		return ns.getDeviceByNQN(ctx, nqn)
+	}
+	return GetDeviceByNQN(ctx, nqn)
+}
+
+func (ns *NodeServer) statPath(path string) (os.FileInfo, error) {
+	if ns.pathStat != nil {
+		return ns.pathStat(path)
+	}
+	return os.Stat(path)
+}
+
+func (ns *NodeServer) createDirectory(path string, mode os.FileMode) error {
+	if ns.mkdirAll != nil {
+		return ns.mkdirAll(path, mode)
+	}
+	return os.MkdirAll(path, mode)
+}
+
+func (ns *NodeServer) remove(path string) error {
+	if ns.removePath != nil {
+		return ns.removePath(path)
+	}
+	return os.Remove(path)
+}
+
+func (ns *NodeServer) mountStage(ctx context.Context, source, target, filesystem string) (bool, error) {
+	if ns.stageMount != nil {
+		return ns.stageMount(ctx, source, target, filesystem)
+	}
+	return formatAndMount(ctx, source, target, filesystem)
+}
+
+func (ns *NodeServer) unmount(ctx context.Context, target string) error {
+	if ns.unstageMount != nil {
+		return ns.unstageMount(ctx, target)
+	}
+	return unmount(ctx, target)
+}
+
+func (ns *NodeServer) waitForDevice(ctx context.Context, path string) error {
+	pollInterval := ns.devicePollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+	timeoutDuration := ns.deviceDiscoveryTimeout
+	if timeoutDuration <= 0 {
+		timeoutDuration = 5 * time.Second
+	}
+	timer := time.NewTimer(timeoutDuration)
+	defer timer.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		if _, err := ns.statPath(path); err == nil {
+			return nil
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timed out waiting for %s", path)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (ns *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
@@ -44,66 +213,77 @@ func (ns *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 }
 
 func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	volID := req.GetVolumeId()
-	if volID == "" {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
-	}
-
-	volCtx := req.GetVolumeContext()
-	capability, err := validateVolumeCapabilities(volCtx, []*csi.VolumeCapability{req.GetVolumeCapability()})
+	stage, err := ns.validateNodeStageRequest(req)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume capability: %v", err)
+		return nil, err
 	}
 
-	// Extract the connection details we placed in CreateVolume
-	nqn := volCtx["nqn"]
-	portalIP := volCtx["portalIP"]
-	portalPort := volCtx["portalPort"]
+	klog.Infof("NodeStageVolume: Connecting to NVMe-oF target. NQN=%s Portal=%s:%s", stage.nqn, stage.portalIP, stage.portalPort)
 
-	klog.Infof("NodeStageVolume: Connecting to NVMe-oF target. NQN=%s Portal=%s:%s", nqn, portalIP, portalPort)
-
-	// 1. Connect via RDMA
-	if err := ConnectRDMA(nqn, portalIP, portalPort); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to connect to NVMe-oF target: %v", err)
+	createdDirectory := false
+	if _, statErr := ns.statPath(stage.stagingTargetPath); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return nil, status.Errorf(codes.Internal, "Failed to inspect staging target path: %v", statErr)
+		}
+		if err := ns.createDirectory(stage.stagingTargetPath, 0750); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to create staging target path: %v", err)
+		}
+		createdDirectory = true
 	}
 
-	// 2. Find the local block device
-	// It may take a moment for udev to populate the device, but `nvme list-subsys` should work soon after connect
-	devPath, err := GetDeviceByNQN(nqn)
+	createdConnection, err := ns.connect(ctx, stage.nqn, stage.portalIP, stage.portalPort, stage.hostNQN)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to locate block device for NQN %s: %v", nqn, err)
-	}
-
-	// Wait for udev to create the block device node
-	for range 10 {
-		if _, err := os.Stat(devPath); err == nil {
-			break
+		if createdConnection {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			_ = ns.disconnect(cleanupCtx, stage.nqn)
+			cancel()
 		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	if _, err := os.Stat(devPath); err != nil {
-		return nil, status.Errorf(codes.Internal, "Block device %s did not appear in time: %v", devPath, err)
-	}
-
-	klog.Infof("Mapped NQN %s to local block device %s", nqn, devPath)
-
-	// 3. Mount the device to req.GetStagingTargetPath()
-	stagingTargetPath := req.GetStagingTargetPath()
-	if stagingTargetPath == "" {
-		return nil, status.Error(codes.InvalidArgument, "Staging target path must be provided")
-	}
-
-	klog.Infof("Staging volume %s (device %s) to %s", volID, devPath, stagingTargetPath)
-
-	if err := formatAndMount(devPath, stagingTargetPath, capability.Filesystem); err != nil {
-		var mismatch *filesystemMismatchError
-		if errors.As(err, &mismatch) {
-			return nil, status.Error(codes.FailedPrecondition, mismatch.Error())
+		if createdDirectory {
+			_ = ns.remove(stage.stagingTargetPath)
 		}
-		return nil, status.Errorf(codes.Internal, "Failed to format and mount: %v", err)
+		return nil, nodeOperationError(ctx, "Failed to connect to NVMe-oF target", err)
+	}
+	mountedByCall := false
+	succeeded := false
+	defer func() {
+		if succeeded {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if mountedByCall {
+			_ = ns.unmount(cleanupCtx, stage.stagingTargetPath)
+		}
+		if createdConnection {
+			_ = ns.disconnect(cleanupCtx, stage.nqn)
+		}
+		if createdDirectory {
+			_ = ns.remove(stage.stagingTargetPath)
+		}
+	}()
+
+	devPath, err := ns.findDevice(ctx, stage.nqn)
+	if err != nil {
+		return nil, nodeOperationError(ctx, fmt.Sprintf("Failed to locate block device for NQN %s", stage.nqn), err)
+	}
+	if err := ns.waitForDevice(ctx, devPath); err != nil {
+		return nil, nodeOperationError(ctx, fmt.Sprintf("Block device %s did not appear", devPath), err)
 	}
 
+	klog.Infof("Mapped NQN %s to local block device %s", stage.nqn, devPath)
+	klog.Infof("Staging volume %s (device %s) to %s", stage.volumeID, devPath, stage.stagingTargetPath)
+
+	mountedByCall, err = ns.mountStage(ctx, devPath, stage.stagingTargetPath, stage.filesystem)
+	if err != nil {
+		var filesystemMismatch *filesystemMismatchError
+		var mountMismatch *mountMismatchError
+		if errors.As(err, &filesystemMismatch) || errors.As(err, &mountMismatch) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return nil, nodeOperationError(ctx, "Failed to format and mount", err)
+	}
+
+	succeeded = true
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -162,8 +342,12 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	klog.Infof("NodePublishVolume: ID=%s Source=%s Target=%s", volID, source, target)
 
-	if err := publishBindMount(source, target, req.GetReadonly()); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	if err := publishBindMount(ctx, source, target, req.GetReadonly()); err != nil {
+		var mismatch *mountMismatchError
+		if errors.As(err, &mismatch) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return nil, nodeOperationError(ctx, "Failed to bind mount", err)
 	}
 
 	klog.Infof("Bind mounted %s to %s", source, target)
@@ -189,25 +373,8 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 }
 
 func isMountPoint(target string) (bool, error) {
-	target = filepath.Clean(target)
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		data, err = os.ReadFile("/proc/mounts")
-		if err != nil {
-			return false, err
-		}
-	}
-	lines := strings.SplitSeq(string(data), "\n")
-	for line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 5 {
-			mountPoint := filepath.Clean(fields[4])
-			if mountPoint == target {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
+	record, err := mountAt(target)
+	return record != nil, err
 }
 
 type filesystemMismatchError struct {
@@ -220,37 +387,62 @@ func (e *filesystemMismatchError) Error() string {
 	return fmt.Sprintf("Block device %s contains %s, but %s was requested; refusing to format or mount it", e.source, e.detected, e.requested)
 }
 
-func formatAndMount(source, target, fsType string) error {
-	_ = os.MkdirAll(target, 0750)
+type mountMismatchError struct{ message string }
 
-	mounted, err := isMountPoint(target)
-	if err == nil && mounted {
-		klog.Infof("Target %s is already mounted", target)
-		return nil
+func (e *mountMismatchError) Error() string { return e.message }
+
+func formatAndMount(ctx context.Context, source, target, fsType string) (bool, error) {
+	if err := os.MkdirAll(target, 0750); err != nil {
+		return false, err
 	}
 
-	if err := ensureFilesystem(source, fsType, probeFilesystem, formatFilesystem); err != nil {
-		return err
+	mounted, err := verifyStagingMount(source, target, fsType)
+	if err != nil {
+		return false, &mountMismatchError{message: err.Error()}
+	}
+	if mounted {
+		klog.Infof("Target %s is already mounted from expected block device", target)
+		return false, nil
+	}
+
+	if err := ensureFilesystemContext(ctx, source, fsType, probeFilesystem, formatFilesystem); err != nil {
+		return false, err
 	}
 
 	klog.Infof("Mounting %s as %s to %s", source, fsType, target)
-	mountCmd := exec.Command("mount", "-t", fsType, source, target)
+	mountCmd := exec.CommandContext(ctx, "mount", "-t", fsType, source, target)
 	if out, mountErr := mountCmd.CombinedOutput(); mountErr != nil {
-		if strings.Contains(string(out), "already mounted") {
-			return nil
+		if ctx.Err() != nil {
+			return false, fmt.Errorf("mount interrupted: %w", ctx.Err())
 		}
-		return fmt.Errorf("mount failed: %v, output: %s", mountErr, string(out))
+		return false, fmt.Errorf("mount failed: %v, output: %s", mountErr, string(out))
 	}
-	return nil
+	mounted, err = verifyStagingMount(source, target, fsType)
+	if err != nil || !mounted {
+		_ = unmount(ctx, target)
+		if err == nil {
+			err = fmt.Errorf("target is not mounted after mount command succeeded")
+		}
+		return false, &mountMismatchError{message: err.Error()}
+	}
+	return true, nil
 }
 
 func ensureFilesystem(source, requested string, probe func(string) (string, error), format func(string, string) error) error {
-	detected, err := probe(source)
+	return ensureFilesystemContext(context.Background(), source, requested,
+		func(_ context.Context, path string) (string, error) { return probe(path) },
+		func(_ context.Context, path, filesystem string) error { return format(path, filesystem) })
+}
+
+func ensureFilesystemContext(ctx context.Context, source, requested string,
+	probe func(context.Context, string) (string, error), format func(context.Context, string, string) error,
+) error {
+	detected, err := probe(ctx, source)
 	if err != nil {
 		return fmt.Errorf("probing filesystem on %s: %w", source, err)
 	}
 	if detected == "" {
-		return format(source, requested)
+		return format(ctx, source, requested)
 	}
 	if normalizeFilesystem(detected) != requested {
 		return &filesystemMismatchError{source: source, requested: requested, detected: detected}
@@ -259,28 +451,34 @@ func ensureFilesystem(source, requested string, probe func(string) (string, erro
 	return nil
 }
 
-func probeFilesystem(source string) (string, error) {
-	cmd := exec.Command("blkid", "-p", "-s", "TYPE", "-o", "value", source)
+func probeFilesystem(ctx context.Context, source string) (string, error) {
+	cmd := exec.CommandContext(ctx, "blkid", "-p", "-s", "TYPE", "-o", "value", source)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return normalizeFilesystem(string(out)), nil
 	}
 
 	var exitErr *exec.ExitError
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("blkid interrupted: %w", ctx.Err())
+	}
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
 		return "", nil
 	}
 	return "", fmt.Errorf("blkid failed: %w, output: %s", err, strings.TrimSpace(string(out)))
 }
 
-func formatFilesystem(source, fsType string) error {
+func formatFilesystem(ctx context.Context, source, fsType string) error {
 	command, args, err := filesystemFormatCommand(source, fsType)
 	if err != nil {
 		return err
 	}
 
 	klog.Infof("Formatting %s as %s", source, fsType)
-	if out, err := exec.Command(command, args...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, command, args...).CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("formatting interrupted: %w", ctx.Err())
+		}
 		return fmt.Errorf("formatting %s as %s failed: %w, output: %s", source, fsType, err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -298,30 +496,46 @@ func filesystemFormatCommand(source, fsType string) (string, []string, error) {
 }
 
 func bindMount(source, target string) error {
-	return publishBindMount(source, target, false)
+	return publishBindMount(context.Background(), source, target, false)
 }
 
-func publishBindMount(source, target string, readOnly bool) error {
-	_ = os.MkdirAll(target, 0750)
-
-	mounted, err := isMountPoint(target)
-	if err == nil && mounted {
-		klog.Infof("Target %s is already bind mounted", target)
-	} else {
-		cmd := exec.Command("mount", "--bind", source, target)
-		if out, mountErr := cmd.CombinedOutput(); mountErr != nil {
-			if !strings.Contains(string(out), "already mounted") {
-				return fmt.Errorf("bind mount failed: %v, output: %s", mountErr, string(out))
-			}
-		}
+func publishBindMount(ctx context.Context, source, target string, readOnly bool) error {
+	if err := os.MkdirAll(target, 0750); err != nil {
+		return err
 	}
-	if !readOnly {
+
+	mounted, err := verifyPublishedMount(source, target, readOnly)
+	if err != nil {
+		return &mountMismatchError{message: err.Error()}
+	}
+	if mounted {
+		klog.Infof("Target %s is already bind mounted from expected source", target)
 		return nil
 	}
-	cmd := exec.Command("mount", "-o", "remount,bind,ro", target)
-	if out, remountErr := cmd.CombinedOutput(); remountErr != nil {
-		_, _ = exec.Command("umount", target).CombinedOutput()
-		return fmt.Errorf("read-only bind remount failed: %v, output: %s", remountErr, string(out))
+	cmd := exec.CommandContext(ctx, "mount", "--bind", source, target)
+	if out, mountErr := cmd.CombinedOutput(); mountErr != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("bind mount interrupted: %w", ctx.Err())
+		}
+		return fmt.Errorf("bind mount failed: %v, output: %s", mountErr, string(out))
+	}
+	if readOnly {
+		cmd = exec.CommandContext(ctx, "mount", "-o", "remount,bind,ro", target)
+		if out, remountErr := cmd.CombinedOutput(); remountErr != nil {
+			_ = unmount(ctx, target)
+			if ctx.Err() != nil {
+				return fmt.Errorf("read-only bind remount interrupted: %w", ctx.Err())
+			}
+			return fmt.Errorf("read-only bind remount failed: %v, output: %s", remountErr, string(out))
+		}
+	}
+	mounted, err = verifyPublishedMount(source, target, readOnly)
+	if err != nil || !mounted {
+		_ = unmount(ctx, target)
+		if err == nil {
+			err = fmt.Errorf("target is not mounted after bind command succeeded")
+		}
+		return &mountMismatchError{message: err.Error()}
 	}
 	return nil
 }

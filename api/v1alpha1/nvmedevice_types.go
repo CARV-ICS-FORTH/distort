@@ -29,6 +29,8 @@ const (
 	NVMeDeviceStateAvailable NVMeDeviceState = "Available"
 	// NVMeDeviceStateClaimed means the device has been claimed by an admin.
 	NVMeDeviceStateClaimed NVMeDeviceState = "Claimed"
+	// NVMeDeviceStateUnavailable means the device is no longer visible to its reporting agent.
+	NVMeDeviceStateUnavailable NVMeDeviceState = "Unavailable"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -64,7 +66,7 @@ type NVMeDeviceSpec struct {
 // NVMeDeviceStatus defines the observed state of NVMeDevice.
 type NVMeDeviceStatus struct {
 	// State represents the current lifecycle state of the device.
-	// +kubebuilder:validation:Enum=Available;Claimed
+	// +kubebuilder:validation:Enum=Available;Claimed;Unavailable
 	// +kubebuilder:default=Available
 	State NVMeDeviceState `json:"state,omitempty"`
 

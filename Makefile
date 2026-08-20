@@ -171,6 +171,8 @@ test-env-deploy: test-env-guard manifests ## Build/load the image and Helm-upgra
 		(cd vagrant && vagrant ssh "$$node" -c "sudo k3s ctr images import /vagrant/distort-img.tar"); \
 	done
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) apply -f config/crd/bases/
+	# CSIDriver.spec.attachRequired is immutable; recreate the isolated lab registration when upgrading fencing behavior.
+	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete csidriver storage.distort.io --ignore-not-found --wait=true --timeout=60s
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set-string image.repository="$(TEST_ENV_IMAGE_REPOSITORY)" --set-string image.tag="$(TEST_ENV_IMAGE_TAG)" --set-string agent.spdk.iobufSmallPoolCount=4096 --set-string agent.spdk.iobufLargePoolCount=256 --set-string agent.spdk.maxSrqDepth=128 --set agent.spdk.skipHugepageSetup=true --set-string agent.resources.requests.memory=256Mi --set-string agent.resources.limits.memory=512Mi --set-string agent.resources.requests.hugepages-2Mi=256Mi --set-string agent.resources.limits.hugepages-2Mi=256Mi
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system deployment/distort-manager deployment/distort-csi-controller
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system daemonset/distort-agent daemonset/distort-csi-node

@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	attachmentidentity "distort/internal/attachment"
 	"distort/internal/capacity"
 	"distort/internal/volumeidentity"
 	"distort/test/knownfailure"
@@ -37,7 +39,21 @@ func (c *immediatelyExportingClient) Create(ctx context.Context, obj client.Obje
 	}
 	partition, ok := obj.(*storagev1alpha1.NVMePartition)
 	if !ok {
-		return nil
+		attachment, attachmentOK := obj.(*storagev1alpha1.NVMeVolumeAttachment)
+		if !attachmentOK {
+			return nil
+		}
+		var stored storagev1alpha1.NVMeVolumeAttachment
+		key := types.NamespacedName{Name: attachment.Name, Namespace: attachment.Namespace}
+		if err := c.Get(ctx, key, &stored); err != nil {
+			return err
+		}
+		stored.Status.ObservedAttachmentID = stored.Spec.AttachmentID
+		meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{
+			Type: attachmentidentity.AccessReadyCondition, Status: metav1.ConditionTrue,
+			Reason: "TestTargetReady", Message: "Test target authorized host access",
+		})
+		return c.Client.Status().Update(ctx, &stored)
 	}
 	var stored storagev1alpha1.NVMePartition
 	key := types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace}
@@ -63,6 +79,16 @@ func (c *immediatelyExportingClient) Create(ctx context.Context, obj client.Obje
 	return c.Client.Status().Update(ctx, &stored)
 }
 
+func (c *immediatelyExportingClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*storagev1alpha1.NVMeVolumeAttachment); ok && len(obj.GetFinalizers()) != 0 {
+		obj.SetFinalizers(nil)
+		if err := c.Update(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
 func newControllerTestServer(t *testing.T) (*ControllerServer, client.Client) {
 	t.Helper()
 	testScheme := runtime.NewScheme()
@@ -71,13 +97,15 @@ func newControllerTestServer(t *testing.T) (*ControllerServer, client.Client) {
 	}
 	baseClient := fake.NewClientBuilder().
 		WithScheme(testScheme).
-		WithStatusSubresource(&storagev1alpha1.NVMePartition{}).
+		WithStatusSubresource(&storagev1alpha1.NVMePartition{}, &storagev1alpha1.NVMeVolumeAttachment{}).
 		Build()
 	readyClient := &immediatelyExportingClient{Client: baseClient}
 	return &ControllerServer{
 		k8sClient:                  readyClient,
 		partitionReadyPollInterval: time.Millisecond,
 		partitionReadyTimeout:      time.Second,
+		attachmentPollInterval:     time.Millisecond,
+		attachmentReadyTimeout:     time.Second,
 	}, readyClient
 }
 
@@ -368,6 +396,87 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 	}
 	if response.GetConfirmed() != nil || response.GetMessage() == "" {
 		t.Fatalf("unsupported capabilities were confirmed: %#v", response)
+	}
+}
+
+func TestControllerAttachmentFencesCompetingNodesAndRequiresExplicitTakeover(t *testing.T) {
+	server, k8sClient := newControllerTestServer(t)
+	created, err := server.CreateVolume(context.Background(), validCreateRequest("fenced-volume", "team-a"))
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	volumeID := created.Volume.VolumeId
+	capability := mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	publish := func(node string) (*csipb.ControllerPublishVolumeResponse, error) {
+		return server.ControllerPublishVolume(context.Background(), &csipb.ControllerPublishVolumeRequest{
+			VolumeId: volumeID, NodeId: node, VolumeCapability: capability,
+			VolumeContext: created.Volume.VolumeContext,
+		})
+	}
+
+	first, err := publish("consumer-a")
+	if err != nil {
+		t.Fatalf("first ControllerPublishVolume: %v", err)
+	}
+	retry, err := publish("consumer-a")
+	if err != nil {
+		t.Fatalf("idempotent ControllerPublishVolume: %v", err)
+	}
+	if retry.PublishContext[publishContextAttachmentID] != first.PublishContext[publishContextAttachmentID] {
+		t.Fatalf("idempotent retry changed attachment ID: first=%#v retry=%#v", first.PublishContext, retry.PublishContext)
+	}
+	_, err = publish("consumer-b")
+	requireCode(t, err, codes.FailedPrecondition)
+
+	reference, err := volumeidentity.ParseVolumeHandle(volumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: attachmentidentity.Name(reference.UID)}
+	var attachment storagev1alpha1.NVMeVolumeAttachment
+	if err := k8sClient.Get(context.Background(), key, &attachment); err != nil {
+		t.Fatal(err)
+	}
+	base := attachment.DeepCopy()
+	if attachment.Annotations == nil {
+		attachment.Annotations = map[string]string{}
+	}
+	attachment.Annotations[attachmentidentity.ForceDetachAnnotation] = "consumer-a"
+	if err := k8sClient.Patch(context.Background(), &attachment, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := publish("consumer-b")
+	if err != nil {
+		t.Fatalf("forced ControllerPublishVolume: %v", err)
+	}
+	if second.PublishContext[publishContextAttachmentID] == first.PublishContext[publishContextAttachmentID] {
+		t.Fatal("forced takeover reused the old attachment ID")
+	}
+	if second.PublishContext[publishContextHostNQN] != hostNQNForNode("consumer-b") {
+		t.Fatalf("unexpected replacement host NQN: %#v", second.PublishContext)
+	}
+
+	// A delayed unpublish from the stale owner must not release its replacement.
+	if _, err := server.ControllerUnpublishVolume(context.Background(), &csipb.ControllerUnpublishVolumeRequest{
+		VolumeId: volumeID, NodeId: "consumer-a",
+	}); err != nil {
+		t.Fatalf("stale ControllerUnpublishVolume: %v", err)
+	}
+	if err := k8sClient.Get(context.Background(), key, &attachment); err != nil || attachment.Spec.NodeID != "consumer-b" {
+		t.Fatalf("stale unpublish removed replacement attachment: attachment=%#v err=%v", attachment.Spec, err)
+	}
+
+	if _, err := server.DeleteVolume(context.Background(), &csipb.DeleteVolumeRequest{VolumeId: volumeID}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("DeleteVolume while attached error = %v, want FailedPrecondition", err)
+	}
+	if _, err := server.ControllerUnpublishVolume(context.Background(), &csipb.ControllerUnpublishVolumeRequest{
+		VolumeId: volumeID, NodeId: "consumer-b",
+	}); err != nil {
+		t.Fatalf("ControllerUnpublishVolume: %v", err)
+	}
+	if err := k8sClient.Get(context.Background(), key, &attachment); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment still exists after unpublish: %v", err)
 	}
 }
 

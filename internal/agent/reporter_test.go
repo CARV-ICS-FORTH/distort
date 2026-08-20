@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,6 +56,87 @@ func TestReporterPublishesNodeInternalIPAndCapacity(t *testing.T) {
 	if actual.Status.TotalCapacity.Cmp(*resource.NewQuantity(4*1024*1024, resource.BinarySI)) != 0 ||
 		actual.Status.FreeCapacity.Cmp(*resource.NewQuantity(3*1024*1024, resource.BinarySI)) != 0 {
 		t.Fatalf("unexpected reported capacity: %#v", actual.Status)
+	}
+}
+
+func TestReporterMarksMissingHardwareUnavailableWithoutReleasingItsClaim(t *testing.T) {
+	claimRef := &storagev1alpha1.NVMeDeviceClaimReference{Namespace: "default", Name: "claim", UID: "claim-uid"}
+	device := &storagev1alpha1.NVMeDevice{
+		ObjectMeta: metav1.ObjectMeta{Name: "distort-worker-1-serial-1"},
+		Spec: storagev1alpha1.NVMeDeviceSpec{
+			NodeName: "distort-worker-1", PCIAddress: "0000:01:00.0", SerialNumber: "SERIAL-1",
+			TotalCapacity: resource.MustParse("1Gi"),
+		},
+		Status: storagev1alpha1.NVMeDeviceStatus{State: storagev1alpha1.NVMeDeviceStateClaimed, ClaimRef: claimRef},
+	}
+	reporter := newReporterTestClient(t, device)
+	reporter.discoverDevices = func() ([]HardwareNVMe, error) { return nil, nil }
+	reporter.reportDevices(context.Background())
+
+	var actual storagev1alpha1.NVMeDevice
+	if err := reporter.Get(context.Background(), types.NamespacedName{Name: device.Name}, &actual); err != nil {
+		t.Fatal(err)
+	}
+	if actual.Status.State != storagev1alpha1.NVMeDeviceStateUnavailable || actual.Status.ClaimRef == nil || actual.Status.ClaimRef.UID != claimRef.UID {
+		t.Fatalf("missing device status = %#v, want Unavailable with ownership retained", actual.Status)
+	}
+	condition := meta.FindStatusCondition(actual.Status.Conditions, hardwareAvailableCondition)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "DeviceNotDiscovered" {
+		t.Fatalf("hardware condition = %#v, want False/DeviceNotDiscovered", condition)
+	}
+}
+
+func TestReporterRefreshesAndReactivatesRediscoveredHardware(t *testing.T) {
+	claimRef := &storagev1alpha1.NVMeDeviceClaimReference{Namespace: "default", Name: "claim", UID: "claim-uid"}
+	device := &storagev1alpha1.NVMeDevice{
+		ObjectMeta: metav1.ObjectMeta{Name: "distort-worker-1-serial-1"},
+		Spec: storagev1alpha1.NVMeDeviceSpec{
+			NodeName: "distort-worker-1", PCIAddress: "0000:01:00.0", SerialNumber: "SERIAL-1",
+			TotalCapacity: resource.MustParse("1Gi"),
+		},
+		Status: storagev1alpha1.NVMeDeviceStatus{State: storagev1alpha1.NVMeDeviceStateUnavailable, ClaimRef: claimRef},
+	}
+	reporter := newReporterTestClient(t, device)
+	reporter.discoverDevices = func() ([]HardwareNVMe, error) {
+		return []HardwareNVMe{{Name: "nvme2", PCIAddress: "0000:03:00.0", SerialNumber: "SERIAL-1", Model: "new-model", TotalBytes: 2 << 30, NUMANode: 1}}, nil
+	}
+	reporter.reportDevices(context.Background())
+
+	var actual storagev1alpha1.NVMeDevice
+	if err := reporter.Get(context.Background(), types.NamespacedName{Name: device.Name}, &actual); err != nil {
+		t.Fatal(err)
+	}
+	if actual.Spec.PCIAddress != "0000:03:00.0" || actual.Spec.Model != "new-model" || actual.Spec.TotalCapacity.Value() != 2<<30 || actual.Spec.NUMANode != 1 {
+		t.Fatalf("hardware metadata was not refreshed: %#v", actual.Spec)
+	}
+	if actual.Status.State != storagev1alpha1.NVMeDeviceStateClaimed || actual.Status.ClaimRef == nil {
+		t.Fatalf("rediscovered device status = %#v, want Claimed with ownership retained", actual.Status)
+	}
+	condition := meta.FindStatusCondition(actual.Status.Conditions, hardwareAvailableCondition)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("hardware condition = %#v, want True", condition)
+	}
+}
+
+func TestReporterDoesNotMarkHardwareMissingWhenDiscoveryFails(t *testing.T) {
+	device := &storagev1alpha1.NVMeDevice{
+		ObjectMeta: metav1.ObjectMeta{Name: "distort-worker-1-serial-1"},
+		Spec: storagev1alpha1.NVMeDeviceSpec{
+			NodeName: "distort-worker-1", PCIAddress: "0000:01:00.0", SerialNumber: "SERIAL-1",
+			TotalCapacity: resource.MustParse("1Gi"),
+		},
+		Status: storagev1alpha1.NVMeDeviceStatus{State: storagev1alpha1.NVMeDeviceStateAvailable},
+	}
+	reporter := newReporterTestClient(t, device)
+	reporter.discoverDevices = func() ([]HardwareNVMe, error) { return nil, errors.New("temporary discovery failure") }
+	reporter.reportDevices(context.Background())
+
+	var actual storagev1alpha1.NVMeDevice
+	if err := reporter.Get(context.Background(), types.NamespacedName{Name: device.Name}, &actual); err != nil {
+		t.Fatal(err)
+	}
+	if actual.Status.State != storagev1alpha1.NVMeDeviceStateAvailable {
+		t.Fatalf("discovery failure changed device state to %q", actual.Status.State)
 	}
 }
 

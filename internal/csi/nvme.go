@@ -45,20 +45,27 @@ type NVMEHostList []struct {
 	Subsystems []NVMESubsystem `json:"Subsystems"`
 }
 
-// ConnectRDMA connects to an NVMe-oF RDMA target.
-func ConnectRDMA(nqn, portalIP, portalPort string) error {
+// ConnectRDMA connects to an NVMe-oF RDMA target and reports whether this call
+// created the connection. An already-connected target is left owned by the
+// earlier staging operation and must not be disconnected during rollback.
+func ConnectRDMA(ctx context.Context, nqn, portalIP, portalPort, hostNQN string) (bool, error) {
 	klog.Infof("Executing nvme connect -t rdma -a %s -s %s -n %s", portalIP, portalPort, nqn)
 
-	cmd := exec.Command("nvme", "connect", "-t", "rdma", "-a", portalIP, "-s", portalPort, "-n", nqn)
+	cmd := exec.CommandContext(ctx, "nvme", "connect", "-t", "rdma", "-a", portalIP, "-s", portalPort, "-n", nqn, "--hostnqn", hostNQN)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			// The command may have reached the target before cancellation. Report an
+			// uncertain new connection so the staging transaction revokes it.
+			return true, fmt.Errorf("nvme connect interrupted: %w", ctx.Err())
+		}
 		if strings.Contains(string(out), "already connected") {
 			klog.Infof("NVMe target %s is already connected", nqn)
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("nvme connect failed: %v, output: %s", err, string(out))
+		return true, fmt.Errorf("nvme connect failed: %v, output: %s", err, string(out))
 	}
-	return nil
+	return true, nil
 }
 
 // DisconnectRDMA disconnects from an NVMe-oF target by NQN.
@@ -81,10 +88,13 @@ func DisconnectRDMA(ctx context.Context, nqn string) error {
 }
 
 // GetDeviceByNQN finds the block device (e.g., /dev/nvmeXn1) associated with an NQN.
-func GetDeviceByNQN(nqn string) (string, error) {
-	cmd := exec.Command("nvme", "list-subsys", "-o", "json")
+func GetDeviceByNQN(ctx context.Context, nqn string) (string, error) {
+	cmd := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("nvme list-subsys interrupted: %w", ctx.Err())
+		}
 		return "", fmt.Errorf("nvme list-subsys failed: %v, output: %s", err, string(out))
 	}
 

@@ -341,9 +341,6 @@ spec:
 				Expect(err).NotTo(HaveOccurred())
 
 				By("Recreating the consumer Pod")
-				// The driver currently uses attachRequired=false and has no
-				// ControllerPublish fencing. Exercise a graceful restart on the
-				// same remote consumer node, not an unsupported forced migration.
 				cmd = exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--wait=true", "--timeout=120s")
 				_, err = utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred())

@@ -40,6 +40,7 @@ func TestRepositoryContainsRequiredDistributionArtifacts(t *testing.T) {
 		"config/crd/bases/storage.distort.io_nvmedevices.yaml",
 		"config/crd/bases/storage.distort.io_nvmedeviceclaims.yaml",
 		"config/crd/bases/storage.distort.io_nvmepartitions.yaml",
+		"config/crd/bases/storage.distort.io_nvmevolumeattachments.yaml",
 		"config/crd/bases/storage.distort.io_rdmastoragenodes.yaml",
 	}
 	for _, path := range paths {
@@ -49,6 +50,25 @@ func TestRepositoryContainsRequiredDistributionArtifacts(t *testing.T) {
 				t.Fatalf("required artifact %s is missing or empty: %v", path, err)
 			}
 		})
+	}
+}
+
+func TestChartEnablesControllerAttachmentFencing(t *testing.T) {
+	driver := readRepositoryFile(t, "deploy/charts/distort/templates/csidriver.yaml")
+	if !regexp.MustCompile(`(?m)^\s*attachRequired:\s*true\s*$`).MatchString(driver) {
+		t.Fatal("CSIDriver must require ControllerPublishVolume before node staging")
+	}
+
+	controller := readRepositoryFile(t, "deploy/charts/distort/templates/csi-controller.yaml")
+	if !strings.Contains(controller, "name: csi-attacher") {
+		t.Fatal("CSI controller deployment has no external-attacher sidecar")
+	}
+
+	rbac := readRepositoryFile(t, "deploy/charts/distort/templates/rbac.yaml")
+	for _, resource := range []string{"nvmevolumeattachments", "nvmevolumeattachments/status", "volumeattachments", "volumeattachments/status"} {
+		if !strings.Contains(rbac, "- "+resource) {
+			t.Errorf("chart RBAC does not include %s", resource)
+		}
 	}
 }
 

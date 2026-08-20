@@ -4,40 +4,21 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: nvmedevices.storage.distort.io
+  name: nvmevolumeattachments.storage.distort.io
 spec:
   group: storage.distort.io
   names:
-    kind: NVMeDevice
-    listKind: NVMeDeviceList
-    plural: nvmedevices
-    singular: nvmedevice
-  scope: Cluster
+    kind: NVMeVolumeAttachment
+    listKind: NVMeVolumeAttachmentList
+    plural: nvmevolumeattachments
+    singular: nvmevolumeattachment
+  scope: Namespaced
   versions:
-  - additionalPrinterColumns:
-    - description: Node where attached
-      jsonPath: .spec.nodeName
-      name: Node
-      type: string
-    - description: PCIe Address
-      jsonPath: .spec.pciAddress
-      name: PCI
-      type: string
-    - description: Total Capacity
-      jsonPath: .spec.totalCapacity
-      name: Capacity
-      type: string
-    - description: Device State
-      jsonPath: .status.state
-      name: State
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: NVMeDevice is the Schema for the nvmedevices API
+        description: NVMeVolumeAttachment is the durable single-writer fencing record
+          for a volume.
         properties:
           apiVersion:
             description: |-
@@ -57,75 +38,56 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of NVMeDevice
+            description: Spec defines the desired attachment owner.
             properties:
-              model:
-                description: Model is the model name/number of the NVMe device.
+              attachmentID:
+                description: AttachmentID distinguishes this attachment lifetime from
+                  every retry or takeover.
+                minLength: 1
                 type: string
-              nodeName:
-                description: NodeName is the name of the Kubernetes node where the
-                  device is attached.
+              hostNQN:
+                description: HostNQN is the deterministic NVMe host identity authorized
+                  by the target.
+                pattern: ^nqn\.2026-01\.io\.distort:host-[a-f0-9]{32}$
                 type: string
-              numaNode:
-                description: NUMANode indicates the NUMA topology node the device
-                  is connected to.
-                type: integer
-              pciAddress:
-                description: PCIAddress is the PCIe address of the NVMe controller
-                  (e.g., "0000:01:00.0").
+              nodeID:
+                description: NodeID is the CSI node which exclusively owns the attachment.
+                maxLength: 253
+                minLength: 1
                 type: string
-              serialNumber:
-                description: SerialNumber is the device's hardware serial number.
-                  Used for claim matching.
-                type: string
-              totalCapacity:
-                anyOf:
-                - type: integer
-                - type: string
-                description: TotalCapacity is the total raw size of the device.
-                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                x-kubernetes-int-or-string: true
-            required:
-            - nodeName
-            - pciAddress
-            - serialNumber
-            - totalCapacity
-            type: object
-          status:
-            description: status defines the observed state of NVMeDevice
-            properties:
-              activeBackend:
-                description: ActiveBackend tracks which target technology currently
-                  owns this controller ("spdk", "kernel", or "none").
-                type: string
-              claimRef:
-                description: ClaimRef identifies the exact active claim that owns
-                  this device.
+              volumeRef:
+                description: VolumeRef identifies the exact partition being attached.
                 properties:
                   name:
-                    description: Name is the name of the claim.
-                    minLength: 1
-                    type: string
-                  namespace:
-                    description: Namespace is the namespace containing the claim.
+                    description: Name is the partition name in the attachment namespace.
                     minLength: 1
                     type: string
                   uid:
-                    description: UID is the immutable Kubernetes UID of the claim.
+                    description: UID prevents a deleted partition name from authorizing
+                      its replacement.
+                    minLength: 1
                     type: string
                 required:
                 - name
-                - namespace
                 - uid
                 type: object
-                x-kubernetes-validations:
-                - message: claimRef is immutable
-                  rule: self == oldSelf
-                - message: claimRef UID must not be empty
-                  rule: size(self.uid) > 0
+            required:
+            - attachmentID
+            - hostNQN
+            - nodeID
+            - volumeRef
+            type: object
+            x-kubernetes-validations:
+            - message: attachment ownership is immutable; delete and recreate the
+                attachment to change nodes
+              rule: self == oldSelf
+          status:
+            description: Status reports whether the provider target has applied the
+              attachment.
+            properties:
               conditions:
-                description: Conditions represent the current state of the NVMeDevice
-                  resource.
+                description: Conditions report whether target access is ready or being
+                  revoked.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -184,21 +146,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              freeCapacity:
-                anyOf:
-                - type: integer
-                - type: string
-                description: FreeCapacity is the remaining unallocated capacity on
-                  the device.
-                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                x-kubernetes-int-or-string: true
-              state:
-                default: Available
-                description: State represents the current lifecycle state of the device.
-                enum:
-                - Available
-                - Claimed
-                - Unavailable
+              observedAttachmentID:
+                description: ObservedAttachmentID is set only after the provider target
+                  authorizes HostNQN.
                 type: string
             type: object
         required:

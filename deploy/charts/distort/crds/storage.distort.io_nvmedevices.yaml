@@ -198,6 +198,7 @@ spec:
                 enum:
                 - Available
                 - Claimed
+                - Unavailable
                 type: string
             type: object
         required:
