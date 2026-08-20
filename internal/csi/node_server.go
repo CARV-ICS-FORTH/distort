@@ -50,6 +50,10 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	volCtx := req.GetVolumeContext()
+	capability, err := validateVolumeCapabilities(volCtx, []*csi.VolumeCapability{req.GetVolumeCapability()})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume capability: %v", err)
+	}
 
 	// Extract the connection details we placed in CreateVolume
 	nqn := volCtx["nqn"]
@@ -92,12 +96,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	klog.Infof("Staging volume %s (device %s) to %s", volID, devPath, stagingTargetPath)
 
-	fsType, err := resolveFilesystem(volCtx, []*csi.VolumeCapability{req.GetVolumeCapability()})
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Invalid filesystem configuration: %v", err)
-	}
-
-	if err := formatAndMount(devPath, stagingTargetPath, fsType); err != nil {
+	if err := formatAndMount(devPath, stagingTargetPath, capability.Filesystem); err != nil {
 		var mismatch *filesystemMismatchError
 		if errors.As(err, &mismatch) {
 			return nil, status.Error(codes.FailedPrecondition, mismatch.Error())
@@ -154,10 +153,16 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	volID := req.GetVolumeId()
 	source := req.GetStagingTargetPath()
 	target := req.GetTargetPath()
+	if volID == "" || source == "" || target == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID, staging target path, and target path must be provided")
+	}
+	if _, err := validateVolumeCapabilities(req.GetVolumeContext(), []*csi.VolumeCapability{req.GetVolumeCapability()}); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume capability: %v", err)
+	}
 
 	klog.Infof("NodePublishVolume: ID=%s Source=%s Target=%s", volID, source, target)
 
-	if err := bindMount(source, target); err != nil {
+	if err := publishBindMount(source, target, req.GetReadonly()); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
@@ -169,6 +174,9 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	started := time.Now()
 	volID := req.GetVolumeId()
 	target := req.GetTargetPath()
+	if volID == "" || target == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID and target path must be provided")
+	}
 
 	klog.Infof("NodeUnpublishVolume: ID=%s Target=%s", volID, target)
 
@@ -290,20 +298,30 @@ func filesystemFormatCommand(source, fsType string) (string, []string, error) {
 }
 
 func bindMount(source, target string) error {
+	return publishBindMount(source, target, false)
+}
+
+func publishBindMount(source, target string, readOnly bool) error {
 	_ = os.MkdirAll(target, 0750)
 
 	mounted, err := isMountPoint(target)
 	if err == nil && mounted {
 		klog.Infof("Target %s is already bind mounted", target)
+	} else {
+		cmd := exec.Command("mount", "--bind", source, target)
+		if out, mountErr := cmd.CombinedOutput(); mountErr != nil {
+			if !strings.Contains(string(out), "already mounted") {
+				return fmt.Errorf("bind mount failed: %v, output: %s", mountErr, string(out))
+			}
+		}
+	}
+	if !readOnly {
 		return nil
 	}
-
-	cmd := exec.Command("mount", "--bind", source, target)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(out), "already mounted") {
-			return nil
-		}
-		return fmt.Errorf("bind mount failed: %v, output: %s", err, string(out))
+	cmd := exec.Command("mount", "-o", "remount,bind,ro", target)
+	if out, remountErr := cmd.CombinedOutput(); remountErr != nil {
+		_, _ = exec.Command("umount", target).CombinedOutput()
+		return fmt.Errorf("read-only bind remount failed: %v, output: %s", remountErr, string(out))
 	}
 	return nil
 }

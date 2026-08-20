@@ -254,7 +254,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 8. Fail kernel partition creation when the command or udev fails
 
-- [ ] **F8 — High — Confirmed**
+- [x] **F8 — High — Resolved**
 - Affected: `internal/agent/plugins/vol_partition.go`
 - Problem: `parted mkpart` errors are logged and ignored. The udev wait returns a device path even when it never appeared.
 - Required fix:
@@ -263,10 +263,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Verify the resulting partition boundaries and size before export.
 - Regression tests:
   - `parted` failure, missing executable, insufficient capacity, udev timeout, and context cancellation.
+- Resolution:
+  - Kernel volume creation now returns `parted` failures immediately, including a missing executable, and rejects requests that do not fit a current free extent.
+  - The udev wait polls for the exact partition block node, honors context cancellation, and returns a clear timeout when the node never appears.
+  - After `mkpart`, the manager re-reads the GPT and requires the new partition number, ownership label, byte boundaries, and capacity to exactly match the allocation before returning it for export. Existing labeled partitions must also match the requested rounded capacity.
+- Verification (2026-08-20): focused tests passed for `mkpart` failure, missing executable, insufficient capacity, missing block node, cancellation, shifted boundaries, and capacity rounding. The combined F8–F10 regression, full host/static suite, and race suite passed.
 
 ### 9. Complete CSI CreateVolume validation and idempotency
 
-- [ ] **F9 — High — Confirmed known limitation**
+- [x] **F9 — High — Resolved**
 - Affected:
   - `internal/csi/controller_server.go`
   - `internal/csi/filesystem.go`
@@ -279,10 +284,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 - Regression tests:
   - Compatible identical retry.
   - Conflict on size, limits, manager, filesystem, capabilities, access mode, and target options.
+- Resolution:
+  - CreateVolume canonicalizes the requested capacity bounds, target backend, volume manager, backend options, filesystem, and supported volume capability, then persists a SHA-256 fingerprint with the human-readable access mode and filesystem.
+  - An identical retry reuses the existing partition. A retry whose valid immutable properties differ returns `AlreadyExists`; unsupported capabilities are rejected earlier with `InvalidArgument`.
+  - CRD transition validation makes the persisted request properties immutable. Legacy partitions without a fingerprint fail closed rather than being silently reused with unverifiable properties.
+- Verification (2026-08-20): CSI regressions passed for identical retries and conflicts in required size, capacity limit, manager, filesystem, and target options. Capability and access-mode differences are covered by F10 validation. The combined F8–F10 regression, full host/static suite, and race suite passed.
 
 ### 10. Reject unsupported CSI capabilities and honor read-only publication
 
-- [ ] **F10 — High — Confirmed**
+- [x] **F10 — High — Resolved**
 - Affected:
   - `internal/csi/controller_server.go`
   - `internal/csi/node_server.go`
@@ -294,6 +304,11 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   4. Enforce read-only bind-remount semantics when requested.
 - Regression tests:
   - RWO mount, raw block, ROX, RWX, conflicting capabilities, read-only publish, and unsupported mount flags.
+- Resolution:
+  - A shared capability validator is used by CreateVolume, ValidateVolumeCapabilities, NodeStageVolume, and NodePublishVolume. It currently accepts only filesystem mounts with `SINGLE_NODE_WRITER`, rejects raw block and multi-node modes, rejects conflicting filesystems, and rejects mount flags until their semantics are implemented.
+  - Node publish validates its required fields and capability. Read-only requests first create the bind mount and then remount it with `remount,bind,ro`; a failed read-only remount removes the bind mount rather than leaving writable publication behind.
+  - ValidateVolumeCapabilities confirms supported requests and returns an explanatory unconfirmed response for unsupported combinations.
+- Verification (2026-08-20): controller and node regressions passed for supported RWO mounts, raw block, ROX, RWX, conflicting capabilities, mount flags, required publish fields, and the two-step read-only bind remount. The combined F8–F10 regression, full host/static suite, and race suite passed.
 
 ### 11. Validate NodeStageVolume before side effects and roll back failures
 

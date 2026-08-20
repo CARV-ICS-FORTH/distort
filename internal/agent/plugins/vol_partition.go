@@ -159,6 +159,13 @@ func partitionsNamed(partitions []partedPartition, name string) []partedPartitio
 	return matches
 }
 
+func partitionCapacity(partition partedPartition) (int64, error) {
+	if partition.start < 0 || partition.end < partition.start {
+		return 0, fmt.Errorf("partition p%d has invalid boundaries %dB-%dB", partition.number, partition.start, partition.end)
+	}
+	return partition.end - partition.start + 1, nil
+}
+
 func partitionPath(devicePath string, number int) string {
 	return fmt.Sprintf("%sp%d", devicePath, number)
 }
@@ -227,13 +234,21 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 		return VolumeIdentity{}, fmt.Errorf("multiple physical partitions claim ownership by volume %q", volumeName)
 	}
 	if len(existing) == 1 {
+		capacityBytes, capacityErr := partitionCapacity(existing[0])
+		if capacityErr != nil {
+			return VolumeIdentity{}, capacityErr
+		}
+		if capacityBytes != allocatedBytes {
+			return VolumeIdentity{}, fmt.Errorf("existing partition p%d owned by %q has capacity %d bytes, expected %d bytes",
+				existing[0].number, volumeName, capacityBytes, allocatedBytes)
+		}
 		path := partitionPath(devicePath, existing[0].number)
 		if err := waitForPartition(ctx, path); err != nil {
 			return VolumeIdentity{}, err
 		}
 		return VolumeIdentity{
 			BackendVolumeID: path,
-			CapacityBytes:   existing[0].end - existing[0].start + 1,
+			CapacityBytes:   capacityBytes,
 			VolumeName:      volumeName,
 		}, nil
 	}
@@ -260,13 +275,25 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 	if created[0].number != partitionNumber {
 		return VolumeIdentity{}, fmt.Errorf("partition-number allocation raced: created p%d for %q, expected reusable p%d", created[0].number, volumeName, partitionNumber)
 	}
+	if created[0].start != start || created[0].end != end {
+		return VolumeIdentity{}, fmt.Errorf("partition p%d boundaries are %dB-%dB after creation, expected %dB-%dB",
+			partitionNumber, created[0].start, created[0].end, start, end)
+	}
+	capacityBytes, err := partitionCapacity(created[0])
+	if err != nil {
+		return VolumeIdentity{}, err
+	}
+	if capacityBytes != allocatedBytes {
+		return VolumeIdentity{}, fmt.Errorf("partition p%d capacity is %d bytes after creation, expected %d bytes",
+			partitionNumber, capacityBytes, allocatedBytes)
+	}
 	path := partitionPath(devicePath, partitionNumber)
 	if err := waitForPartition(ctx, path); err != nil {
 		return VolumeIdentity{}, err
 	}
 	return VolumeIdentity{
 		BackendVolumeID: path,
-		CapacityBytes:   created[0].end - created[0].start + 1,
+		CapacityBytes:   capacityBytes,
 		VolumeName:      volumeName,
 	}, nil
 }

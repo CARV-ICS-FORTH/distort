@@ -4,14 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"distort/test/knownfailure"
 )
 
 func writeTestExecutable(t *testing.T, directory, name, body string) string {
@@ -112,11 +111,13 @@ func TestPartedVolumesDoNotAliasPartitionOne(t *testing.T) {
 }
 
 type fakePartedDisk struct {
-	devicePath  string
-	size        int64
-	initialized bool
-	partitions  []partedPartition
-	wipeCalls   int
+	devicePath             string
+	size                   int64
+	initialized            bool
+	partitions             []partedPartition
+	wipeCalls              int
+	createdStartAdjustment int64
+	mkpartErr              error
 }
 
 func installFakePartedDisk(t *testing.T) *fakePartedDisk {
@@ -125,6 +126,7 @@ func installFakePartedDisk(t *testing.T) *fakePartedDisk {
 	oldParted := executeParted
 	oldWipefs := executeWipefs
 	oldStat := partitionPathStat
+	oldPollPeriod := partitionPollPeriod
 	oldPollCount := partitionPollCount
 	executeParted = disk.runParted
 	executeWipefs = func(context.Context, string) ([]byte, error) {
@@ -137,6 +139,7 @@ func installFakePartedDisk(t *testing.T) *fakePartedDisk {
 		executeParted = oldParted
 		executeWipefs = oldWipefs
 		partitionPathStat = oldStat
+		partitionPollPeriod = oldPollPeriod
 		partitionPollCount = oldPollCount
 		partitionDeviceLocks.Delete(disk.devicePath)
 	})
@@ -156,6 +159,9 @@ func (d *fakePartedDisk) runParted(_ context.Context, args ...string) ([]byte, e
 			d.partitions = nil
 			return nil, nil
 		case "mkpart":
+			if d.mkpartErr != nil {
+				return []byte("simulated mkpart failure"), d.mkpartErr
+			}
 			name := args[index+1]
 			start, err := parseByteField(args[index+2])
 			if err != nil {
@@ -165,6 +171,7 @@ func (d *fakePartedDisk) runParted(_ context.Context, args ...string) ([]byte, e
 			if err != nil {
 				return nil, err
 			}
+			start += d.createdStartAdjustment
 			number := lowestAvailablePartitionNumber(d.partitions)
 			d.partitions = append(d.partitions, partedPartition{number: number, start: start, end: end, name: name})
 			return nil, nil
@@ -205,15 +212,74 @@ func (d *fakePartedDisk) table(includeFree bool) string {
 }
 
 func TestPartedCreateReturnsCommandFailure(t *testing.T) {
-	knownfailure.Require(t, "F8")
-	fakeBin := t.TempDir()
-	writeTestExecutable(t, fakeBin, "parted", "touch \"${4}p1\"\nexit 17")
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+	disk.mkpartErr = &exec.ExitError{}
 
-	device := filepath.Join(t.TempDir(), "nvme0n1")
-	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), device, "nvme0", "broken", 64*1024*1024)
-	if err == nil {
-		t.Fatal("CreateVolume returned success after parted exited with status 17")
+	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), disk.devicePath, "nvme0", "broken", 64*1024*1024)
+	if err == nil || !strings.Contains(err.Error(), "simulated mkpart failure") {
+		t.Fatalf("CreateVolume error = %v, want mkpart command failure", err)
+	}
+}
+
+func TestPartedCreateReturnsMissingExecutableFailure(t *testing.T) {
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+	executeParted = func(ctx context.Context, args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, "distort-parted-does-not-exist", args...).CombinedOutput()
+	}
+
+	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), disk.devicePath, "nvme0", "missing", 64*1024*1024)
+	if err == nil || !strings.Contains(err.Error(), "executable file not found") {
+		t.Fatalf("CreateVolume error = %v, want missing executable failure", err)
+	}
+}
+
+func TestPartedCreateRejectsInsufficientCapacity(t *testing.T) {
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+
+	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), disk.devicePath, "nvme0", "too-large", 2*disk.size)
+	if err == nil || !strings.Contains(err.Error(), "no free extent") {
+		t.Fatalf("CreateVolume error = %v, want insufficient capacity failure", err)
+	}
+}
+
+func TestPartedCreateReturnsUdevTimeout(t *testing.T) {
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+	partitionPathStat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	partitionPollPeriod = time.Millisecond
+	partitionPollCount = 2
+
+	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), disk.devicePath, "nvme0", "missing-node", 64*1024*1024)
+	if err == nil || !strings.Contains(err.Error(), "did not appear") {
+		t.Fatalf("CreateVolume error = %v, want udev timeout", err)
+	}
+}
+
+func TestPartedCreateHonorsContextCancellationDuringUdevWait(t *testing.T) {
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+	partitionPathStat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	partitionPollPeriod = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := (&PartedVolumeManager{}).CreateVolume(ctx, disk.devicePath, "nvme0", "cancelled", 64*1024*1024)
+	if err != context.Canceled {
+		t.Fatalf("CreateVolume error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPartedCreateVerifiesCreatedBoundaries(t *testing.T) {
+	disk := installFakePartedDisk(t)
+	disk.initialized = true
+	disk.createdStartAdjustment = partitionAlignmentBytes
+
+	_, err := (&PartedVolumeManager{}).CreateVolume(context.Background(), disk.devicePath, "nvme0", "shifted", 64*1024*1024)
+	if err == nil || !strings.Contains(err.Error(), "boundaries") {
+		t.Fatalf("CreateVolume error = %v, want boundary verification failure", err)
 	}
 }
 

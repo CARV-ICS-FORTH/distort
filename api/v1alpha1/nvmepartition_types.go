@@ -45,6 +45,7 @@ type NVMePartitionSpec struct {
 	// Size is the requested capacity for the volume.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036853727232')) <= 0",message="size must be positive and safely roundable to a 1 MiB allocation unit"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="size is immutable"
 	Size resource.Quantity `json:"size"`
 
 	// NodeName is the node where this partition should be created.
@@ -65,18 +66,34 @@ type NVMePartitionSpec struct {
 	ClaimRef *NVMeDeviceClaimReference `json:"claimRef,omitempty"`
 
 	// AccessMode indicates the PVC access mode (e.g., ReadWriteOnce, ReadOnlyMany).
+	// +kubebuilder:validation:Enum=SINGLE_NODE_WRITER
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="accessMode is immutable"
 	// +optional
 	AccessMode string `json:"accessMode,omitempty"`
+
+	// Filesystem is the canonical filesystem selected by the CSI request.
+	// +kubebuilder:validation:Enum=ext4;xfs
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="filesystem is immutable"
+	// +optional
+	Filesystem string `json:"filesystem,omitempty"`
+
+	// RequestFingerprint identifies all immutable CSI CreateVolume properties.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="requestFingerprint is immutable"
+	// +optional
+	RequestFingerprint string `json:"requestFingerprint,omitempty"`
 
 	// TargetBackend specifies the export technology (e.g., "spdk" or "kernel").
 	// +kubebuilder:validation:Enum=spdk;kernel
 	// +kubebuilder:default=spdk
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="targetBackend is immutable"
 	// +optional
 	TargetBackend string `json:"targetBackend,omitempty"`
 
 	// VolumeManager specifies the volume manager (e.g., "partition" or "lvm").
 	// +kubebuilder:validation:Enum=partition;lvm
 	// +kubebuilder:default=partition
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="volumeManager is immutable"
 	// +optional
 	VolumeManager string `json:"volumeManager,omitempty"`
 
@@ -84,6 +101,7 @@ type NVMePartitionSpec struct {
 	// +kubebuilder:validation:MaxProperties=1
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k == 'spdk-core-mask')",message="targetOptions contains an unsupported backend option"
 	// +kubebuilder:validation:XValidation:rule="!('spdk-core-mask' in self) || (size(self['spdk-core-mask']) <= 258 && self['spdk-core-mask'].matches('^0x[0-9A-Fa-f]+$'))",message="spdk-core-mask must be at most 258 characters and match 0x followed by hexadecimal digits"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="targetOptions is immutable"
 	// +optional
 	TargetOptions map[string]string `json:"targetOptions,omitempty"`
 }

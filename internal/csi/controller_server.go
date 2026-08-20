@@ -64,13 +64,9 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, "Name cannot be empty")
 	}
 
-	caps := req.GetVolumeCapabilities()
-	if len(caps) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume Capabilities cannot be empty")
-	}
-	fsType, err := resolveFilesystem(req.GetParameters(), caps)
+	capability, err := validateVolumeCapabilities(req.GetParameters(), req.GetVolumeCapabilities())
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Invalid filesystem configuration: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume capabilities: %v", err)
 	}
 
 	requiredBytes, expectedAllocation, err := normalizeCapacityRange(req.GetCapacityRange())
@@ -103,6 +99,23 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if err := storageoptions.Validate(targetBackend, targetOptions); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid backend options: %v", err)
 	}
+	canonicalRequest := canonicalCreateVolumeRequest{
+		RequiredBytes: requiredBytes,
+		LimitBytes: func() int64 {
+			if req.GetCapacityRange() == nil {
+				return defaultVolumeCapacityBytes
+			}
+			return req.GetCapacityRange().GetLimitBytes()
+		}(),
+		TargetBackend: targetBackend,
+		VolumeManager: volumeManager,
+		TargetOptions: targetOptions,
+		Capability:    capability,
+	}
+	requestFingerprint, err := fingerprintCreateVolumeRequest(canonicalRequest)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to fingerprint CreateVolume request: %v", err)
+	}
 
 	// Create NVMePartition CRD
 	partition := &storagev1alpha1.NVMePartition{
@@ -111,10 +124,13 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			Namespace: ns,
 		},
 		Spec: storagev1alpha1.NVMePartitionSpec{
-			Size:          *resource.NewQuantity(requiredBytes, resource.BinarySI),
-			TargetBackend: targetBackend,
-			VolumeManager: volumeManager,
-			TargetOptions: targetOptions,
+			Size:               *resource.NewQuantity(requiredBytes, resource.BinarySI),
+			AccessMode:         capability.AccessMode,
+			Filesystem:         capability.Filesystem,
+			RequestFingerprint: requestFingerprint,
+			TargetBackend:      targetBackend,
+			VolumeManager:      volumeManager,
+			TargetOptions:      targetOptions,
 			// NodeName is intentionally omitted here; the mutating scheduler (Mgmt-Controller) handles it.
 		},
 	}
@@ -125,17 +141,17 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			klog.Errorf("Failed to create NVMePartition CRD: %v", err)
 			return nil, status.Errorf(codes.Internal, "failed to create partition: %v", err)
 		}
-		// Partition already exists — retrieve it and verify it matches the requested backend.
-		// This prevents silently reusing a stale partition created with a different backend.
+		// Partition already exists — retrieve it and verify every immutable CSI
+		// request property before reusing it.
 		existing := &storagev1alpha1.NVMePartition{}
 		if err = cs.k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, existing); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get existing partition: %v", err)
 		}
-		if existing.Spec.TargetBackend != targetBackend {
-			klog.Errorf("Existing NVMePartition %s has backend %q but %q was requested", name, existing.Spec.TargetBackend, targetBackend)
+		if existing.Spec.RequestFingerprint != requestFingerprint {
+			klog.InfoS("Existing NVMePartition is incompatible with CreateVolume retry", "namespace", ns, "name", name)
 			return nil, status.Errorf(codes.AlreadyExists,
-				"partition %s already exists with backend %q; delete the existing partition or PVC first",
-				name, existing.Spec.TargetBackend)
+				"partition %s/%s already exists with different immutable CreateVolume properties; delete the existing partition or PVC first",
+				ns, name)
 		}
 		partition = existing
 	}
@@ -179,7 +195,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		"nqn":               partition.Status.NQN,
 		"portalIP":          partition.Status.PortalIP,
 		"portalPort":        fmt.Sprintf("%d", partition.Status.PortalPort),
-		filesystemParameter: fsType,
+		filesystemParameter: capability.Filesystem,
 	}
 
 	return &csi.CreateVolumeResponse{
@@ -187,6 +203,20 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			VolumeId:      volumeID,
 			CapacityBytes: allocatedBytes,
 			VolumeContext: volCtx,
+		},
+	}, nil
+}
+
+func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
+	}
+	if _, err := validateVolumeCapabilities(req.GetVolumeContext(), req.GetVolumeCapabilities()); err != nil {
+		return &csi.ValidateVolumeCapabilitiesResponse{Message: err.Error()}, nil
+	}
+	return &csi.ValidateVolumeCapabilitiesResponse{
+		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
+			VolumeCapabilities: req.GetVolumeCapabilities(),
 		},
 	}, nil
 }

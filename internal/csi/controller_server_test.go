@@ -173,6 +173,9 @@ func TestCreateVolumeCreatesExpectedPartitionAndResponse(t *testing.T) {
 	if partition.Spec.TargetOptions["spdk-core-mask"] != "0x3" {
 		t.Fatalf("backend option was not forwarded: %#v", partition.Spec.TargetOptions)
 	}
+	if partition.Spec.AccessMode != csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER.String() || partition.Spec.Filesystem != "ext4" || len(partition.Spec.RequestFingerprint) != 64 {
+		t.Fatalf("canonical CreateVolume properties were not persisted: %#v", partition.Spec)
+	}
 	if _, exists := partition.Spec.TargetOptions["csi.storage.k8s.io/pvc/name"]; exists {
 		t.Fatalf("CSI metadata leaked into backend options: %#v", partition.Spec.TargetOptions)
 	}
@@ -278,18 +281,18 @@ func TestCreateVolumeDefaultsMissingRangeAndReturnsRoundedCapacity(t *testing.T)
 }
 
 func TestCreateVolumeRejectsIncompatibleRetries(t *testing.T) {
-	knownfailure.Require(t, "F9")
 	tests := []struct {
 		name   string
 		mutate func(*csipb.CreateVolumeRequest)
 	}{
 		{name: "size", mutate: func(req *csipb.CreateVolumeRequest) { req.CapacityRange.RequiredBytes++ }},
+		{name: "limit", mutate: func(req *csipb.CreateVolumeRequest) {
+			req.CapacityRange.LimitBytes = req.CapacityRange.RequiredBytes + 1024*1024
+		}},
+		{name: "backend", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["target-backend"] = "kernel" }},
 		{name: "manager", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["volume-manager"] = "lvm" }},
 		{name: "filesystem", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters[filesystemParameter] = "xfs" }},
 		{name: "backend option", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["spdk-core-mask"] = "0x7" }},
-		{name: "access mode", mutate: func(req *csipb.CreateVolumeRequest) {
-			req.VolumeCapabilities[0].AccessMode.Mode = csipb.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER
-		}},
 	}
 
 	for _, test := range tests {
@@ -308,7 +311,6 @@ func TestCreateVolumeRejectsIncompatibleRetries(t *testing.T) {
 }
 
 func TestCreateVolumeRejectsUnsupportedCapabilities(t *testing.T) {
-	knownfailure.Require(t, "F10")
 	tests := []struct {
 		name string
 		cap  *csipb.VolumeCapability
@@ -316,6 +318,11 @@ func TestCreateVolumeRejectsUnsupportedCapabilities(t *testing.T) {
 		{name: "raw block", cap: blockCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
 		{name: "read only many", cap: mountCapability(csipb.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY)},
 		{name: "read write many", cap: mountCapability(csipb.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER)},
+		{name: "unsupported mount flags", cap: func() *csipb.VolumeCapability {
+			capability := mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+			capability.GetMount().MountFlags = []string{"noatime"}
+			return capability
+		}()},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -325,6 +332,42 @@ func TestCreateVolumeRejectsUnsupportedCapabilities(t *testing.T) {
 			_, err := server.CreateVolume(context.Background(), req)
 			requireCode(t, err, codes.InvalidArgument)
 		})
+	}
+	t.Run("conflicting capabilities", func(t *testing.T) {
+		server, _ := newControllerTestServer(t)
+		req := validCreateRequest("unsupported-conflicting-capabilities", "default")
+		xfs := mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+		xfs.GetMount().FsType = "xfs"
+		req.VolumeCapabilities = append(req.VolumeCapabilities, xfs)
+		_, err := server.CreateVolume(context.Background(), req)
+		requireCode(t, err, codes.InvalidArgument)
+	})
+}
+
+func TestValidateVolumeCapabilities(t *testing.T) {
+	server, _ := newControllerTestServer(t)
+	valid := mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	response, err := server.ValidateVolumeCapabilities(context.Background(), &csipb.ValidateVolumeCapabilitiesRequest{
+		VolumeId:           "volume",
+		VolumeCapabilities: []*csipb.VolumeCapability{valid},
+		VolumeContext:      map[string]string{filesystemParameter: "ext4"},
+	})
+	if err != nil || response.GetConfirmed() == nil {
+		t.Fatalf("ValidateVolumeCapabilities valid response = %#v, error = %v", response, err)
+	}
+
+	response, err = server.ValidateVolumeCapabilities(context.Background(), &csipb.ValidateVolumeCapabilitiesRequest{
+		VolumeId: "volume",
+		VolumeCapabilities: []*csipb.VolumeCapability{
+			valid,
+			blockCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ValidateVolumeCapabilities unsupported request returned RPC error: %v", err)
+	}
+	if response.GetConfirmed() != nil || response.GetMessage() == "" {
+		t.Fatalf("unsupported capabilities were confirmed: %#v", response)
 	}
 }
 

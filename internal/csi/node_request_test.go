@@ -77,7 +77,6 @@ func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
 }
 
 func TestNodePublishRejectsMissingFieldsAndHonorsReadOnly(t *testing.T) {
-	knownfailure.Require(t, "F10")
 	server := &NodeServer{}
 	_, err := server.NodePublishVolume(context.Background(), &csipb.NodePublishVolumeRequest{
 		VolumeId:          "",
@@ -95,10 +94,9 @@ func TestNodePublishRejectsMissingFieldsAndHonorsReadOnly(t *testing.T) {
 }
 
 func TestNodePublishUsesAReadOnlyBindMount(t *testing.T) {
-	knownfailure.Require(t, "F10")
 	fakeBin := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "mount-arguments")
-	script := "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$MOUNT_LOG\"\n"
+	script := "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$MOUNT_LOG\"\n"
 	if err := os.WriteFile(filepath.Join(fakeBin, "mount"), []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +109,7 @@ func TestNodePublishUsesAReadOnlyBindMount(t *testing.T) {
 		StagingTargetPath: t.TempDir(),
 		TargetPath:        filepath.Join(t.TempDir(), "target"),
 		Readonly:          true,
+		VolumeCapability:  mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume returned error: %v", err)
@@ -119,8 +118,8 @@ func TestNodePublishUsesAReadOnlyBindMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(arguments), "ro") {
-		t.Fatalf("read-only request produced a writable bind mount:\n%s", arguments)
+	if !strings.Contains(string(arguments), "--bind") || !strings.Contains(string(arguments), "remount,bind,ro") {
+		t.Fatalf("read-only request did not bind then remount read-only:\n%s", arguments)
 	}
 }
 

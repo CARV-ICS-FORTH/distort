@@ -111,9 +111,9 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 | F5 (resolved) | Exact SPDK base-bdev/lvstore/lvol identities are persisted and verified absent across partial cleanup and retry | Plugin/agent unit + Vagrant SPDK E2E |
 | F6 (resolved) | Concurrent reservations, stale status/cache reads, update conflicts, and terminating-volume capacity retention | Envtest concurrency and conflict injection |
 | F7 (resolved) | Capacity-range validation, negative legacy objects, upward rounding for kernel/SPDK, and persisted actual allocation | CSI, plugin, envtest, CRD contract + E2E admission/SPDK |
-| F8 | A failing `parted` command must fail volume creation | Plugin command-failure unit |
-| F9 | CreateVolume retries compare size, manager, filesystem, access mode, and options | CSI unit |
-| F10 | Unsupported capabilities are rejected and read-only publish uses read-only mounts | CSI controller/node unit |
+| F8 (resolved) | Command/udev failures, cancellation, insufficient space, and incorrect partition boundaries fail creation | Plugin unit |
+| F9 (resolved) | CreateVolume retries compare a persisted fingerprint of capacity bounds, manager, filesystem, capability, and options | CSI unit + generated CRD schema |
+| F10 (resolved) | Unsupported capabilities and mount flags are rejected; read-only publish uses bind-remount semantics | CSI controller/node unit |
 | F11 | Validation precedes connection and failed staging disconnects the target | CSI node failure-injection unit |
 | F12 | Existing stage/publish mounts must match the expected source | CSI node unit |
 | F13 | Missing hardware requeues and active claims follow device movement | Envtest |
