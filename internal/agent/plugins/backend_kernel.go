@@ -30,9 +30,9 @@ func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, devi
 	if err := storageoptions.Validate(k.Name(), options); err != nil {
 		return err
 	}
-	klog.Infof("Ensuring device %s (%s) is bound to kernel nvme driver", deviceName, pciAddress)
+	klog.InfoS("Ensuring device is bound to kernel NVMe driver", "device", deviceName, "pciAddress", pciAddress)
 	if err := ResetSPDKDevice(pciAddress); err != nil {
-		klog.Warningf("spdk_setup.sh reset failed or warned: %v", err)
+		klog.ErrorS(err, "SPDK device reset returned a warning")
 	}
 	return nil
 }
@@ -64,19 +64,19 @@ func (k *KernelBackend) ExportVolume(ctx context.Context, volumeName string, blo
 	nqn := volumeidentity.NQN(volumeName)
 	subsysPath := filepath.Join(nvmetPath, "subsystems", nqn)
 	if _, err := os.Stat(subsysPath); err == nil {
-		klog.Infof("NVMe-oF target %s already exported via Kernel ConfigFS", nqn)
+		klog.InfoS("NVMe-oF target is already exported through kernel configfs", "nqn", nqn)
 		return nqn, nil
 	}
 
-	klog.Infof("Exporting %s as NVMe-oF target %s on %s:%d via Kernel ConfigFS", blockPath, nqn, portalIP, portalPort)
+	klog.InfoS("Exporting kernel NVMe-oF target", "blockPath", blockPath, "nqn", nqn, "portalIP", portalIP, "portalPort", portalPort)
 
 	// Ensure configfs is mounted (nvmet module loaded)
 	if _, err := os.Stat(nvmetPath); err != nil {
-		klog.Info("Loading nvmet and nvmet-rdma modules...")
+		klog.InfoS("Loading kernel NVMe target modules")
 		_ = exec.Command("modprobe", "nvmet").Run()
 		_ = exec.Command("modprobe", "nvmet-rdma").Run()
 		if !isMountPoint("/sys/kernel/config") {
-			klog.Info("Mounting configfs on /sys/kernel/config...")
+			klog.InfoS("Mounting configfs", "path", "/sys/kernel/config")
 			_ = exec.Command("mount", "-t", "configfs", "none", "/sys/kernel/config").Run()
 		}
 	}
@@ -193,7 +193,7 @@ func (k *KernelBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN st
 }
 
 func (k *KernelBackend) UnexportVolume(ctx context.Context, nqn string) error {
-	klog.Infof("Unexporting Kernel NVMe-oF target %s", nqn)
+	klog.InfoS("Unexporting kernel NVMe-oF target", "nqn", nqn)
 
 	portID := 1
 	portPath := filepath.Join(nvmetPath, "ports", strconv.Itoa(portID))

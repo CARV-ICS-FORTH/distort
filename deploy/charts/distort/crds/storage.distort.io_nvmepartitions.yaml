@@ -175,11 +175,10 @@ spec:
                   rule: self == oldSelf
               volumeManager:
                 default: partition
-                description: VolumeManager specifies the volume manager (e.g., "partition"
-                  or "lvm").
+                description: VolumeManager specifies the supported volume-carving
+                  strategy.
                 enum:
                 - partition
-                - lvm
                 type: string
                 x-kubernetes-validations:
                 - message: volumeManager is immutable

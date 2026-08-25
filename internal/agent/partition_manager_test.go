@@ -435,6 +435,54 @@ func TestPartitionManagerAcceptsMatchingLiveClaim(t *testing.T) {
 	}
 }
 
+func TestPartitionManagerRecoversExistingAllocationWhileDeviceIsTemporarilyUnavailable(t *testing.T) {
+	backend := &countingBackend{}
+	manager := &countingVolumeManager{}
+	plugins.RegisterTargetBackend(backend)
+	plugins.RegisterVolumeManager(manager)
+
+	claim := &storagev1alpha1.NVMeDeviceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "recovery-owner", Namespace: "default", UID: types.UID("recovery-claim-uid")},
+		Spec:       storagev1alpha1.NVMeDeviceClaimSpec{SerialNumber: "RECOVERY-SERIAL"},
+		Status: storagev1alpha1.NVMeDeviceClaimStatus{
+			Active: false, MatchedDevice: "node-a-recovery-serial", NodeName: "node-a",
+		},
+	}
+	claimRef := &storagev1alpha1.NVMeDeviceClaimReference{
+		Namespace: claim.Namespace, Name: claim.Name, UID: claim.UID,
+	}
+	device := &storagev1alpha1.NVMeDevice{
+		ObjectMeta: metav1.ObjectMeta{Name: claim.Status.MatchedDevice},
+		Spec: storagev1alpha1.NVMeDeviceSpec{
+			NodeName: "node-a", PCIAddress: "0000:01:00.0", SerialNumber: claim.Spec.SerialNumber,
+			TotalCapacity: resource.MustParse("1Gi"),
+		},
+		Status: storagev1alpha1.NVMeDeviceStatus{
+			State: storagev1alpha1.NVMeDeviceStateUnavailable, ClaimRef: claimRef,
+		},
+	}
+	partition := &storagev1alpha1.NVMePartition{
+		ObjectMeta: metav1.ObjectMeta{Name: "recovering-volume", Namespace: "default"},
+		Spec: storagev1alpha1.NVMePartitionSpec{
+			Size: resource.MustParse("100Mi"), NodeName: "node-a",
+			ParentDeviceSerialNumber: claim.Spec.SerialNumber, ClaimRef: claimRef,
+			TargetBackend: backend.Name(), VolumeManager: manager.Name(),
+		},
+		Status: storagev1alpha1.NVMePartitionStatus{
+			ExternalID: "existing-external-id", BackendVolumeID: "existing-backend-volume",
+		},
+	}
+	testClient := newPartitionManagerClient(t, claim, device, partition)
+	reconciler := &PartitionManager{Client: testClient, NodeName: "node-a"}
+	_, _ = reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace},
+	})
+
+	if calls := backend.setupCalls.Load(); calls != 1 {
+		t.Fatalf("backend SetupDevice was called %d times during authorized recovery, want 1", calls)
+	}
+}
+
 func TestInvalidPluginConfigurationBecomesTerminalStatus(t *testing.T) {
 	partition := &storagev1alpha1.NVMePartition{
 		ObjectMeta: metav1.ObjectMeta{Name: "invalid-plugin", Namespace: "default"},

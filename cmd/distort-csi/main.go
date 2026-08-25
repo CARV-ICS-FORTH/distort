@@ -62,5 +62,8 @@ func main() {
 
 	// Initialize CSI Driver (Identity, Controller, Node servers)
 	driver := csi.NewDriver(nodeId, endpoint, k8sClient)
-	driver.Run()
+	if err := driver.Run(); err != nil {
+		setupLog.Error(err, "CSI driver stopped")
+		os.Exit(1)
+	}
 }

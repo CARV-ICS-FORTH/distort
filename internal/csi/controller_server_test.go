@@ -23,7 +23,6 @@ import (
 	attachmentidentity "distort/internal/attachment"
 	"distort/internal/capacity"
 	"distort/internal/volumeidentity"
-	"distort/test/knownfailure"
 )
 
 type immediatelyExportingClient struct {
@@ -187,7 +186,7 @@ func TestCreateVolumeCreatesExpectedPartitionAndResponse(t *testing.T) {
 	if response.Volume.CapacityBytes != req.CapacityRange.RequiredBytes {
 		t.Fatalf("CapacityBytes = %d, want %d", response.Volume.CapacityBytes, req.CapacityRange.RequiredBytes)
 	}
-	if response.Volume.VolumeContext[filesystemParameter] != "ext4" || response.Volume.VolumeContext["nqn"] == "" {
+	if response.Volume.VolumeContext[filesystemParameter] != defaultFilesystem || response.Volume.VolumeContext["nqn"] == "" {
 		t.Fatalf("unexpected volume context: %#v", response.Volume.VolumeContext)
 	}
 
@@ -318,7 +317,6 @@ func TestCreateVolumeRejectsIncompatibleRetries(t *testing.T) {
 			req.CapacityRange.LimitBytes = req.CapacityRange.RequiredBytes + 1024*1024
 		}},
 		{name: "backend", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["target-backend"] = "kernel" }},
-		{name: "manager", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["volume-manager"] = "lvm" }},
 		{name: "filesystem", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters[filesystemParameter] = "xfs" }},
 		{name: "backend option", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["spdk-core-mask"] = "0x7" }},
 	}
@@ -630,10 +628,23 @@ func TestLegacyDeleteVolumeDeletesOneUnambiguousPartition(t *testing.T) {
 }
 
 func TestCreateVolumeRejectsUnimplementedManagers(t *testing.T) {
-	knownfailure.Require(t, "F20")
-	server, _ := newControllerTestServer(t)
-	req := validCreateRequest("unimplemented-manager", "default")
-	req.Parameters["volume-manager"] = "lvm"
-	_, err := server.CreateVolume(context.Background(), req)
-	requireCode(t, err, codes.InvalidArgument)
+	tests := []struct {
+		name    string
+		backend string
+		manager string
+	}{
+		{name: "lvm manager", backend: "spdk", manager: "lvm"},
+		{name: "unknown manager", backend: "kernel", manager: "zfs"},
+		{name: "unknown backend", backend: "userspace", manager: "partition"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, _ := newControllerTestServer(t)
+			req := validCreateRequest("unsupported-configuration", "default")
+			req.Parameters["target-backend"] = tt.backend
+			req.Parameters["volume-manager"] = tt.manager
+			_, err := server.CreateVolume(context.Background(), req)
+			requireCode(t, err, codes.InvalidArgument)
+		})
+	}
 }

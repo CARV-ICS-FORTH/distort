@@ -29,7 +29,7 @@ func CallSPDKRPCContext(ctx context.Context, method string, result any, args ...
 	cmdArgs := append([]string{method}, args...)
 	cmd := exec.CommandContext(ctx, spdkRPCExecutable, cmdArgs...)
 	cmd.WaitDelay = 250 * time.Millisecond
-	klog.V(4).Infof("Executing SPDK RPC: %v", cmdArgs)
+	klog.V(4).InfoS("Executing SPDK RPC", "arguments", cmdArgs)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

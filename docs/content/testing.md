@@ -87,15 +87,15 @@ Run one green scenario:
 ```bash
 make test-e2e E2E_ARGS='-ginkgo.label-filter=F1'
 make test-e2e E2E_ARGS='-ginkgo.label-filter=F4'
+make test-e2e E2E_ARGS='-ginkgo.label-filter=F17'
 make test-e2e E2E_ARGS='-ginkgo.focus=Persistence.*backend=kernel'
 make test-e2e E2E_ARGS='-ginkgo.label-filter=green'
 ```
 
-Run a quarantined cluster regression in a freshly reset lab:
+Run the RBAC and admission regressions together against the isolated lab:
 
 ```bash
-make test-env-regression FINDING=F17
-make test-env-regression FINDING=F18
+make test-e2e E2E_ARGS="-ginkgo.label-filter='F18 || F20'"
 ```
 
 The E2E suite refuses to run unless the active kubeconfig server is `https://192.168.56.10:6443` and all three expected Vagrant node names are present. A failed spec automatically captures nodes, workloads, DISTORT resources, events, and recent component logs.
@@ -118,23 +118,23 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 | F12 | Existing stage/publish mounts must match the expected source | CSI node unit |
 | F13 | Missing hardware requeues and active claims follow device movement | Envtest |
 | F14 | Deleting an old claim cannot release a replacement claim's device | Envtest |
-| F15 | Exact allow/exclude semantics, mounted devices, and failed mount inspection | Agent fake-sysfs unit |
-| F16 | Real Node IP/capacity reporting, no loopback fallback, and active export count | Agent unit + Vagrant smoke |
-| F17 | SPDK process crash must restore the exported target | Vagrant recovery E2E |
-| F18 | Separate chart identities plus forbidden Node mutation | Repository contract + E2E RBAC |
+| F15 (resolved) | Exact allow/exclude semantics, mounted devices, failed mount inspection, and the explicit unsafe override | Agent fake-sysfs unit |
+| F16 (resolved) | Live RDMA interface/IP/transport discovery, fresh readiness, no loopback fallback, and active export count | Agent/controller unit + Vagrant smoke |
+| F17 (resolved) | Bounded RPC and exact export health checks; SPDK process crash restores the exported target | Plugin/agent unit + Vagrant recovery E2E |
+| F18 (resolved) | Separate chart identities plus required/forbidden permission matrix | Repository contract + E2E RBAC |
 | F19 | Permanent plugin errors become terminal rather than hot-looping | Agent unit |
-| F20 | Unimplemented LVM is rejected by CSI, CRD, and admission | CSI + repository contract + E2E admission |
-| F21 | Every sample has a concrete usable spec and no scaffold TODO | Repository contract |
-| F22 | Behavior-focused controller, CSI, agent, plugin, contract, and E2E suites | Entire suite |
-| F23 | Existing lint configuration remains an explicit required command | `make lint`; promote to `make test-suite` after the current lint backlog is fixed |
+| F20 (resolved) | Unimplemented LVM is rejected by CSI, CRD, and admission | CSI + repository contract + E2E admission |
+| F21 (resolved) | Every sample is concrete, schema-valid, and server-side dry-run tested; agent-owned examples are not applied by default | Envtest + repository contract |
+| F22 (resolved) | Behavior-focused controller, CSI, agent, plugin, contract, and E2E suites | Entire suite |
+| F23 (resolved) | Structured logging and bounded reconciler helpers remain lint-clean | `make lint`, required by `make test-suite` |
 | F24 (resolved) | Documentation version matches the `go.mod` directive | Repository contract |
-| F25 | A single-writer volume cannot be concurrently attached read-write on two nodes; publish/unpublish and stale-owner recovery are idempotent | CSI controller + two-node E2E |
+| F25 (fix implemented; hardware rerun pending) | A single-writer volume cannot be concurrently attached read-write on two nodes; publish/unpublish and stale-owner recovery are idempotent | CSI controller + two-node E2E |
 
 ## Last verified lab run
 
 On 2026-08-19, a clean reset followed by the complete hardware suite produced 11 passing green specs, zero failures, and three explicitly quarantined skips. SPDK and kernel targets both passed cross-node provisioning, mounting, graceful same-node Pod recreation, persistence, and cleanup. The suite also covered concurrency-safe capacity scheduling, same-device kernel partition-number reuse, exact SPDK lvol teardown after the subsystem had already been removed, API capacity rejection, and upward-rounded allocation reporting.
 
-The host `make test-suite` and `make test-race` gates passed at that point. `make lint` still reported the 19-item F23 backlog and must not be described as green.
+On 2026-08-25, the consolidated host `make test-suite` gate passed 143 behavior tests, repository contracts, Helm lint/render, Hugo, E2E compilation, and lint with zero issues. Package coverage was 59.8% for the agent, 58.7% for agent plugins, 71.4% for controllers, and 67.6% for CSI. The focused F25 lab run proved initial SPDK attachment and competing-node rejection; its corrected takeover rerun remains pending because worker-1's virtual root disk developed ext4 corruption and raw read errors, making container-image extraction fail digest validation.
 
 ## Additional coverage beyond the review
 

@@ -202,13 +202,13 @@ func (pv *PartedVolumeManager) SetupStorage(ctx context.Context, devicePath stri
 	defer lock.Unlock()
 
 	if _, _, err := readPartedTable(ctx, devicePath, false); err == nil {
-		klog.Infof("Storage already configured on %s (partition table exists)", devicePath)
+		klog.InfoS("Storage already has a partition table", "devicePath", devicePath)
 		return nil
 	}
 
-	klog.Infof("Wiping and initializing GPT label on %s", devicePath)
+	klog.InfoS("Wiping device and initializing GPT label", "devicePath", devicePath)
 	if out, err := executeWipefs(ctx, devicePath); err != nil {
-		klog.Warningf("wipefs error (ignoring): %v output: %s", err, string(out))
+		klog.ErrorS(err, "Ignored wipefs error", "output", string(out))
 	}
 	if _, err := runParted(ctx, "-s", devicePath, "mklabel", "gpt"); err != nil {
 		return err
@@ -258,7 +258,7 @@ func (pv *PartedVolumeManager) CreateVolume(ctx context.Context, devicePath stri
 	if err != nil {
 		return VolumeIdentity{}, err
 	}
-	klog.Infof("Creating partition %d for %s on %s (%dB -> %dB)", partitionNumber, volumeName, devicePath, start, end)
+	klog.InfoS("Creating partition", "partitionNumber", partitionNumber, "volume", volumeName, "devicePath", devicePath, "startBytes", start, "endBytes", end)
 	if _, err := runParted(ctx, "-s", "-a", "optimal", devicePath, "mkpart", volumeName,
 		fmt.Sprintf("%dB", start), fmt.Sprintf("%dB", end)); err != nil {
 		return VolumeIdentity{}, err
@@ -337,7 +337,7 @@ func (pv *PartedVolumeManager) DeleteVolume(ctx context.Context, devicePath stri
 		target = &matches[0]
 	}
 
-	klog.Infof("Removing partition %d owned by %s from %s", target.number, volumeName, devicePath)
+	klog.InfoS("Removing partition", "partitionNumber", target.number, "volume", volumeName, "devicePath", devicePath)
 	_, err = runParted(ctx, "-s", devicePath, "rm", strconv.Itoa(target.number))
 	return err
 }

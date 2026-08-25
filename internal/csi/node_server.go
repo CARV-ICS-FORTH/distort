@@ -218,7 +218,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, err
 	}
 
-	klog.Infof("NodeStageVolume: Connecting to NVMe-oF target. NQN=%s Portal=%s:%s", stage.nqn, stage.portalIP, stage.portalPort)
+	klog.InfoS("Connecting to NVMe-oF target for staging", "nqn", stage.nqn, "portalIP", stage.portalIP, "portalPort", stage.portalPort)
 
 	createdDirectory := false
 	if _, statErr := ns.statPath(stage.stagingTargetPath); statErr != nil {
@@ -270,8 +270,8 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, nodeOperationError(ctx, fmt.Sprintf("Block device %s did not appear", devPath), err)
 	}
 
-	klog.Infof("Mapped NQN %s to local block device %s", stage.nqn, devPath)
-	klog.Infof("Staging volume %s (device %s) to %s", stage.volumeID, devPath, stage.stagingTargetPath)
+	klog.InfoS("Mapped NQN to local block device", "nqn", stage.nqn, "devicePath", devPath)
+	klog.InfoS("Staging volume", "volumeID", stage.volumeID, "devicePath", devPath, "targetPath", stage.stagingTargetPath)
 
 	mountedByCall, err = ns.mountStage(ctx, devPath, stage.stagingTargetPath, stage.filesystem)
 	if err != nil {
@@ -299,14 +299,14 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		return nil, status.Error(codes.InvalidArgument, "Staging Target Path must be provided")
 	}
 
-	klog.Infof("NodeUnstageVolume: ID=%s Path=%s", volID, stagingTargetPath)
+	klog.InfoS("Unstaging volume", "volumeID", volID, "targetPath", stagingTargetPath)
 
 	// 1. Unmount the staging path
 	unmountStarted := time.Now()
 	if err := unmount(ctx, stagingTargetPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to unmount staging path: %v", err)
 	}
-	klog.Infof("Unmounted staging path %s in %s", stagingTargetPath, time.Since(unmountStarted))
+	klog.InfoS("Unmounted staging path", "targetPath", stagingTargetPath, "duration", time.Since(unmountStarted))
 
 	// 2. Execute `nvme disconnect -n <NQN>`. New handles carry the immutable
 	// partition UID; retain the legacy fallback for already-published volumes.
@@ -323,8 +323,8 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	if err := DisconnectRDMA(ctx, nqn); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to disconnect NVMe target: %v", err)
 	}
-	klog.Infof("Disconnected NVMe target %s in %s", nqn, time.Since(disconnectStarted))
-	klog.Infof("NodeUnstageVolume completed for %s in %s", volID, time.Since(started))
+	klog.InfoS("Disconnected NVMe target", "nqn", nqn, "duration", time.Since(disconnectStarted))
+	klog.InfoS("Completed volume unstage", "volumeID", volID, "duration", time.Since(started))
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
@@ -340,7 +340,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume capability: %v", err)
 	}
 
-	klog.Infof("NodePublishVolume: ID=%s Source=%s Target=%s", volID, source, target)
+	klog.InfoS("Publishing volume", "volumeID", volID, "sourcePath", source, "targetPath", target)
 
 	if err := publishBindMount(ctx, source, target, req.GetReadonly()); err != nil {
 		var mismatch *mountMismatchError
@@ -350,7 +350,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, nodeOperationError(ctx, "Failed to bind mount", err)
 	}
 
-	klog.Infof("Bind mounted %s to %s", source, target)
+	klog.InfoS("Bind mounted volume", "sourcePath", source, "targetPath", target)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -362,13 +362,13 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		return nil, status.Error(codes.InvalidArgument, "Volume ID and target path must be provided")
 	}
 
-	klog.Infof("NodeUnpublishVolume: ID=%s Target=%s", volID, target)
+	klog.InfoS("Unpublishing volume", "volumeID", volID, "targetPath", target)
 
 	if err := unmount(ctx, target); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to unmount target path: %v", err)
 	}
 
-	klog.Infof("NodeUnpublishVolume unmounted %s in %s", target, time.Since(started))
+	klog.InfoS("Unmounted published volume", "targetPath", target, "duration", time.Since(started))
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -401,7 +401,7 @@ func formatAndMount(ctx context.Context, source, target, fsType string) (bool, e
 		return false, &mountMismatchError{message: err.Error()}
 	}
 	if mounted {
-		klog.Infof("Target %s is already mounted from expected block device", target)
+		klog.InfoS("Target is already mounted from expected block device", "targetPath", target)
 		return false, nil
 	}
 
@@ -409,7 +409,7 @@ func formatAndMount(ctx context.Context, source, target, fsType string) (bool, e
 		return false, err
 	}
 
-	klog.Infof("Mounting %s as %s to %s", source, fsType, target)
+	klog.InfoS("Mounting filesystem", "sourcePath", source, "filesystem", fsType, "targetPath", target)
 	mountCmd := exec.CommandContext(ctx, "mount", "-t", fsType, source, target)
 	if out, mountErr := mountCmd.CombinedOutput(); mountErr != nil {
 		if ctx.Err() != nil {
@@ -447,7 +447,7 @@ func ensureFilesystemContext(ctx context.Context, source, requested string,
 	if normalizeFilesystem(detected) != requested {
 		return &filesystemMismatchError{source: source, requested: requested, detected: detected}
 	}
-	klog.Infof("Block device %s already contains %s", source, detected)
+	klog.InfoS("Block device already contains a filesystem", "sourcePath", source, "filesystem", detected)
 	return nil
 }
 
@@ -474,7 +474,7 @@ func formatFilesystem(ctx context.Context, source, fsType string) error {
 		return err
 	}
 
-	klog.Infof("Formatting %s as %s", source, fsType)
+	klog.InfoS("Formatting block device", "sourcePath", source, "filesystem", fsType)
 	if out, err := exec.CommandContext(ctx, command, args...).CombinedOutput(); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("formatting interrupted: %w", ctx.Err())
@@ -486,9 +486,9 @@ func formatFilesystem(ctx context.Context, source, fsType string) error {
 
 func filesystemFormatCommand(source, fsType string) (string, []string, error) {
 	switch fsType {
-	case "ext4":
+	case defaultFilesystem:
 		return "mkfs.ext4", []string{"-F", source}, nil
-	case "xfs":
+	case xfsFilesystem:
 		return "mkfs.xfs", []string{"-f", source}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported filesystem %q", fsType)
@@ -509,7 +509,7 @@ func publishBindMount(ctx context.Context, source, target string, readOnly bool)
 		return &mountMismatchError{message: err.Error()}
 	}
 	if mounted {
-		klog.Infof("Target %s is already bind mounted from expected source", target)
+		klog.InfoS("Target is already bind mounted from expected source", "targetPath", target)
 		return nil
 	}
 	cmd := exec.CommandContext(ctx, "mount", "--bind", source, target)
@@ -551,7 +551,7 @@ func unmount(ctx context.Context, target string) error {
 			return fmt.Errorf("checking mount point: %w", err)
 		}
 		if !mounted {
-			klog.Infof("Target %s is not mounted", target)
+			klog.InfoS("Target is not mounted", "targetPath", target)
 			return nil
 		}
 

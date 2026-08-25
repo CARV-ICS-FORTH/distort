@@ -49,7 +49,7 @@ type NVMEHostList []struct {
 // created the connection. An already-connected target is left owned by the
 // earlier staging operation and must not be disconnected during rollback.
 func ConnectRDMA(ctx context.Context, nqn, portalIP, portalPort, hostNQN string) (bool, error) {
-	klog.Infof("Executing nvme connect -t rdma -a %s -s %s -n %s", portalIP, portalPort, nqn)
+	klog.InfoS("Connecting NVMe target", "transport", "rdma", "portalIP", portalIP, "portalPort", portalPort, "nqn", nqn)
 
 	cmd := exec.CommandContext(ctx, "nvme", "connect", "-t", "rdma", "-a", portalIP, "-s", portalPort, "-n", nqn, "--hostnqn", hostNQN)
 	out, err := cmd.CombinedOutput()
@@ -60,7 +60,7 @@ func ConnectRDMA(ctx context.Context, nqn, portalIP, portalPort, hostNQN string)
 			return true, fmt.Errorf("nvme connect interrupted: %w", ctx.Err())
 		}
 		if strings.Contains(string(out), "already connected") {
-			klog.Infof("NVMe target %s is already connected", nqn)
+			klog.InfoS("NVMe target is already connected", "nqn", nqn)
 			return false, nil
 		}
 		return true, fmt.Errorf("nvme connect failed: %v, output: %s", err, string(out))
@@ -70,7 +70,7 @@ func ConnectRDMA(ctx context.Context, nqn, portalIP, portalPort, hostNQN string)
 
 // DisconnectRDMA disconnects from an NVMe-oF target by NQN.
 func DisconnectRDMA(ctx context.Context, nqn string) error {
-	klog.Infof("Executing nvme disconnect -n %s", nqn)
+	klog.InfoS("Disconnecting NVMe target", "nqn", nqn)
 
 	cmd := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn)
 	out, err := cmd.CombinedOutput()
@@ -79,7 +79,7 @@ func DisconnectRDMA(ctx context.Context, nqn string) error {
 			return fmt.Errorf("nvme disconnect interrupted: %w", ctx.Err())
 		}
 		if strings.Contains(string(out), "no controllers found") {
-			klog.Infof("NVMe target %s already disconnected", nqn)
+			klog.InfoS("NVMe target is already disconnected", "nqn", nqn)
 			return nil
 		}
 		return fmt.Errorf("nvme disconnect failed: %v, output: %s", err, string(out))

@@ -9,6 +9,7 @@ import (
 
 const (
 	defaultFilesystem      = "ext4"
+	xfsFilesystem          = "xfs"
 	filesystemParameter    = "fsType"
 	csiFilesystemParameter = "csi.storage.k8s.io/fstype"
 )

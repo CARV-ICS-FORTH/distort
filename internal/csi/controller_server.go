@@ -34,7 +34,11 @@ type ControllerServer struct {
 	attachmentReadyTimeout     time.Duration
 }
 
-const defaultVolumeCapacityBytes int64 = 1024 * 1024 * 1024
+const (
+	defaultVolumeCapacityBytes int64 = 1024 * 1024 * 1024
+	spdkTargetBackend                = "spdk"
+	partitionVolumeManager           = "partition"
+)
 
 func normalizeCapacityRange(capacityRange *csi.CapacityRange) (int64, int64, error) {
 	if capacityRange == nil {
@@ -77,7 +81,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid capacity range: %v", err)
 	}
 
-	klog.Infof("CreateVolume: Name=%s, SizeBytes=%d", name, requiredBytes)
+	klog.InfoS("Creating volume", "name", name, "sizeBytes", requiredBytes)
 
 	ns := req.GetParameters()["csi.storage.k8s.io/pvc/namespace"]
 	if ns == "" {
@@ -86,11 +90,14 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	targetBackend := req.GetParameters()["target-backend"]
 	if targetBackend == "" {
-		targetBackend = "spdk"
+		targetBackend = spdkTargetBackend
 	}
 	volumeManager := req.GetParameters()["volume-manager"]
 	if volumeManager == "" {
-		volumeManager = "partition"
+		volumeManager = partitionVolumeManager
+	}
+	if err := validateStorageCombination(targetBackend, volumeManager); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Unsupported storage configuration: %v", err)
 	}
 	targetOptions := make(map[string]string)
 	// csi.storage.k8s.io/* keys are injected by the provisioner sidecar and are not for backends.
@@ -141,7 +148,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	err = cs.k8sClient.Create(ctx, partition)
 	if err != nil {
 		if client.IgnoreAlreadyExists(err) != nil {
-			klog.Errorf("Failed to create NVMePartition CRD: %v", err)
+			klog.ErrorS(err, "Failed to create NVMePartition")
 			return nil, status.Errorf(codes.Internal, "failed to create partition: %v", err)
 		}
 		// Partition already exists — retrieve it and verify every immutable CSI
@@ -161,7 +168,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	// Wait for the partition to be Exported
 	// The Mgmt-Controller schedules it -> The Agent slices and exports it.
-	klog.Infof("Waiting for NVMePartition %s in namespace %s to be Exported...", name, ns)
+	klog.InfoS("Waiting for NVMePartition export", "name", name, "namespace", ns)
 	err = cs.waitForPartitionReady(ctx, name, ns)
 	if err != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "partition failed to become ready: %v", err)
@@ -210,6 +217,18 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}, nil
 }
 
+func validateStorageCombination(targetBackend, volumeManager string) error {
+	switch targetBackend {
+	case spdkTargetBackend, "kernel":
+	default:
+		return fmt.Errorf("target backend %q is not implemented", targetBackend)
+	}
+	if volumeManager != partitionVolumeManager {
+		return fmt.Errorf("volume manager %q is not implemented", volumeManager)
+	}
+	return nil
+}
+
 func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
@@ -230,7 +249,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 
-	klog.Infof("DeleteVolume: ID=%s", volID)
+	klog.InfoS("Deleting volume", "volumeID", volID)
 
 	reference, err := volumeidentity.ParseVolumeHandle(volID)
 	if err != nil {
@@ -258,7 +277,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Errorf(codes.Internal, "failed to check volume attachment: %v", err)
 	}
 	if err := cs.k8sClient.Delete(ctx, partition); err != nil && client.IgnoreNotFound(err) != nil {
-		klog.Errorf("Failed to delete NVMePartition %s: %v", key, err)
+		klog.ErrorS(err, "Failed to delete NVMePartition", "partition", key)
 		return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
 	}
 

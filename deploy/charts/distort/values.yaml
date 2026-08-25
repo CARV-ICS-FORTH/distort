@@ -50,13 +50,17 @@ csi:
       memory: 64Mi
 
 serviceAccount:
-  # Specifies whether a service account should be created
+  # Specifies whether component service accounts should be created.
   create: true
-  # Annotations to add to the service account
+  # Annotations added to every component service account.
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
-  name: "distort"
+  # Optional component-specific names. Empty values use <release>-distort-<component>
+  # when create is true. All four names are required and must be distinct when false.
+  names:
+    manager: ""
+    agent: ""
+    csiController: ""
+    csiNode: ""
 
 rbac:
   # Specifies whether RBAC resources should be created

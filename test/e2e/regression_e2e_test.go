@@ -675,19 +675,47 @@ spec:
 	})
 })
 
-var _ = Describe("Review finding API and authorization regressions", Label("known-failure"), func() {
-	It("prevents the shared workload identity from mutating Nodes", Label("F18", "rbac"), func() {
-		requireKnownE2E("F18")
-		out, err := kubectl(
-			"auth", "can-i", "update", "nodes",
-			"--as=system:serviceaccount:distort-system:distort",
-		)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(strings.TrimSpace(out)).To(Equal("no"))
+var _ = Describe("Review finding API and authorization regressions", func() {
+	It("gives each workload only its required Kubernetes API access", Label("F18", "rbac"), func() {
+		checks := []struct {
+			account  string
+			verb     string
+			resource string
+			want     string
+		}{
+			{account: "distort-manager", verb: "update", resource: "nvmepartitions.storage.distort.io", want: "yes"},
+			{account: "distort-agent", verb: "update", resource: "nvmepartitions.storage.distort.io/status", want: "yes"},
+			{account: "distort-csi-controller", verb: "create", resource: "nvmepartitions.storage.distort.io", want: "yes"},
+			{account: "distort-manager", verb: "create", resource: "persistentvolumes", want: "no"},
+			{account: "distort-agent", verb: "create", resource: "persistentvolumeclaims", want: "no"},
+			{account: "distort-csi-controller", verb: "update", resource: "nvmedevices.storage.distort.io", want: "no"},
+			{account: "distort-csi-node", verb: "get", resource: "nvmepartitions.storage.distort.io", want: "no"},
+		}
+		for _, account := range []string{"distort-manager", "distort-agent", "distort-csi-controller", "distort-csi-node"} {
+			checks = append(checks, struct {
+				account  string
+				verb     string
+				resource string
+				want     string
+			}{account: account, verb: "update", resource: "nodes", want: "no"})
+		}
+		for _, check := range checks {
+			By(fmt.Sprintf("checking %s can %s %s = %s", check.account, check.verb, check.resource, check.want))
+			out, err := kubectl(
+				"auth", "can-i", check.verb, check.resource,
+				"--as=system:serviceaccount:distort-system:"+check.account,
+			)
+			if check.want == "yes" {
+				Expect(err).NotTo(HaveOccurred())
+			} else {
+				Expect(err).To(HaveOccurred(), "kubectl auth can-i returns status 1 when access is denied")
+			}
+			Expect(strings.Fields(out)).NotTo(BeEmpty())
+			Expect(strings.Fields(out)[len(strings.Fields(out))-1]).To(Equal(check.want))
+		}
 	})
 
 	It("rejects the unimplemented lvm manager at admission", Label("F20", "admission"), func() {
-		requireKnownE2E("F20")
 		name := "regression-f20-lvm"
 		DeferCleanup(func() {
 			_, _ = kubectl("delete", "nvmepartition", name, "--ignore-not-found", "--wait=false")
@@ -705,7 +733,6 @@ spec:
 	})
 
 	It("automatically restores an exported SPDK target after nvmf_tgt crashes", Label("F17", "recovery"), func() {
-		requireKnownE2E("F17")
 		serial := serialForNode("distort-worker-1")
 		_, err := applyManifest(fmt.Sprintf(`
 apiVersion: storage.distort.io/v1alpha1
@@ -734,10 +761,10 @@ spec:
 		)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
+			_, _ = kubectl("delete", "nvmepartition", "regression-f17-volume", "--ignore-not-found", "--wait=true", "--timeout=120s")
+			_, _ = kubectl("delete", "nvmedeviceclaim", "regression-f17-claim", "--ignore-not-found", "--wait=true", "--timeout=120s")
 			_, _ = kubectl("delete", "pod", "-n", "distort-system", strings.TrimSpace(agentPod), "--ignore-not-found", "--wait=true")
 			_, _ = kubectl("rollout", "status", "-n", "distort-system", "daemonset/distort-agent", "--timeout=180s")
-			_, _ = kubectl("delete", "nvmepartition", "regression-f17-volume", "--ignore-not-found", "--wait=false")
-			_, _ = kubectl("delete", "nvmedeviceclaim", "regression-f17-claim", "--ignore-not-found", "--wait=false")
 		})
 
 		Eventually(func(g Gomega) {
@@ -749,12 +776,20 @@ spec:
 		Expect(err).NotTo(HaveOccurred())
 		Expect(expectedNQN).NotTo(BeEmpty())
 
-		_, err = kubectl("exec", "-n", "distort-system", strings.TrimSpace(agentPod), "--", "pkill", "-9", "nvmf_tgt")
+		targetPIDs, err := kubectl(
+			"exec", "-n", "distort-system", strings.TrimSpace(agentPod), "-c", "agent", "--", "pidof", "nvmf_tgt",
+		)
+		Expect(err).NotTo(HaveOccurred())
+		pids := strings.Fields(targetPIDs)
+		Expect(pids).NotTo(BeEmpty(), "the exported partition must have a running nvmf_tgt process")
+		_, err = kubectl(
+			"exec", "-n", "distort-system", strings.TrimSpace(agentPod), "-c", "agent", "--", "kill", "-9", pids[0],
+		)
 		Expect(err).NotTo(HaveOccurred())
 
 		Eventually(func(g Gomega) {
 			out, rpcErr := kubectl(
-				"exec", "-n", "distort-system", strings.TrimSpace(agentPod), "--",
+				"exec", "-n", "distort-system", strings.TrimSpace(agentPod), "-c", "agent", "--",
 				"/opt/spdk/scripts/rpc.py", "nvmf_get_subsystems",
 			)
 			g.Expect(rpcErr).NotTo(HaveOccurred())

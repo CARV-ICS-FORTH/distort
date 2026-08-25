@@ -1,9 +1,14 @@
 apiVersion: storage.distort.io/v1alpha1
 kind: RDMAStorageNode
 metadata:
+  annotations:
+    storage.distort.io/example-only: "Agent-owned resource; do not apply to a managed cluster"
   labels:
     app.kubernetes.io/name: distort
     app.kubernetes.io/managed-by: kustomize
   name: rdmastoragenode-sample
 spec:
-  # TODO(user): Add fields here
+  nodeName: worker-with-rdma
+  rdmaIP: 192.0.2.10
+  transport: RoCEv2
+  linkSpeed: 100 Gb/sec

@@ -65,15 +65,18 @@ func TestChartEnablesControllerAttachmentFencing(t *testing.T) {
 	}
 
 	rbac := readRepositoryFile(t, "deploy/charts/distort/templates/rbac.yaml")
-	for _, resource := range []string{"nvmevolumeattachments", "nvmevolumeattachments/status", "volumeattachments", "volumeattachments/status"} {
-		if !strings.Contains(rbac, "- "+resource) {
+	resources := []string{
+		"nvmevolumeattachments", "nvmevolumeattachments/status",
+		"volumeattachments", "volumeattachments/status",
+	}
+	for _, resource := range resources {
+		if !strings.Contains(rbac, `"`+resource+`"`) {
 			t.Errorf("chart RBAC does not include %s", resource)
 		}
 	}
 }
 
 func TestSampleManifestsContainUsableSpecs(t *testing.T) {
-	knownfailure.Require(t, "F21")
 	samples, err := filepath.Glob(filepath.Join(repositoryRoot(t), "config", "samples", "storage_*.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -109,16 +112,19 @@ func TestSampleManifestsContainUsableSpecs(t *testing.T) {
 			t.Errorf("%s has no concrete spec fields", filepath.Base(sample))
 		}
 	}
+	kustomization := readRepositoryFile(t, "config/samples/kustomization.yaml")
+	for _, agentOwned := range []string{"storage_v1alpha1_nvmedevice.yaml", "storage_v1alpha1_rdmastoragenode.yaml"} {
+		if regexp.MustCompile(`(?m)^\s*-\s*` + regexp.QuoteMeta(agentOwned) + `\s*$`).MatchString(kustomization) {
+			t.Errorf("default sample kustomization applies agent-owned resource %s", agentOwned)
+		}
+	}
 }
 
 func TestChartUsesSeparateServiceAccounts(t *testing.T) {
-	knownfailure.Require(t, "F18")
 	rbac := readRepositoryFile(t, "deploy/charts/distort/templates/rbac.yaml")
-	if count := strings.Count(rbac, "apiVersion: v1\nkind: ServiceAccount"); count < 4 {
-		t.Fatalf(
-			"chart defines %d ServiceAccounts, want at least one per manager, agent, CSI controller, and CSI node",
-			count,
-		)
+	componentRange := regexp.MustCompile(`range \$component := list "manager" "agent" "csiController" "csiNode"`)
+	if !componentRange.MatchString(rbac) {
+		t.Fatal("chart must create service accounts for manager, agent, CSI controller, and CSI node")
 	}
 
 	workloads := []string{
@@ -145,7 +151,6 @@ func TestChartUsesSeparateServiceAccounts(t *testing.T) {
 }
 
 func TestCRDDoesNotAdvertiseUnimplementedLVM(t *testing.T) {
-	knownfailure.Require(t, "F20")
 	crd := readRepositoryFile(t, "config/crd/bases/storage.distort.io_nvmepartitions.yaml")
 	if regexp.MustCompile(`(?m)^\s*- lvm\s*$`).MatchString(crd) {
 		t.Fatal("NVMePartition CRD admits lvm although no lvm plugin is registered")

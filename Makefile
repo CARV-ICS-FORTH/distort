@@ -78,7 +78,7 @@ test-regression: manifests generate fmt vet setup-envtest ## Run quarantined tes
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" DISTORT_RUN_KNOWN_FAILURES=1 DISTORT_FINDING="$(FINDING)" go test $$(go list ./... | grep -v /e2e) -count=1
 
 .PHONY: test-suite
-test-suite: test test-static ## Run the complete green host-side suite and compile E2E tests.
+test-suite: test test-static lint ## Run the complete green host-side suite and compile E2E tests.
 	go test -tags=e2e ./test/e2e -run '^$$'
 
 .PHONY: test-static

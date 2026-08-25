@@ -52,6 +52,19 @@ The agent accepts two optional environment variables containing exact, comma-sep
 
 For example, `0000:04:00.0,0000:05:00.0` selects two exact addresses. Substring and partial-address matches are deliberately rejected. These variables are not currently first-class Helm values, so installations that need them must add the environment entries to the agent workload through their deployment customization. Confirm the PCI addresses and mounted-device state before enabling an agent; assigning an OS or otherwise in-use controller to SPDK can make the host unavailable or destroy data.
 
+Malformed list entries stop discovery instead of broadening the selection. DISTORT also excludes a controller whenever mounted-state inspection cannot be completed. `NVME_ALLOW_UNSAFE_MOUNT_INSPECTION=true` bypasses only that inspection failure and should be reserved for a controlled recovery environment after an administrator has independently verified that the device is unused.
+
+### RDMA readiness
+
+A storage node is eligible for placement only while its agent discovers an active RDMA port, maps it to a network interface with a non-loopback IP address, and refreshes the node heartbeat. Inspect the published endpoint and readiness with:
+
+```bash
+kubectl get rdmastoragenodes
+kubectl get rdmastoragenode <node-name> -o yaml
+```
+
+The reported transport, link speed, IP address, active-export count, `Ready` condition, and `lastHeartbeatTime` come from the node's live RDMA state. Placement waits when no endpoint is ready or when its heartbeat is older than 45 seconds; DISTORT does not substitute a Kubernetes InternalIP or loopback address.
+
 ### Step 2: Allocate Drives via `NVMeDeviceClaim`
 
 To make a discovered physical device available for partitioning and pod allocation, an administrator must **claim** it. 
@@ -97,7 +110,7 @@ DISTORT supports multiple backends and volume carving configurations. These are 
 | Parameter | Type | Allowed Values | Default | Description |
 |---|---|---|---|---|
 | `target-backend` | String | `spdk`, `kernel` | `spdk` | The target export technology to run on the storage nodes. |
-| `volume-manager` | String | `partition` (or `lvm` in future) | `partition` | The volume carving method to slice physical drives. |
+| `volume-manager` | String | `partition` | `partition` | The volume carving method to slice physical drives. Unimplemented managers such as `lvm` are rejected. |
 | `spdk-core-mask` | String | CPU mask (e.g., `0x1`, `0x3`) | `0x1` | Core affinity mask to pass to the SPDK target daemon (SPDK only). |
 | `fsType` | String | `ext4`, `xfs` | `ext4` | Filesystem created on a blank exported volume.|
 | `csi.storage.k8s.io/fstype` | String | `ext4`, `xfs` | `ext4` | CSI ecosystem spelling for the filesystem type. |
@@ -157,7 +170,9 @@ The filesystem choice applies when DISTORT first stages a blank volume. If a vol
 
 Custom formatting options and StorageClass `mountOptions` are not currently supported. XFS also requires XFS support in the consumer node's host kernel, cannot be shrunk, and must not be mounted read-write from multiple nodes because it is not a clustered filesystem.
 
-DISTORT also does not yet provide controller-side attachment fencing. Until `ControllerPublishVolume`/`ControllerUnpublishVolume` or an equivalent durable lease is implemented, do not force a read-write volume between nodes or assume `ReadWriteOnce` alone prevents a second active consumer. See F25 in the [review findings](/review-findings/).
+DISTORT implements controller-side single-writer fencing through `ControllerPublishVolume` and `ControllerUnpublishVolume`. A durable `NVMeVolumeAttachment` authorizes one node and host NQN at a time, while the target backend defaults to closed host access. A competing node is rejected until the current owner unpublishes.
+
+Forced takeover is deliberately an administrator operation. First fence or confirm the old node is unreachable, then annotate the current attachment with `storage.distort.io/force-detach-node=<current-node>`. DISTORT revokes and disconnects the old host before granting the replacement. Never apply this annotation while the old node can still access the volume. Final two-node hardware re-verification of this path remains tracked under F25 in the [review findings](/review-findings/).
 
 Apply the chosen StorageClass:
 

@@ -115,9 +115,10 @@ fi`
 	}
 	text := string(calls)
 	disable := strings.Index(text, "nvmf_subsystem_allow_any_host nqn.test:spdk-fencing -d")
-	remove := strings.Index(text, "nvmf_subsystem_remove_host nqn.test:spdk-fencing nqn.test:old-host --timeout-ms 10000")
+	remove := strings.Index(text, "nvmf_subsystem_remove_host nqn.test:spdk-fencing nqn.test:old-host")
 	add := strings.Index(text, "nvmf_subsystem_add_host nqn.test:spdk-fencing "+newHost)
-	if disable < 0 || remove < disable || add < remove || strings.Contains(text, "nvmf_subsystem_disconnect_host") {
+	if disable < 0 || remove < disable || add < remove ||
+		strings.Contains(text, "nvmf_subsystem_disconnect_host") || strings.Contains(text, "--timeout-ms") {
 		t.Fatalf("unsafe SPDK host transition order:\n%s", text)
 	}
 }
@@ -574,7 +575,13 @@ func TestSPDKExportHealthChecksBackingBdevAndListener(t *testing.T) {
 	rpc := writeTestExecutable(t, fakeBin, "rpc.py", `
 case "$1" in
   rpc_get_methods) printf '[]\n' ;;
-  nvmf_get_subsystems) printf '[{"nqn":"nqn.test","namespaces":[{"bdev_name":"lvs/volume"}],"listen_addresses":[{"trtype":"RDMA","traddr":"192.0.2.10","trsvcid":"4420"}]}]\n' ;;
+  bdev_get_bdevs)
+    if [ "$3" = "lvs/volume" ]; then
+      printf '[{"name":"lvol-uuid","uuid":"lvol-uuid","aliases":["lvs/volume"]}]\n'
+    else
+      printf '[]\n'
+    fi ;;
+  nvmf_get_subsystems) printf '[{"nqn":"nqn.test","namespaces":[{"bdev_name":"lvol-uuid"}],"listen_addresses":[{"trtype":"RDMA","traddr":"192.0.2.10","trsvcid":"4420"}]}]\n' ;;
   *) printf 'unexpected method %s\n' "$1" >&2; exit 8 ;;
 esac`)
 	oldExecutable := spdkRPCExecutable

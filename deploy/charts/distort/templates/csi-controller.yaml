@@ -17,7 +17,8 @@ spec:
         {{- include "distort.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: csi-controller
     spec:
-      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      # The external-provisioner and external-attacher share this Pod identity.
+      serviceAccountName: {{ include "distort.csiControllerServiceAccountName" . }}
       containers:
         - name: csi-attacher
           image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1

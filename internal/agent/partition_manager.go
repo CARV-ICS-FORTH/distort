@@ -215,6 +215,7 @@ func claimReferencesEqual(a, b *storagev1alpha1.NVMeDeviceClaimReference) bool {
 }
 
 func (p *PartitionManager) verifyProvisioningAuthorization(ctx context.Context, partition *storagev1alpha1.NVMePartition) (*storagev1alpha1.NVMeDevice, error) {
+	recoveringExistingAllocation := partition.Status.ExternalID != "" || partition.Status.BackendVolumeID != ""
 	claimRef := partition.Spec.ClaimRef
 	if claimRef == nil || claimRef.Namespace == "" || claimRef.Name == "" || claimRef.UID == "" {
 		return nil, fmt.Errorf("NVMePartition %s has no complete owning claim reference", partition.Name)
@@ -232,7 +233,7 @@ func (p *PartitionManager) verifyProvisioningAuthorization(ctx context.Context, 
 		!strings.EqualFold(device.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
 		return nil, fmt.Errorf("NVMeDevice %s does not match the assigned node and serial", device.Name)
 	}
-	if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed {
+	if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed && !recoveringExistingAllocation {
 		return nil, fmt.Errorf("NVMeDevice %s is not claimed", device.Name)
 	}
 	if !claimReferencesEqual(device.Status.ClaimRef, claimRef) {
@@ -250,9 +251,12 @@ func (p *PartitionManager) verifyProvisioningAuthorization(ctx context.Context, 
 	if !claim.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("NVMeDeviceClaim %s is being deleted", claimKey)
 	}
-	if !claim.Status.Active || claim.Status.MatchedDevice != device.Name ||
+	if claim.Status.MatchedDevice != device.Name ||
 		claim.Status.NodeName != partition.Spec.NodeName ||
 		!strings.EqualFold(claim.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
+		return nil, fmt.Errorf("NVMeDeviceClaim %s does not match NVMeDevice %s", claimKey, device.Name)
+	}
+	if !claim.Status.Active && !recoveringExistingAllocation {
 		return nil, fmt.Errorf("NVMeDeviceClaim %s is not actively bound to NVMeDevice %s", claimKey, device.Name)
 	}
 
@@ -329,350 +333,318 @@ func (p *PartitionManager) retryableProvisioningFailure(ctx context.Context, par
 	return p.recordProvisioningFailure(ctx, partition, reason, err, false)
 }
 
-// Reconcile handles partition configuration when an admin/controller assigns them to this node.
-func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+type resolvedPartitionPlugins struct {
+	targetBackendName string
+	volumeManagerName string
+	targetBackend     plugins.TargetBackend
+	volumeManager     plugins.VolumeManager
+}
 
-	var partition storagev1alpha1.NVMePartition
-	if err := p.Get(ctx, req.NamespacedName, &partition); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	// Double check we only process partitions for our own node
-	if partition.Spec.NodeName != p.NodeName {
-		return ctrl.Result{}, nil
-	}
-
-	isMarkedToBeDeleted := partition.GetDeletionTimestamp() != nil
-	if !isMarkedToBeDeleted && partitionHasTerminalFailure(&partition) {
-		return ctrl.Result{}, nil
-	}
-
-	// Resolve the target backend and volume manager plugins
+func resolvePartitionPlugins(partition *storagev1alpha1.NVMePartition) (resolvedPartitionPlugins, string, error) {
 	targetBackendName := partition.Spec.TargetBackend
-	logger.Info("Resolving target backend plugin", "backend", targetBackendName)
 	if targetBackendName == "" {
-		targetBackendName = spdkTargetBackend // default fallback
+		targetBackendName = spdkTargetBackend
 	}
-	backend, err := plugins.GetTargetBackend(targetBackendName)
+	targetBackend, err := plugins.GetTargetBackend(targetBackendName)
 	if err != nil {
-		logger.Error(err, "Failed to resolve target backend plugin", "backend", targetBackendName)
-		if !isMarkedToBeDeleted {
-			return p.terminalProvisioningFailure(ctx, &partition, "InvalidBackend", err)
+		return resolvedPartitionPlugins{}, "InvalidBackend", err
+	}
+
+	volumeManagerName := partition.Spec.VolumeManager
+	if volumeManagerName == "" || volumeManagerName == "partition" {
+		if targetBackendName == spdkTargetBackend {
+			volumeManagerName = "spdk-lvol"
+		} else {
+			volumeManagerName = "parted"
 		}
+	}
+	volumeManager, err := plugins.GetVolumeManager(volumeManagerName)
+	if err != nil {
+		return resolvedPartitionPlugins{}, "InvalidVolumeManager", err
+	}
+	return resolvedPartitionPlugins{
+		targetBackendName: targetBackendName,
+		volumeManagerName: volumeManagerName,
+		targetBackend:     targetBackend,
+		volumeManager:     volumeManager,
+	}, "", nil
+}
+
+func (p *PartitionManager) resolveDeletionDevice(partition *storagev1alpha1.NVMePartition, targetBackendName string) (string, string, error) {
+	if targetBackendName == spdkTargetBackend {
+		name := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
+		return name, name, nil
+	}
+	devices, err := DiscoverNVMe()
+	if err != nil {
+		return "", "", fmt.Errorf("discover NVMe devices during teardown: %w", err)
+	}
+	for _, device := range devices {
+		if strings.EqualFold(device.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
+			return "/dev/" + device.Name + "n1", device.Name, nil
+		}
+	}
+	return "", "", fmt.Errorf("NVMe device with serial %s was not found during teardown", partition.Spec.ParentDeviceSerialNumber)
+}
+
+func (p *PartitionManager) clearInactiveBackend(ctx context.Context, partition *storagev1alpha1.NVMePartition, targetBackendName string) error {
+	if targetBackendName == spdkTargetBackend {
+		return nil
+	}
+	var partitions storagev1alpha1.NVMePartitionList
+	if err := p.List(ctx, &partitions); err != nil {
+		return fmt.Errorf("list NVMePartitions during teardown: %w", err)
+	}
+	for _, candidate := range partitions.Items {
+		if candidate.Spec.ParentDeviceSerialNumber == partition.Spec.ParentDeviceSerialNumber &&
+			(candidate.Namespace != partition.Namespace || candidate.Name != partition.Name) &&
+			candidate.DeletionTimestamp.IsZero() {
+			return nil
+		}
+	}
+	deviceName := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
+	return p.updateDeviceStatus(ctx, types.NamespacedName{Name: deviceName}, func(status *storagev1alpha1.NVMeDeviceStatus) {
+		status.ActiveBackend = ""
+	})
+}
+
+func (p *PartitionManager) reconcilePartitionDeletion(
+	ctx context.Context,
+	key types.NamespacedName,
+	partition *storagev1alpha1.NVMePartition,
+	resolved resolvedPartitionPlugins,
+	externalID string,
+) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(partition, partitionFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	logger := log.FromContext(ctx)
+	logger.Info("Cleaning up NVMePartition", "partition", partition.Name)
+
+	nqn := partition.Status.NQN
+	if nqn == "" {
+		nqn = volumeidentity.NQN(externalID)
+	}
+	if err := resolved.targetBackend.UnexportVolume(ctx, nqn); err != nil {
+		logger.Error(err, "Failed to unexport NVMe target", "nqn", nqn)
+		return ctrl.Result{}, err
+	}
+	if err := p.releaseAttachmentAfterUnexport(ctx, partition); err != nil {
+		logger.Error(err, "Failed to release NVMeVolumeAttachment after target removal")
 		return ctrl.Result{}, err
 	}
 
-	vmName := partition.Spec.VolumeManager
-	logger.Info("Resolving volume manager plugin", "vm", vmName)
-	if vmName == "" || vmName == "partition" {
-		if targetBackendName == spdkTargetBackend {
-			vmName = "spdk-lvol"
-		} else {
-			vmName = "parted"
-		}
-	}
-	volManager, err := plugins.GetVolumeManager(vmName)
-	if err != nil {
-		logger.Error(err, "Failed to resolve volume manager plugin", "manager", vmName)
-		if !isMarkedToBeDeleted {
-			return p.terminalProvisioningFailure(ctx, &partition, "InvalidVolumeManager", err)
-		}
-		return ctrl.Result{}, err
-	}
-	var requestedAllocation int64
-	if !isMarkedToBeDeleted {
-		if err := storageoptions.Validate(targetBackendName, partition.Spec.TargetOptions); err != nil {
-			return p.terminalProvisioningFailure(ctx, &partition, "InvalidOptions", err)
-		}
-		requestedAllocation, err = capacity.RoundUp(partition.Spec.Size.Value())
+	if partition.Spec.ParentDeviceSerialNumber != "" {
+		devicePath, deviceName, err := p.resolveDeletionDevice(partition, resolved.targetBackendName)
 		if err != nil {
-			return p.terminalProvisioningFailure(ctx, &partition, "InvalidCapacity", fmt.Errorf("invalid partition capacity %q: %w", partition.Spec.Size.String(), err))
+			logger.Error(err, "Failed to resolve NVMe device during teardown")
+			return ctrl.Result{}, err
 		}
-		_, err = p.verifyProvisioningAuthorization(ctx, &partition)
-		if err != nil {
-			return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
+		identity := backendVolumeIdentity(partition.Status)
+		if err := resolved.volumeManager.DeleteVolume(ctx, devicePath, deviceName, externalID, identity); err != nil {
+			logger.Error(err, "Failed to delete volume from backend", "volume", externalID)
+			return ctrl.Result{}, err
 		}
-		if err := p.setClaimAuthorizationCondition(ctx, &partition, metav1.ConditionTrue, "ClaimOwnershipVerified", "The live owning claim authorizes this allocation"); err != nil {
+		if err := p.clearInactiveBackend(ctx, partition, resolved.targetBackendName); err != nil {
+			logger.Error(err, "Failed to clear NVMeDevice active backend")
 			return ctrl.Result{}, err
 		}
 	}
-	externalID, volumeID := identitiesForPartition(&partition)
 
-	if isMarkedToBeDeleted {
-		if controllerutil.ContainsFinalizer(&partition, partitionFinalizer) {
-			logger.Info("Cleaning up NVMePartition", "partition", partition.Name)
-
-			// 1. Unexport the NVMe-oF target
-			nqn := partition.Status.NQN
-			if nqn == "" {
-				// ExportVolume may have created the subsystem before the status
-				// update succeeded. All current backends use this deterministic NQN.
-				nqn = volumeidentity.NQN(externalID)
-			}
-			if err := backend.UnexportVolume(ctx, nqn); err != nil {
-				logger.Error(err, "Failed to unexport NVMe target", "nqn", nqn)
-				return ctrl.Result{}, err
-			}
-			if err := p.releaseAttachmentAfterUnexport(ctx, &partition); err != nil {
-				logger.Error(err, "Failed to release NVMeVolumeAttachment after target removal")
-				return ctrl.Result{}, err
-			}
-
-			// 2. Remove the partition from the block device
-			if partition.Spec.ParentDeviceSerialNumber != "" {
-				var devPath, devBaseName string
-				if targetBackendName == spdkTargetBackend {
-					// SPDK controller names are deterministic and remain available
-					// even when the device is no longer visible in kernel sysfs.
-					devBaseName = p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
-					devPath = devBaseName
-				} else {
-					devices, err := DiscoverNVMe()
-					if err != nil {
-						logger.Error(err, "Failed to discover NVMe devices during teardown")
-						return ctrl.Result{}, err
-					}
-					for _, d := range devices {
-						if strings.EqualFold(d.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
-							devBaseName = d.Name
-							devPath = "/dev/" + d.Name + "n1"
-							break
-						}
-					}
-					if devBaseName == "" {
-						err := fmt.Errorf("NVMe device with serial %s was not found during teardown", partition.Spec.ParentDeviceSerialNumber)
-						logger.Error(err, "Failed to resolve NVMe device during teardown")
-						return ctrl.Result{}, err
-					}
-				}
-
-				if err := volManager.DeleteVolume(ctx, devPath, devBaseName, externalID, backendVolumeIdentity(partition.Status)); err != nil {
-					logger.Error(err, "Failed to delete volume from backend", "volume", externalID)
-					return ctrl.Result{}, err
-				}
-
-				// Clear the operational mode for backends which do not retain
-				// ownership of the physical device. SPDK keeps its lvstore and
-				// controller attached for reuse; resetting PCI ownership without
-				// first deleting the lvstore and detaching the controller is unsafe.
-				var partList storagev1alpha1.NVMePartitionList
-				if err := p.List(ctx, &partList); err != nil {
-					logger.Error(err, "Failed to list NVMePartitions during teardown")
-					return ctrl.Result{}, err
-				}
-				activeCount := 0
-				for _, pt := range partList.Items {
-					if pt.Spec.ParentDeviceSerialNumber == partition.Spec.ParentDeviceSerialNumber &&
-						(pt.Namespace != partition.Namespace || pt.Name != partition.Name) &&
-						pt.DeletionTimestamp.IsZero() {
-						activeCount++
-					}
-				}
-				if activeCount == 0 && targetBackendName != spdkTargetBackend {
-					deviceName := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
-					err := p.updateDeviceStatus(ctx, types.NamespacedName{Name: deviceName}, func(status *storagev1alpha1.NVMeDeviceStatus) {
-						status.ActiveBackend = ""
-					})
-					if err != nil {
-						logger.Error(err, "Failed to clear NVMeDevice active backend")
-						return ctrl.Result{}, err
-					}
-				}
-			}
-
-			// Remove the finalizer only after every required external cleanup
-			// operation succeeded. Any error above retains it and causes a retry.
-			var latest storagev1alpha1.NVMePartition
-			if err := p.Get(ctx, req.NamespacedName, &latest); err != nil {
-				return ctrl.Result{}, client.IgnoreNotFound(err)
-			}
-			base := latest.DeepCopy()
-			controllerutil.RemoveFinalizer(&latest, partitionFinalizer)
-			err := p.Patch(ctx, &latest, client.MergeFrom(base))
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
+	var latest storagev1alpha1.NVMePartition
+	if err := p.Get(ctx, key, &latest); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	base := latest.DeepCopy()
+	controllerutil.RemoveFinalizer(&latest, partitionFinalizer)
+	return ctrl.Result{}, p.Patch(ctx, &latest, client.MergeFrom(base))
+}
 
+func (p *PartitionManager) ensurePartitionIdentityAndFinalizer(
+	ctx context.Context,
+	key types.NamespacedName,
+	partition *storagev1alpha1.NVMePartition,
+	externalID string,
+	volumeID string,
+) error {
 	if partition.Status.ExternalID != externalID || partition.Status.VolumeID != volumeID {
-		if err := p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
+		if err := p.updatePartitionStatus(ctx, key, func(status *storagev1alpha1.NVMePartitionStatus) {
 			status.ExternalID = externalID
 			status.VolumeID = volumeID
 		}); err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 		partition.Status.ExternalID = externalID
 		partition.Status.VolumeID = volumeID
 	}
-
-	// Ensure finalizer is present
-	if !controllerutil.ContainsFinalizer(&partition, partitionFinalizer) {
-		base := partition.DeepCopy()
-		controllerutil.AddFinalizer(&partition, partitionFinalizer)
-		if err := p.Patch(ctx, &partition, client.MergeFrom(base)); err != nil {
-			return ctrl.Result{}, err
-		}
+	if controllerutil.ContainsFinalizer(partition, partitionFinalizer) {
+		return nil
 	}
+	base := partition.DeepCopy()
+	controllerutil.AddFinalizer(partition, partitionFinalizer)
+	return p.Patch(ctx, partition, client.MergeFrom(base))
+}
 
-	// If it's already exported or failed, verify its existence or return
-	switch partition.Status.State {
-	case storagev1alpha1.NVMePartitionStateExported:
-		portalIP, err := p.rdmaEndpoint(ctx)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		healthy := true
-		if checker, ok := backend.(plugins.ExportHealthChecker); ok {
-			healthErr := checker.CheckExport(ctx, partition.Status.NQN, partition.Status.BackendVolumeID,
-				portalIP, partition.Status.PortalPort, partition.Spec.TargetOptions)
-			if healthErr != nil {
-				healthy = false
-				logger.Error(healthErr, "Export health check failed; re-provisioning", "nqn", partition.Status.NQN)
-			}
-		}
-		if healthy {
-			if err := p.reconcileAttachmentAccess(ctx, &partition, backend); err != nil {
-				logger.Error(err, "Failed to reconcile exclusive NVMe host access", "nqn", partition.Status.NQN)
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: exportedHealthInterval}, nil
-		}
-	case storagev1alpha1.NVMePartitionStateFailed:
-		// Retry failures classified as transient. Idempotent plugin operations can
-		// recover resources created before an RPC response or status update failed.
-		logger.Info("Retrying failed NVMePartition provisioning")
+func (p *PartitionManager) reconcileExportedPartition(
+	ctx context.Context,
+	partition *storagev1alpha1.NVMePartition,
+	backend plugins.TargetBackend,
+) (bool, ctrl.Result, error) {
+	if partition.Status.State != storagev1alpha1.NVMePartitionStateExported {
+		return false, ctrl.Result{}, nil
 	}
-
-	logger.Info("Provisioning partition on local node", "partition", partition.Name, "size", partition.Spec.Size.String())
-
-	// Re-fetch the ownership chain immediately before the first host operation.
-	dev, err := p.verifyProvisioningAuthorization(ctx, &partition)
+	portalIP, err := p.rdmaEndpoint(ctx)
 	if err != nil {
-		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
+		return true, ctrl.Result{}, err
 	}
-	deviceName := dev.Name
+	if checker, ok := backend.(plugins.ExportHealthChecker); ok {
+		err := checker.CheckExport(ctx, partition.Status.NQN, partition.Status.BackendVolumeID,
+			portalIP, partition.Status.PortalPort, partition.Spec.TargetOptions)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Export health check failed; re-provisioning", "nqn", partition.Status.NQN)
+			return false, ctrl.Result{}, nil
+		}
+	}
+	if err := p.reconcileAttachmentAccess(ctx, partition, backend); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to reconcile exclusive NVMe host access", "nqn", partition.Status.NQN)
+		return true, ctrl.Result{}, err
+	}
+	return true, ctrl.Result{RequeueAfter: exportedHealthInterval}, nil
+}
+
+func findProvisioningDevice(partition *storagev1alpha1.NVMePartition, targetBackendName string) (string, string, string, error) {
+	devices, err := DiscoverNVMe()
+	if err != nil {
+		return "", "", "DiscoveryFailed", fmt.Errorf("discover NVMe devices: %w", err)
+	}
+	for _, device := range devices {
+		if strings.EqualFold(device.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
+			path := "/dev/" + device.Name + "n1"
+			if targetBackendName == spdkTargetBackend {
+				path = device.Name
+			}
+			return path, device.Name, "", nil
+		}
+	}
+	return "", "", "DeviceNotFound", fmt.Errorf("NVMe device with serial %s not found on host", partition.Spec.ParentDeviceSerialNumber)
+}
+
+func (p *PartitionManager) persistBackendVolumeIdentity(
+	ctx context.Context,
+	key types.NamespacedName,
+	partition *storagev1alpha1.NVMePartition,
+	created plugins.VolumeIdentity,
+) error {
+	if backendVolumeIdentity(partition.Status) == created {
+		return nil
+	}
+	if err := p.updatePartitionStatus(ctx, key, func(status *storagev1alpha1.NVMePartitionStatus) {
+		status.BackendVolumeID = created.BackendVolumeID
+		status.AllocatedCapacity = *resource.NewQuantity(created.CapacityBytes, resource.BinarySI)
+		status.SPDKBaseBdev = created.BaseBdev
+		status.SPDKLvstoreName = created.VolumeStoreName
+		status.SPDKLvstoreUUID = created.VolumeStoreUUID
+		status.SPDKLvolName = created.VolumeName
+		status.SPDKLvolUUID = created.VolumeUUID
+	}); err != nil {
+		return err
+	}
+	partition.Status.BackendVolumeID = created.BackendVolumeID
+	partition.Status.AllocatedCapacity = *resource.NewQuantity(created.CapacityBytes, resource.BinarySI)
+	partition.Status.SPDKBaseBdev = created.BaseBdev
+	partition.Status.SPDKLvstoreName = created.VolumeStoreName
+	partition.Status.SPDKLvstoreUUID = created.VolumeStoreUUID
+	partition.Status.SPDKLvolName = created.VolumeName
+	partition.Status.SPDKLvolUUID = created.VolumeUUID
+	return nil
+}
+
+func (p *PartitionManager) provisionPartition(
+	ctx context.Context,
+	key types.NamespacedName,
+	partition *storagev1alpha1.NVMePartition,
+	resolved resolvedPartitionPlugins,
+	externalID string,
+	requestedAllocation int64,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Provisioning NVMePartition", "partition", partition.Name, "size", partition.Spec.Size.String())
+
+	device, err := p.verifyProvisioningAuthorization(ctx, partition)
+	if err != nil {
+		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
+	}
 	if _, err := p.rdmaEndpoint(ctx); err != nil {
-		return p.retryableProvisioningFailure(ctx, &partition, "RDMAEndpointUnavailable", err)
+		return p.retryableProvisioningFailure(ctx, partition, "RDMAEndpointUnavailable", err)
 	}
-
-	if dev.Status.ActiveBackend != "" && dev.Status.ActiveBackend != targetBackendName {
-		err := fmt.Errorf("device is currently locked to backend %s, requested %s", dev.Status.ActiveBackend, targetBackendName)
+	if device.Status.ActiveBackend != "" && device.Status.ActiveBackend != resolved.targetBackendName {
+		err := fmt.Errorf("device is currently locked to backend %s, requested %s", device.Status.ActiveBackend, resolved.targetBackendName)
 		logger.Error(err, "Mismatched backend for target device")
-		return p.retryableProvisioningFailure(ctx, &partition, "BackendBusy", err)
+		return p.retryableProvisioningFailure(ctx, partition, "BackendBusy", err)
 	}
-
-	// Setup the hardware device driver for the chosen backend
-	if err := backend.SetupDevice(ctx, dev.Spec.PCIAddress, dev.Name, partition.Spec.TargetOptions); err != nil {
+	if err := resolved.targetBackend.SetupDevice(ctx, device.Spec.PCIAddress, device.Name, partition.Spec.TargetOptions); err != nil {
 		logger.Error(err, "Failed to setup physical device driver for backend")
-		return p.retryableProvisioningFailure(ctx, &partition, "DeviceSetupFailed", err)
+		return p.retryableProvisioningFailure(ctx, partition, "DeviceSetupFailed", err)
 	}
-
-	// Lock the active backend state on the device
-	if dev.Status.ActiveBackend == "" {
-		err := p.updateDeviceStatus(ctx, types.NamespacedName{Name: deviceName}, func(status *storagev1alpha1.NVMeDeviceStatus) {
-			status.ActiveBackend = targetBackendName
+	if device.Status.ActiveBackend == "" {
+		err := p.updateDeviceStatus(ctx, types.NamespacedName{Name: device.Name}, func(status *storagev1alpha1.NVMeDeviceStatus) {
+			status.ActiveBackend = resolved.targetBackendName
 		})
 		if err != nil {
 			logger.Error(err, "Failed to update NVMeDevice active backend status")
-			return p.retryableProvisioningFailure(ctx, &partition, "DeviceStatusUpdateFailed", err)
+			return p.retryableProvisioningFailure(ctx, partition, "DeviceStatusUpdateFailed", err)
 		}
 	}
 
-	// Resolve the block device paths
-	devices, err := DiscoverNVMe()
+	devicePath, deviceName, failureReason, err := findProvisioningDevice(partition, resolved.targetBackendName)
 	if err != nil {
-		logger.Error(err, "Failed to discover NVMe devices")
-		return p.retryableProvisioningFailure(ctx, &partition, "DiscoveryFailed", err)
+		logger.Error(err, "Failed to locate parent NVMe device")
+		return p.retryableProvisioningFailure(ctx, partition, failureReason, err)
 	}
-
-	var devPath, devBaseName string
-	for _, d := range devices {
-		if strings.EqualFold(d.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
-			devBaseName = d.Name
-			devPath = "/dev/" + d.Name + "n1"
-			if targetBackendName == spdkTargetBackend {
-				devPath = d.Name
-			}
-			break
-		}
+	if _, err := p.verifyProvisioningAuthorization(ctx, partition); err != nil {
+		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
 	}
-
-	if devBaseName == "" {
-		err := fmt.Errorf("NVMe device with serial %s not found on host", partition.Spec.ParentDeviceSerialNumber)
-		logger.Error(err, "Cannot locate parent device")
-		return p.retryableProvisioningFailure(ctx, &partition, "DeviceNotFound", err)
-	}
-
-	// Setup and slice volume storage
-	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
-		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
-	}
-	if err := volManager.SetupStorage(ctx, devPath, devBaseName); err != nil {
+	if err := resolved.volumeManager.SetupStorage(ctx, devicePath, deviceName); err != nil {
 		logger.Error(err, "Failed to configure storage slicing")
-		return p.retryableProvisioningFailure(ctx, &partition, "StorageSetupFailed", err)
+		return p.retryableProvisioningFailure(ctx, partition, "StorageSetupFailed", err)
 	}
-
-	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
-		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
+	if _, err := p.verifyProvisioningAuthorization(ctx, partition); err != nil {
+		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
 	}
-	createdVolume, err := volManager.CreateVolume(ctx, devPath, devBaseName, externalID, partition.Spec.Size.Value())
+	created, err := resolved.volumeManager.CreateVolume(ctx, devicePath, deviceName, externalID, partition.Spec.Size.Value())
 	if err != nil {
 		logger.Error(err, "Failed to carve volume from device")
-		return p.retryableProvisioningFailure(ctx, &partition, "VolumeCreationFailed", err)
+		return p.retryableProvisioningFailure(ctx, partition, "VolumeCreationFailed", err)
 	}
-	if createdVolume.BackendVolumeID == "" {
-		err := fmt.Errorf("volume manager %s returned an empty backend volume ID", vmName)
-		return p.terminalProvisioningFailure(ctx, &partition, "InvalidVolumeIdentity", err)
+	if created.BackendVolumeID == "" {
+		err := fmt.Errorf("volume manager %s returned an empty backend volume ID", resolved.volumeManagerName)
+		return p.terminalProvisioningFailure(ctx, partition, "InvalidVolumeIdentity", err)
 	}
-	if createdVolume.CapacityBytes < requestedAllocation {
-		err := fmt.Errorf("volume manager %s allocated %d bytes, below required %d", vmName, createdVolume.CapacityBytes, requestedAllocation)
-		return p.terminalProvisioningFailure(ctx, &partition, "InsufficientAllocation", err)
+	if created.CapacityBytes < requestedAllocation {
+		err := fmt.Errorf("volume manager %s allocated %d bytes, below required %d", resolved.volumeManagerName, created.CapacityBytes, requestedAllocation)
+		return p.terminalProvisioningFailure(ctx, partition, "InsufficientAllocation", err)
 	}
-	if backendVolumeIdentity(partition.Status) != createdVolume {
-		if err := p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
-			status.BackendVolumeID = createdVolume.BackendVolumeID
-			status.AllocatedCapacity = *resource.NewQuantity(createdVolume.CapacityBytes, resource.BinarySI)
-			status.SPDKBaseBdev = createdVolume.BaseBdev
-			status.SPDKLvstoreName = createdVolume.VolumeStoreName
-			status.SPDKLvstoreUUID = createdVolume.VolumeStoreUUID
-			status.SPDKLvolName = createdVolume.VolumeName
-			status.SPDKLvolUUID = createdVolume.VolumeUUID
-		}); err != nil {
-			return ctrl.Result{}, err
-		}
-		partition.Status.BackendVolumeID = createdVolume.BackendVolumeID
-		partition.Status.AllocatedCapacity = *resource.NewQuantity(createdVolume.CapacityBytes, resource.BinarySI)
-		partition.Status.SPDKBaseBdev = createdVolume.BaseBdev
-		partition.Status.SPDKLvstoreName = createdVolume.VolumeStoreName
-		partition.Status.SPDKLvstoreUUID = createdVolume.VolumeStoreUUID
-		partition.Status.SPDKLvolName = createdVolume.VolumeName
-		partition.Status.SPDKLvolUUID = createdVolume.VolumeUUID
+	if err := p.persistBackendVolumeIdentity(ctx, key, partition, created); err != nil {
+		return ctrl.Result{}, err
 	}
-	blockPath := createdVolume.BackendVolumeID
 
 	portalIP, err := p.rdmaEndpoint(ctx)
 	if err != nil {
-		return p.retryableProvisioningFailure(ctx, &partition, "RDMAEndpointUnavailable", err)
+		return p.retryableProvisioningFailure(ctx, partition, "RDMAEndpointUnavailable", err)
 	}
-	portalPort := 4420
-	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
-		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
+	if _, err := p.verifyProvisioningAuthorization(ctx, partition); err != nil {
+		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
 	}
-	nqn, err := backend.ExportVolume(ctx, externalID, blockPath, portalIP, portalPort, partition.Spec.TargetOptions)
+	nqn, err := resolved.targetBackend.ExportVolume(ctx, externalID, created.BackendVolumeID, portalIP, 4420, partition.Spec.TargetOptions)
 	if err != nil {
 		logger.Error(err, "Failed to export volume as target")
-		return p.retryableProvisioningFailure(ctx, &partition, "ExportFailed", err)
+		return p.retryableProvisioningFailure(ctx, partition, "ExportFailed", err)
 	}
-
-	// Update partition status
-	err = p.updatePartitionStatus(ctx, req.NamespacedName, func(status *storagev1alpha1.NVMePartitionStatus) {
+	err = p.updatePartitionStatus(ctx, key, func(status *storagev1alpha1.NVMePartitionStatus) {
 		status.State = storagev1alpha1.NVMePartitionStateExported
 		status.NQN = nqn
 		status.PortalIP = portalIP
-		status.PortalPort = portalPort
+		status.PortalPort = 4420
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type: partitionProvisioningCondition, Status: metav1.ConditionTrue,
 			ObservedGeneration: partition.Generation, Reason: "Provisioned",
@@ -680,12 +652,63 @@ func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		})
 	})
 	if err != nil {
-		logger.Error(err, "Failed to update partition status")
+		logger.Error(err, "Failed to update NVMePartition status")
 		return ctrl.Result{}, err
 	}
-
-	logger.Info("Successfully provisioned and exported partition", "partition", partition.Name)
+	logger.Info("Provisioned and exported NVMePartition", "partition", partition.Name)
 	return ctrl.Result{RequeueAfter: exportedHealthInterval}, nil
+}
+
+// Reconcile handles partition configuration when an admin/controller assigns them to this node.
+func (p *PartitionManager) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	var partition storagev1alpha1.NVMePartition
+	if err := p.Get(ctx, req.NamespacedName, &partition); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if partition.Spec.NodeName != p.NodeName {
+		return ctrl.Result{}, nil
+	}
+	deleting := partition.GetDeletionTimestamp() != nil
+	if !deleting && partitionHasTerminalFailure(&partition) {
+		return ctrl.Result{}, nil
+	}
+	resolved, failureReason, err := resolvePartitionPlugins(&partition)
+	if err != nil {
+		logger.Error(err, "Failed to resolve NVMePartition plugins", "reason", failureReason)
+		if !deleting {
+			return p.terminalProvisioningFailure(ctx, &partition, failureReason, err)
+		}
+		return ctrl.Result{}, err
+	}
+	externalID, volumeID := identitiesForPartition(&partition)
+	if deleting {
+		return p.reconcilePartitionDeletion(ctx, req.NamespacedName, &partition, resolved, externalID)
+	}
+	if err := storageoptions.Validate(resolved.targetBackendName, partition.Spec.TargetOptions); err != nil {
+		return p.terminalProvisioningFailure(ctx, &partition, "InvalidOptions", err)
+	}
+	requestedAllocation, err := capacity.RoundUp(partition.Spec.Size.Value())
+	if err != nil {
+		return p.terminalProvisioningFailure(ctx, &partition, "InvalidCapacity", fmt.Errorf("invalid partition capacity %q: %w", partition.Spec.Size.String(), err))
+	}
+	if _, err := p.verifyProvisioningAuthorization(ctx, &partition); err != nil {
+		return p.rejectUnauthorizedProvisioning(ctx, &partition, err)
+	}
+	if err := p.setClaimAuthorizationCondition(ctx, &partition, metav1.ConditionTrue, "ClaimOwnershipVerified", "The live owning claim authorizes this allocation"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := p.ensurePartitionIdentityAndFinalizer(ctx, req.NamespacedName, &partition, externalID, volumeID); err != nil {
+		return ctrl.Result{}, err
+	}
+	handled, result, err := p.reconcileExportedPartition(ctx, &partition, resolved.targetBackend)
+	if handled || err != nil {
+		return result, err
+	}
+	if partition.Status.State == storagev1alpha1.NVMePartitionStateFailed {
+		logger.Info("Retrying failed NVMePartition provisioning")
+	}
+	return p.provisionPartition(ctx, req.NamespacedName, &partition, resolved, externalID, requestedAllocation)
 }
 
 // SetupWithManager sets up the controller with the Manager.

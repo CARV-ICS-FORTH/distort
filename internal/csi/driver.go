@@ -2,10 +2,10 @@ package csi
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -34,7 +34,7 @@ type Driver struct {
 }
 
 func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
-	klog.Infof("Creating new CSI driver: name=%s nodeID=%s endpoint=%s", DriverName, nodeID, endpoint)
+	klog.InfoS("Creating CSI driver", "name", DriverName, "nodeID", nodeID, "endpoint", endpoint)
 
 	d := &Driver{
 		name:      DriverName,
@@ -50,47 +50,35 @@ func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
 	return d
 }
 
-func (d *Driver) Run() {
-	var wg sync.WaitGroup
+func (d *Driver) Run() error {
+	parts := strings.SplitN(d.endpoint, "://", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid endpoint format %q", d.endpoint)
+	}
+	protocol, addr := parts[0], parts[1]
 
-	wg.Go(func() {
-
-		// Parse endpoint
-		var protocol, addr string
-		parts := strings.SplitN(d.endpoint, "://", 2)
-		if len(parts) == 2 {
-			protocol = parts[0]
-			addr = parts[1]
-		} else {
-			klog.Fatalf("Invalid endpoint format: %s", d.endpoint)
+	if protocol == "unix" {
+		klog.InfoS("Removing existing socket", "path", addr)
+		if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove existing socket %s: %w", addr, err)
 		}
+	}
 
-		if protocol == "unix" {
-			klog.Infof("Removing existing socket: %s", addr)
-			if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
-				klog.Fatalf("Failed to remove existing socket %s: %v", addr, err)
-			}
-		}
+	listener, err := net.Listen(protocol, addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
 
-		listener, err := net.Listen(protocol, addr)
-		if err != nil {
-			klog.Fatalf("Failed to listen on %s: %v", addr, err)
-		}
+	server := grpc.NewServer()
+	csi.RegisterIdentityServer(server, d.ids)
+	csi.RegisterControllerServer(server, d.cs)
+	csi.RegisterNodeServer(server, d.ns)
 
-		server := grpc.NewServer()
-
-		// Register CSI Services
-		csi.RegisterIdentityServer(server, d.ids)
-		csi.RegisterControllerServer(server, d.cs)
-		csi.RegisterNodeServer(server, d.ns)
-
-		klog.Infof("Starting CSI GRPC server on %s", d.endpoint)
-		if err := server.Serve(listener); err != nil {
-			klog.Fatalf("GRPC server failed: %v", err)
-		}
-	})
-
-	wg.Wait()
+	klog.InfoS("Starting CSI GRPC server", "endpoint", d.endpoint)
+	if err := server.Serve(listener); err != nil {
+		return fmt.Errorf("serve CSI GRPC endpoint: %w", err)
+	}
+	return nil
 }
 
 // ==========================================
@@ -104,7 +92,7 @@ type IdentityServer struct {
 }
 
 func (ids *IdentityServer) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
-	klog.V(5).Infof("Using default GetPluginInfo")
+	klog.V(5).InfoS("Using default GetPluginInfo")
 	if ids.name == "" {
 		return nil, status.Error(codes.Unavailable, "Driver name not configured")
 	}

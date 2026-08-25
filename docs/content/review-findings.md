@@ -4,7 +4,342 @@ description: "Prioritized defects, regression criteria, completed fixes, and pro
 type: "page"
 ---
 
-# Review Findings and Fix Backlog
+# Current Project Review — 2026-08-25
+
+## 1. Executive summary
+
+DISTORT has a credible, well-structured happy path, but the current working tree is not production-ready. The host-side suite and race detector pass, yet several important recovery, deployment, CSI-contract, and state-consistency defects remain outside those tests.
+
+The most serious findings are:
+
+- The kernel NVMe target can report a partition as Exported and an attachment as ready when configfs is incomplete or disconnected.
+- NVMeDeviceClaim.spec.serialNumber is mutable, allowing one claim to retain stale ownership while rebinding elsewhere.
+- The documented Helm quick start deploys an unqualified, mutable distort:latest image.
+- The documented make test-env-redeploy workflow silently does nothing because of a Makefile typo.
+- Multiple CSI 1.5 request semantics are implemented incorrectly.
+- The current GitHub module and lint quality gates are deterministically failing even though local make test-suite passes.
+
+No Critical issue was confirmed. Four High-severity defects and several Medium-severity correctness and reliability gaps were found.
+
+This review covers the current working tree, which was already dirty: 36 modified and 5 untracked files. It therefore does not necessarily represent a committed release.
+
+Project summary:
+
+- Purpose: Kubernetes-native disaggregated NVMe storage exported over NVMe-oF/RDMA.
+- Main binaries:
+  - distort-manager: claims, scheduling, capacity, and heartbeat expiry.
+  - distort-agent: hardware discovery, SPDK/kernel provisioning, exports, ACLs, and status.
+  - distort-csi: CSI controller, attachment fencing, node connection, formatting, and mounting.
+- Persistence:
+  - Kubernetes CRDs store desired state, identities, allocation, and attachment ownership.
+  - Physical partition tables or SPDK lvol metadata store backend allocation.
+  - Kernel configfs or SPDK JSON-RPC state stores live target configuration.
+- Dependencies: Go 1.25.3, Kubebuilder/controller-runtime, Kubernetes 0.35, CSI 1.5, gRPC, SPDK 26.01, nvme-cli, parted, ext4/XFS, Helm, K3s/Vagrant/VirtualBox, and RDMA/SoftRoCE.
+- Review limitations:
+  - Kernel configfs and real SPDK behavior were code-reviewed but not exercised because the lab deployment is unhealthy.
+  - No CSI conformance suite was available.
+  - Generated files were checked for drift but were not treated as hand-maintained source.
+
+## 2. Intended behavior map
+
+| Feature or flow | Intended behavior | Implementation | Status |
+|---|---|---|---|
+| Helm installation | Install a working manager, agent, CSI controller/node, CRDs, and RBAC | deploy/charts/distort | **Broken by default image** |
+| Device discovery | Discover safe, unmounted NVMe controllers and mark disappeared hardware unavailable | internal/agent/nvme_discovery.go, reporter.go | **Partially verified** |
+| RDMA readiness | Publish only active, usable, fresh RDMA endpoints | rdma_discovery.go, rdmahealth/readiness.go | **Partially verified** |
+| Device claims | Bind exact serial to one device and preserve ownership by UID | nvmedeviceclaim_controller.go | **Broken under spec mutation** |
+| Partition placement | Select a claimed device on a fresh RDMA node with sufficient capacity | nvmepartition_controller.go | **Verified on normal path; fragile around stale claims and inventory** |
+| SPDK provisioning | Bind hardware, create lvol, export, supervise, recover, and clean up | SPDK backend and lvol manager | **Partially verified** |
+| Kernel provisioning | Create GPT partition and complete configfs target, recover idempotently | Kernel backend and parted manager | **Broken under partial state** |
+| CSI Create/Delete | Create stable namespaced volume handles and clean exact backend allocation | controller_server.go | **Partially verified** |
+| Single-writer attachment | Durable owner, exact host ACL, explicit fenced takeover | controller_attachment.go, attachment CRD, agent ACL reconciliation | **Partially verified; hardware gate pending** |
+| CSI node lifecycle | Connect, validate filesystem, format blank volume, stage and publish safely | node_server.go, nvme.go | **Partially verified** |
+| Host-side quality gates | Tests, race, lint, tidy, Helm, docs, and E2E compile should pass | Makefile and GitHub workflows | **Local suite passes; CI gates broken** |
+| Vagrant hardware workflow | Redeploy current image, smoke-check lab, and run isolated E2E | Makefile, vagrant, and E2E tests | **Broken redeploy; lab currently unhealthy** |
+| Documentation | Canonical docs describe current implementation and release status | docs/content | **Inconsistent** |
+
+## 3. Findings
+
+### Current F1. Kernel target can falsely report a broken export as ready
+
+- **Severity:** High
+- **Confidence:** Confirmed in control flow; hardware consequence not exercised
+- **Affected:** internal/agent/plugins/backend_kernel.go:63, internal/agent/partition_manager.go:488
+- **Expected:** Reconciliation verifies or repairs the namespace device path, enabled state, listener address and port, subsystem link, and host ACL before publishing Exported or AccessReady=True.
+- **Actual:**
+  - ExportVolume returns success as soon as the subsystem directory exists, without checking anything beneath it.
+  - Creation is multi-step. Any failure after creating the subsystem leaves partial state that every retry treats as successful.
+  - KernelBackend does not implement ExportHealthChecker, so periodic reconciliation never validates kernel targets.
+  - ReconcileHostAccess returns early when its host list is exact, without checking that the subsystem remains linked to port 1.
+  - The backend always writes addr_adrfam=ipv4 even if discovery selected IPv6.
+- **Reproduction:** Inject a failure after creating the subsystem but before namespace, listener, or symlink completion. The next retry returns success and marks the partition Exported. Alternatively, remove the port symlink while keeping the desired host ACL; reconciliation reports AccessReady.
+- **Why it matters:** Kubernetes can bind a PV or complete attachment while no usable target exists. Endpoint changes and configfs corruption are not repaired.
+- **Recommended fix:** Implement an exact kernel CheckExport, make ExportVolume validate and repair each component, derive address family from the portal IP, and always verify or recreate the port link. Revoke ACLs before unexport.
+- **Regression test:** Add fake-configfs tests for partial subsystems, missing/wrong namespaces and listeners, missing links, IPv6, and retry after link failure. Assert that invalid state never produces Exported or AccessReady.
+
+### Current F2. Mutating an active claim creates inconsistent or leaked ownership
+
+- **Severity:** High
+- **Confidence:** Confirmed
+- **Affected:** api/v1alpha1/nvmedeviceclaim_types.go:27, internal/controller/nvmedeviceclaim_controller.go:191, internal/controller/nvmepartition_controller.go:74
+- **Expected:** The serial establishing physical ownership is immutable, or migration safely coordinates every dependent partition and old device.
+- **Actual:** spec.serialNumber has no nonempty or immutability validation. Patching it to a missing serial leaves the old device Claimed. Patching it to another present serial can claim the new device without releasing the old one because the release loop only considers devices matching the new serial. Placement checks device status and ClaimRef but does not resolve the live claim. The agent later rejects old allocations because the claim serial no longer matches.
+- **Reproduction:** Bind claim C to serial A, create a partition, then patch C.spec.serialNumber to B. Reconcile and create another partition. The claim can retain A and acquire B while old allocations fail authorization.
+- **Why it matters:** Device ownership leaks, partitions become stuck, and stale exports may stop receiving health and ACL reconciliation.
+- **Recommended fix:** Add MinLength=1 and CEL immutability to serialNumber. Placement should verify the referenced live claim UID, active state, matched device, node, and serial before reserving capacity.
+- **Regression test:** Patch a bound claim with and without dependent partitions in envtest; expect admission rejection and unchanged ownership.
+
+### Current F3. The documented Helm quick start uses an unsafe non-release image
+
+- **Severity:** High
+- **Confidence:** Confirmed
+- **Affected:** README.md:20, deploy/charts/distort/values.yaml:1
+- **Expected:** A plain documented install deploys a project-owned versioned image or requires an explicit repository.
+- **Actual:** The README provides no image override. The chart renders every DISTORT component as unqualified, mutable distort:latest.
+- **Reproduction:** helm template distort deploy/charts/distort renders four image: "distort:latest" entries.
+- **Why it matters:** Installation may fail, pull an unrelated registry image, or change without a chart update. Deployment and rollback are not reproducible.
+- **Recommended fix:** Publish and default to a fully qualified project-controlled image aligned with Chart.appVersion, preferably with optional digest pinning. Otherwise make the repository value mandatory.
+- **Regression test:** Assert that the default rendered image is qualified, not latest, and matches the chart release.
+
+### Current F4. The documented lab redeploy command is a silent no-op
+
+- **Severity:** High
+- **Confidence:** Confirmed
+- **Affected:** Makefile:184, docs/content/local-testing.md:121
+- **Expected:** make test-env-redeploy builds, imports, deploys, restarts, and waits for the current image.
+- **Actual:** The phony target has no recipe or prerequisite. The deploy prerequisite is attached to the misspelled target test-e test-env-destroynv-redeploy.
+- **Reproduction:** make -n test-env-redeploy exits 0 and prints Nothing to be done.
+- **Why it matters:** Hardware tests can run against stale code or remain unavailable while the workflow falsely reports success. The current lab has several ErrImageNeverPull workloads and an unhealthy CSI controller.
+- **Recommended fix:** Define test-env-redeploy: test-env-deploy.
+- **Regression test:** Add a repository contract that dry-runs the target and verifies that build and deploy commands are emitted.
+
+### Current F5. CSI controller violates multiple CSI 1.5 request contracts
+
+- **Severity:** Medium
+- **Confidence:** Confirmed
+- **Affected:** internal/csi/controller_server.go:43, internal/csi/controller_attachment.go:109, CSI 1.5 spec CapacityRange and ControllerUnpublishVolume contracts
+- **Expected:** Follow the request semantics in the declared CSI 1.5 dependency.
+- **Actual:**
+  1. A limit-only CapacityRange is rejected even though required_bytes=0 means unspecified.
+  2. ValidateVolumeCapabilities never resolves the volume. Any nonempty fake ID with generic supported capabilities can be confirmed, and context or parameters are not compared with persisted state.
+  3. ControllerUnpublishVolume rejects empty node_id even though CSI defines it as unpublish from all nodes.
+- **Reproduction:** Submit CapacityRange{RequiredBytes:0, LimitBytes:1Gi}; validate a nonexistent ID with a supported mount capability; or unpublish a valid volume with empty NodeId.
+- **Why it matters:** Standards-compliant orchestrators can be rejected while nonexistent or stale volume identities are incorrectly confirmed.
+- **Recommended fix:** Normalize limit-only ranges, resolve exact UID-bearing handles during validation, compare filesystem/context/parameters, and treat empty node ID as deletion of the current attachment.
+- **Regression test:** Add limit-only, both-zero, nonexistent and recreated volume, altered context, parameter mismatch, and all-node-unpublish tests. Run CSI conformance for advertised methods.
+
+### Current F6. Discovery failures leave stale devices schedulable
+
+- **Severity:** Medium
+- **Confidence:** Confirmed
+- **Affected:** internal/agent/nvme_discovery.go:85, internal/agent/reporter.go:142
+- **Expected:** A degraded scan publishes safe partial results with explicit source health or makes affected inventory unavailable.
+- **Actual:** DiscoverNVMe can return partial devices plus an error. reportDevices discards the entire result, reports zero capacity, and skips invalidating previously reported devices. RDMA readiness can remain true, and placement uses stale NVMeDevice objects instead of reported node capacity.
+- **Reproduction:** Begin with a claimed device, then fail only SPDK or kernel discovery. The stale device remains eligible for placement while provisioning subsequently fails discovery.
+- **Why it matters:** Requests can be assigned to stale hardware and enter persistent retry loops with misleading node health.
+- **Recommended fix:** Track health per discovery source, process safe partial results, publish a degradation condition, and make scheduling reject stale inventory.
+- **Regression test:** Inject successful discovery followed by a partial-source error and assert no new partition is scheduled until a fresh successful observation.
+
+### Current F7. Raw hardware serials are unsafe Kubernetes object names
+
+- **Severity:** Medium
+- **Confidence:** Highly likely
+- **Affected:** internal/agent/reporter.go:152, internal/agent/nvme_discovery.go:168
+- **Expected:** Supported NVMe serials are preserved as exact identities while producing bounded DNS-safe Kubernetes names.
+- **Actual:** The object name is nodeName plus a lowercased raw serial. There is no sanitization, hash, length bound, or DNS validation. Critical serial and PCI sysfs reads can also be silently omitted, and Required markers do not reject empty strings.
+- **Reproduction:** Return a serial containing spaces, a slash, invalid punctuation, or enough characters to exceed the object-name limit. Kubernetes rejects creation. A missing PCI address reaches later backend setup as an empty address.
+- **Why it matters:** Valid hardware can become undiscoverable, while malformed metadata fails only during provisioning.
+- **Recommended fix:** Use a bounded DNS-safe hash in metadata.name, preserve the exact serial in spec, and reject empty serial, PCI address, node, or nonpositive capacity.
+- **Regression test:** Cover whitespace, punctuation, long serials, missing serial/PCI, and deterministic collision resistance.
+
+### Current F8. SPDK process configuration is not transactional or consistently enforced
+
+- **Severity:** Medium
+- **Confidence:** Confirmed for option handling; highly likely for stuck initialization
+- **Affected:** internal/agent/plugins/backend_spdk.go:40, internal/storageoptions/options.go:46
+- **Expected:** A declared core mask is honored or rejected consistently, and failed initialization leaves a clean state for retry.
+- **Actual:**
+  - spdk-core-mask=0x0 passes validation despite selecting no CPU.
+  - Only the first volume that starts the node-wide nvmf_tgt process controls its mask. Later conflicting options silently succeed.
+  - With custom iobuf settings, failures in iobuf_set_options, framework_start_init, or framework_wait_init return without killing the wait-for-rpc process. A retry sees pidof succeed and skips initialization.
+- **Reproduction:** Start with mask 0x1, then provision with 0x3; both requests succeed but the second is not applied. Alternatively, fail framework_start_init and retry while the child remains alive.
+- **Why it matters:** StorageClass configuration has undocumented first-request-wins behavior, and initialization faults can require manual process cleanup.
+- **Recommended fix:** Treat the core mask as node-global, persist and verify it, reject conflicts and zero masks, and terminate/reap the process on every initialization failure.
+- **Regression test:** Capture first and second masks, reject conflicts and 0x0, and inject every initialization RPC failure while verifying clean retry.
+
+### Current F9. RDMA endpoint validation can select an unusable address or state
+
+- **Severity:** Medium
+- **Confidence:** Confirmed
+- **Affected:** internal/agent/rdma_discovery.go:24, internal/rdmahealth/readiness.go:19
+- **Expected:** Placement accepts only an exactly active port with a routable address family supported by the target and CSI node.
+- **Actual:** Port state uses substring matching for ACTIVE; address selection accepts multicast and link-local addresses and returns the first address; readiness repeats the weak validation; node staging disagrees by rejecting multicast; and kernel export always configures IPv4. The CRD also permits TCP while readiness rejects it.
+- **Reproduction:** Present an ACTIVE_DEFER state or an interface whose first address is link-local or multicast. It may become schedulable and later fail export or staging.
+- **Why it matters:** The system can report false readiness and produce unusable Exported partitions.
+- **Recommended fix:** Parse exact state, reject unsupported multicast and link-local addresses, prefer configured routable addresses, derive target address family, and align or remove TCP support.
+- **Regression test:** Add address-order, multicast, link-local/global IPv6, ACTIVE_DEFER, and kernel IPv6 cases.
+
+### Current F10. CSI node publish and unpublish paths are not fail-safe
+
+- **Severity:** Medium
+- **Confidence:** Confirmed
+- **Affected:** internal/csi/node_server.go:290 and :332
+- **Expected:** Every mount and unmount RPC requires a non-root absolute kubelet path before privileged filesystem operations.
+- **Actual:** NodeStageVolume performs this validation, but NodeUnstageVolume, NodePublishVolume, and NodeUnpublishVolume only require nonempty strings. The implementation then calls MkdirAll, mount --bind, or umount directly.
+- **Reproduction:** Publish with target / or a relative path, or unstage/unpublish /. The driver attempts filesystem operations instead of returning InvalidArgument.
+- **Why it matters:** A malformed local CSI request can modify or mask sensitive paths in the privileged CSI container and potentially affect mount-propagated kubelet paths.
+- **Recommended fix:** Centralize clean, absolute, non-root validation and optionally require the configured kubelet-root prefix.
+- **Regression test:** Table-test empty, relative, root, cleaned traversal, and valid kubelet paths while asserting no command is invoked on rejection.
+
+### Current F11. The current GitHub quality gates are deterministically red
+
+- **Severity:** Medium
+- **Confidence:** Confirmed
+- **Affected:** .github/workflows/test.yml:20, .github/workflows/lint.yml:20, .golangci.yml:25, internal/controller/sample_manifests_test.go:11
+- **Expected:** The documented GitHub tidy and lint checks pass on the current green tree.
+- **Actual:** go mod tidy moves sigs.k8s.io/yaml from indirect to direct. The GitHub lint action installs a stock binary, but the configuration enables the custom module plugin logcheck. Local make lint succeeds only because the Makefile builds a custom binary.
+- **Reproduction:** GOCACHE=/tmp/distort-go-build go mod tidy -diff exits 1. The stock 2.8.0 linter exits 3 with plugin logcheck not found.
+- **Why it matters:** Pull requests cannot satisfy advertised quality gates, encouraging bypasses and masking genuine regressions.
+- **Recommended fix:** Commit tidy output and make the lint workflow invoke the project custom linter through make lint.
+- **Regression test:** Add one local CI-equivalence target and make workflows invoke it.
+
+### Current F12. Canonical documentation contradicts the current attachment implementation
+
+- **Severity:** Medium
+- **Confidence:** Confirmed
+- **Affected:** docs/content/architecture.md:66 and :124, docs/content/internals.md:425, docs/content/using.md:173
+- **Expected:** Canonical documentation provides one description of current deployed behavior.
+- **Actual:** Architecture lists four CRDs and omits NVMeVolumeAttachment. Architecture and internals say attachRequired is false and publish/unpublish are absent. The chart and CSI implementation do the opposite. Architecture also lists several resolved items as remaining production work.
+- **Reproduction:** Compare the affected documentation with deploy/charts/distort/templates/csidriver.yaml and internal/csi/controller_attachment.go.
+- **Why it matters:** Operators can make unsafe decisions based on obsolete fencing claims, and reviewers cannot determine which release gates are outstanding.
+- **Recommended fix:** Update architecture and internals from the current implementation and retain this file as the historical ledger.
+- **Regression test:** Add documentation contracts for the CRD count, attachRequired, implemented CSI methods, and forbidden stale assertions.
+
+### Current F13. Some green verification can pass without proving readiness or fencing
+
+- **Severity:** Low
+- **Confidence:** Confirmed
+- **Affected:** vagrant/smoke-test.sh:35, test/e2e/e2e_test.go:34, test/e2e/regression_e2e_test.go:475, test/contracts/repository_contracts_test.go:173
+- **Expected:** Green tests prove the behavior claimed by their documentation and labels.
+- **Actual:** Smoke and base E2E count RDMAStorageNode objects without requiring Ready=True, a fresh heartbeat, or a usable endpoint. F25 is labeled green and release-gate while its corrected hardware run is pending. F25 verifies the SPDK host list but not failed old-node I/O after takeover. The resolved F24 test remains quarantined and fails when selected because its literal version match does not accept equivalent documentation wording.
+- **Why it matters:** Test status and documentation overstate production evidence.
+- **Recommended fix:** Validate readiness fields, keep F25 out of release-green filters until hardware completion, prove old-node I/O failure, and unquarantine or make F24 semantic.
+- **Regression test:** Make these checks permanent green assertions once the underlying behavior is verified.
+
+## 4. Robustness gaps
+
+The following are material risks inferred from code but not fully proven in the available hardware environment:
+
+- DeleteVolume returns after issuing Kubernetes deletion rather than waiting for agent finalizers and backend cleanup.
+- SPDK repair deletes an existing subsystem after any failed health check, including transient RPC or observation failures.
+- Capacity serialization uses process-local mutexes; there is no durable reservation transaction across leader overlap.
+- Several helpers use background contexts or lack their own timeout, including legacy lvol RPC calls and ResetSPDKDevice.
+- KernelBackend.SetupDevice logs and suppresses SPDK reset failure.
+- PartedVolumeManager.SetupStorage ignores wipefs failure before creating GPT.
+- Helm workloads have no liveness, readiness, or startup probes; CSI Probe does not test dependencies.
+- Reset scripts broadly ignore wipe, rebind, and configfs cleanup errors.
+- Existing SPDK lvol retries trust requested capacity rather than verifying actual existing bdev size.
+- Metrics and Conditions do not expose degraded NVMe inventory discovery.
+
+## 5. Test coverage gaps
+
+| Test type | Scenario and input | Expected result | Suggested location |
+|---|---|---|---|
+| Kernel integration | Partial configfs subsystem, missing link/listener/namespace | Repair succeeds or partition remains non-exported | internal/agent/plugins/backend_kernel_test.go |
+| Envtest | Patch active claim serial after binding | Admission rejection; ownership unchanged | Claim controller tests |
+| CSI unit/conformance | Limit-only capacity, fake volume validation, empty-node unpublish | CSI 1.5-compliant responses | CSI controller tests |
+| Reporter/controller integration | One discovery source errors after prior success | Stale device cannot be scheduled | Agent/controller tests |
+| SPDK failure injection | Fail each custom initialization RPC | Process killed and next retry fully initializes | Plugin tests |
+| Configuration | Two volumes request conflicting core masks | Second request rejected observably | Plugin/agent tests |
+| RDMA unit/hardware | Link-local, multicast, IPv6, ACTIVE_DEFER | Only explicitly supported endpoint becomes ready | RDMA tests |
+| CSI privileged path | Root, relative, and traversal-like cleaned paths | InvalidArgument and no mount command | Node request tests |
+| Helm/Make contract | Default image and redeploy dependency | Qualified image and emitted deploy commands | Repository contracts |
+| E2E fencing | Continue I/O from old node after forced takeover | Old I/O fails before new writer is authorized | F25 E2E |
+| Recovery E2E | Corrupt kernel link/listener while exported | Agent repairs it and preserves attachment | Vagrant kernel E2E |
+| Smoke | Stale or non-ready RDMA object exists | Smoke fails despite object count | Shell or E2E test |
+
+The coverage profile also reports important production functions at 0%, including kernel ExportVolume, UnexportVolume and SetupDevice, SPDK ExportVolume and device reset/transport setup, and several real filesystem-formatting paths.
+
+## 6. Recommended improvements
+
+### Immediate fixes
+
+| Recommendation | Impact | Effort |
+|---|---:|---:|
+| Make kernel export and ACL reconciliation exact and repairable | High | Medium |
+| Make claim serial nonempty and immutable; validate live claim during placement | High | Low–Medium |
+| Correct test-env-redeploy and rerun the isolated hardware suite | High | Low |
+| Replace distort:latest with a qualified versioned release image | High | Low |
+| Correct CSI capacity, validation, and all-node unpublish semantics | High | Medium |
+| Commit tidy output and align GitHub lint with the custom binary | Medium | Low |
+
+### Near-term hardening
+
+| Recommendation | Impact | Effort |
+|---|---:|---:|
+| Surface degraded discovery and make inventory freshness schedulable state | High | Medium |
+| Make SPDK initialization transactional and core-mask configuration node-global | High | Medium |
+| Strengthen RDMA address, state, and family validation | Medium | Medium |
+| Validate every CSI mount and unmount path consistently | Medium | Low |
+| Add workload health probes and meaningful CSI dependency checks | Medium | Medium |
+| Update architecture and internals to the current five-CRD design | Medium | Low |
+
+### Longer-term improvements
+
+| Recommendation | Impact | Effort |
+|---|---:|---:|
+| Run CSI conformance for the advertised controller/node capability set | High | High |
+| Make capacity reservation safe across manager failover | High | High |
+| Add target corruption, timeout, and node-loss failure-injection E2E | High | High |
+| Verify finalizer completion before acknowledging CSI deletion | Medium | Medium |
+| Publish signed or digest-pinned reproducible release artifacts | Medium | High |
+| Add target health, discovery, cleanup, and attachment-revocation metrics | Medium | Medium |
+
+## 7. Verification performed
+
+Successful commands and checks:
+
+- make test-suite passed unit, envtest, contract, vet, manifests/generate/fmt, Helm lint/render, Hugo, custom golangci-lint, and tagged E2E compilation.
+- Reported package coverage was 59.8% for agent, 58.7% for plugins, 71.4% for controllers, and 67.6% for CSI.
+- make test-race passed all non-E2E packages.
+- GOCACHE=/tmp/distort-go-build go build ./cmd/... passed for all three binaries.
+- git diff --check passed.
+- Generated and Helm CRD copies compared equal.
+- helm template rendered successfully and confirmed distort:latest and attachRequired: true.
+- vagrant status from vagrant/ reported all three VMs running.
+- make test-env-status verified the guarded cluster and three Ready Kubernetes nodes, but showed several ErrImageNeverPull workloads and an unhealthy CSI controller.
+- GOCACHE=/tmp/distort-go-build go tool cover -func=cover.out completed with aggregate statement coverage of 52.6%.
+
+Commands that exposed project failures:
+
+- GOCACHE=/tmp/distort-go-build go mod tidy -diff exited 1 because sigs.k8s.io/yaml must become a direct dependency.
+- The stock golangci-lint 2.8.0 binary exited 3 because logcheck was not present.
+- make -n test-env-redeploy exited 0 but performed nothing.
+- The selected F24 contract test failed because its literal version assertion does not accept the architecture guide wording.
+
+Limitations:
+
+- Initial tidy and coverage attempts using the default cache hit the read-only sandbox cache and were rerun with a cache under /tmp.
+- Hardware E2E, destructive lab reset, Docker image build, real SPDK/configfs operations, and CSI conformance were not run.
+- Hardware E2E was not meaningful while the guarded lab workloads were unhealthy and the documented F25 worker-disk problem remained unresolved.
+- No intentional source edits were made during the audit. The test-suite target inherently invokes generation and formatting; the same 41 working-tree entries remained present, but no pre-run byte-level snapshot was available.
+
+## 8. Final assessment
+
+| Area | Rating | Rationale |
+|---|---:|---|
+| Functional correctness | **6/10** | Major normal flows are implemented and tested, but kernel recovery, claim mutation, CSI semantics, and deployment defaults contain real defects. |
+| Robustness | **4/10** | Partial configfs state, stale discovery, SPDK initialization failures, and incomplete recovery validation remain fragile. |
+| Error handling | **5/10** | Many failures are surfaced with Conditions and structured logs, but several device errors are suppressed or converted into misleading success. |
+| Test quality | **6/10** | Broad host, race, envtest, Helm, docs, and E2E coverage exists, but critical hardware functions remain untested and some green assertions mask invalid behavior. |
+| Maintainability | **7/10** | Code is reasonably modular with stable identities and structured controllers; stale documentation and node-global configuration reduce clarity. |
+| Production readiness | **3/10** | Default installation is not reproducible, hardware release gates remain incomplete, the current lab cannot run the full suite, and kernel target recovery is not trustworthy. |
+
+Overall, the project is suitable for continued development and controlled lab testing, but not for production storage workloads until the High findings, CSI conformance gaps, and hardware recovery and fencing gates are resolved.
+
+---
+
+## Historical Review Findings and Fix Backlog
 
 This document converts the repository review into an ordered implementation backlog. Work through the items in sequence unless a finding explicitly says it can be handled independently.
 
@@ -389,7 +724,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 15. Make discovery filtering exact and mount inspection fail safe
 
-- [ ] **F15 — High — Confirmed**
+- [x] **F15 — High — Resolved**
 - Affected: `internal/agent/nvme_discovery.go`
 - Problem:
   - `/sys/class/block` or `lsblk` failures are treated as “not mounted.”
@@ -404,10 +739,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 - Regression tests:
   - Exact, substring, whitespace, duplicate, and malformed lists.
   - Mounted namespace, unreadable sysfs, failed `lsblk`, and SPDK-bound device.
+- Resolution:
+  - Allow and exclude settings are parsed as normalized, exact PCI-address sets; malformed entries fail discovery and exclusion wins consistently for kernel- and SPDK-discovered controllers.
+  - Mount inspection now returns errors instead of treating inspection failure as an unmounted device. Devices fail closed unless the administrator explicitly sets `NVME_ALLOW_UNSAFE_MOUNT_INSPECTION=true`.
+  - Kernel sysfs, capacity, SPDK RPC, and mount-inspection failures are returned to the reporter so degraded discovery is visible rather than silently producing an unsafe inventory.
+- Verification (2026-08-25): fake-sysfs and command tests passed for exact/partial/malformed policies, mounted namespaces, failed inspection, the explicit unsafe override, and SPDK-bound devices. The complete host test suite passed.
 
 ### 16. Use real RDMA readiness and endpoint discovery
 
-- [ ] **F16 — High — Confirmed known limitation**
+- [x] **F16 — High — Resolved**
 - Affected:
   - `internal/agent/reporter.go`
   - `internal/controller/rdmastoragenode_controller.go`
@@ -422,10 +762,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   5. Report actual active exports.
 - Regression tests:
   - Missing Node, missing InternalIP, no RDMA interface, link down, stale heartbeat, valid RoCE, valid InfiniBand, and export count changes.
+- Resolution:
+  - Each agent discovers active ports from `/sys/class/infiniband`, resolves their associated network device and non-loopback address, and reports the observed transport and link speed without a Kubernetes Node-IP or loopback fallback.
+  - `RDMAStorageNode` status now publishes a timestamped `Ready` condition and the actual number of exported partitions. The controller expires stale heartbeats after 45 seconds.
+  - Placement and agent export both require a fresh ready RDMA node, and the exporter uses that verified RDMA endpoint as its portal address.
+- Verification (2026-08-25): agent and controller tests passed for active/down/unreadable RDMA sysfs, stale status, endpoint validation, and export counts. The isolated three-node smoke test reported three ready RoCEv2 endpoints at `192.168.56.10`–`192.168.56.12`, each with its discovered link speed and fresh heartbeat.
 
 ### 17. Supervise SPDK and bound every external operation
 
-- [ ] **F17 — High — Confirmed known limitation**
+- [x] **F17 — High — Resolved**
 - Affected:
   - `internal/agent/plugins/backend_spdk.go`
   - `internal/agent/plugins/spdk_rpc.go`
@@ -438,10 +783,16 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   4. Add context and timeouts to all SPDK RPC calls.
 - Regression tests:
   - Target crash, hung RPC, missing listener, wrong backing bdev, cancellation, and restart recovery.
+- Resolution:
+  - The agent supervises the managed `nvmf_tgt` process, restarts it on demand, and periodically health-checks every exported partition.
+  - SPDK RPC calls accept caller cancellation and enforce a default 15-second timeout, including bounded child-process termination.
+  - Export health validates the exact NQN, RDMA listener address and port, and the namespace's canonical bdev identity (including lvol UUID/alias resolution). Missing or mismatched exports are replaced idempotently.
+  - Recovery remains authorized when transient SPDK loss hides the PCI device only if the already-provisioned partition, live claim UID, matched device, node, serial, and device owner reference still agree; new allocations remain fail-closed.
+- Verification (2026-08-25): focused plugin/agent tests passed for hung RPCs, cancellation, listener and backing-bdev mismatches, process exit, and authorized recovery. The isolated Vagrant F17 E2E killed the live `nvmf_tgt` PID and observed the original NQN restored; the scenario passed with clean partition and claim teardown in 32 seconds.
 
 ### 18. Split Helm service accounts and reduce RBAC
 
-- [ ] **F18 — High — Confirmed**
+- [x] **F18 — High — Resolved**
 - Affected:
   - `deploy/charts/distort/templates/rbac.yaml`
   - manager, agent, CSI controller, and CSI node workload templates
@@ -450,6 +801,10 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Create separate least-privilege service accounts and roles for manager, agent/reporter, CSI controller, CSI node, provisioner, and registrar.
 - Regression tests:
   - Render the chart and run a `kubectl auth can-i` allow/deny matrix for each service account.
+- Resolution:
+  - The chart now creates separate identities and least-privilege ClusterRoles for the manager, agent/reporter, and CSI controller, plus an unprivileged CSI node identity. Kubernetes assigns identity per Pod, so the provisioner/attacher share the CSI controller identity and the registrar shares the CSI node identity with their respective drivers.
+  - Workload templates use component-specific service accounts. The CSI node/registrar Pod receives no Kubernetes API role, and no DISTORT workload can mutate Nodes.
+- Verification (2026-08-25): chart lint/render and repository contracts passed. The isolated Vagrant RBAC E2E verified required manager, agent, and CSI-controller access plus eight forbidden cross-component/Node operations across all four identities.
 
 ### 19. Distinguish retryable and terminal partition failures
 
@@ -471,25 +826,34 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
 
 ### 20. Do not admit unimplemented `lvm` configuration
 
-- [ ] **F20 — Medium — Confirmed**
+- [x] **F20 — Medium — Resolved**
 - Affected:
   - `api/v1alpha1/nvmepartition_types.go`
   - `internal/csi/controller_server.go`
 - Problem: The API enum accepts `lvm`, but no LVM plugin is registered.
 - Required fix: Remove `lvm` from current validation or implement and register it. CSI should return an immediate actionable error for unsupported combinations.
 - Regression test: Every admitted backend/volume-manager combination resolves to a registered compatible plugin.
+- Resolution:
+  - `NVMePartition.spec.volumeManager` now admits only the implemented `partition` strategy; both generated CRD copies were regenerated from the API marker.
+  - CSI validates backend/manager combinations before creating an object and returns `InvalidArgument` for unknown backends or unimplemented managers. Plugin registry coverage confirms the admitted SPDK and kernel implementations are registered.
+- Verification (2026-08-25): CSI unit tests, generated-schema contract tests, and the isolated Vagrant admission E2E passed.
 
 ### 21. Replace invalid sample manifests
 
-- [ ] **F21 — Medium — Confirmed**
+- [x] **F21 — Medium — Resolved**
 - Affected: `config/samples/*.yaml`
 - Problem: All sample specs contain scaffold TODOs and omit required fields.
 - Required fix: Provide safe, realistic examples. Avoid including agent-owned discovery objects in the default sample kustomization unless their use is explicitly explained.
 - Regression test: Server-side dry-run every sample against envtest in CI.
+- Resolution:
+  - All four samples now contain concrete, schema-valid fields and replacement guidance where cluster-specific hardware values are required.
+  - Agent-owned `NVMeDevice` and `RDMAStorageNode` examples are explicitly marked as documentation-only and excluded from the default sample kustomization.
+  - Controller envtest loads every sample into its typed API object and performs a server-side dry-run against the generated CRDs.
+- Verification (2026-08-25): all four envtest dry-runs and the repository sample contracts passed in the consolidated test suite.
 
 ### 22. Add behavior-focused test coverage
 
-- [ ] **F22 — Medium — Confirmed**
+- [x] **F22 — Medium — Resolved**
 - Affected: all test packages
 - Problem: Agent/plugins have 0% coverage; controller tests only assert that reconciliation returns no error; CSI server operations are mostly untested.
 - Required fix:
@@ -498,10 +862,15 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   3. Add multi-volume, multi-namespace, failure-injection, concurrency, recovery, and XFS E2E cases.
   4. Verify provider resource deletion through SPDK/configfs, not only CR disappearance.
 - Acceptance criteria: Critical storage isolation and deletion behavior is exercised in required CI checks.
+- Resolution:
+  - Injectable command runners and fake plugin/RPC boundaries now cover agent discovery, provisioning, deletion, recovery, and backend failure paths without hardware.
+  - Controller, CSI, contract, and E2E suites cover multi-volume and multi-namespace isolation, concurrent capacity decisions, command and RPC failures, restart recovery, XFS behavior, and exact kernel/SPDK resource deletion.
+  - The consolidated host suite contains 143 behavior tests and reports 59.8% coverage for `internal/agent`, 58.7% for `internal/agent/plugins`, 71.4% for `internal/controller`, and 67.6% for `internal/csi`.
+- Verification (2026-08-25): `make test-suite` passed the unit, envtest, repository-contract, Helm, documentation, lint, and E2E-compilation gates.
 
 ### 23. Restore lint CI
 
-- [ ] **F23 — Low — Confirmed**
+- [x] **F23 — Low — Resolved**
 - Affected:
   - Go sources reported by `golangci-lint`
   - `.github/workflows/lint.yml`
@@ -510,7 +879,11 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Split provisioning/deletion/recovery into smaller functions.
   - Convert logging to the configured structured Kubernetes style.
   - Resolve repeated constant and comment-spacing findings.
-- Verification: `GOLANGCI_LINT_CACHE=/tmp/distort-golangci-cache ./bin/golangci-lint run` passes.
+- Resolution:
+  - `PartitionManager.Reconcile` is split into focused discovery, deletion, identity, export, and provisioning helpers while preserving terminal versus retryable failure reasons.
+  - Reported logging sites now use structured Kubernetes logging, repeated constants and loop-variable findings are removed, and CSI driver startup returns errors to `main` instead of terminating from a goroutine.
+  - `make test-suite` now requires the lint gate.
+- Verification (2026-08-25): the consolidated `make test-suite` run passed with `golangci-lint` reporting zero issues.
 
 ### 24. Align documented and actual Go versions
 
@@ -548,7 +921,7 @@ See the [testing strategy](/testing/) for the finding-by-finding automated cover
   - Controller publish/unpublish now owns one deterministic, namespaced `NVMeVolumeAttachment` per immutable partition UID. Its immutable node, deterministic host NQN, unique attachment lifetime, status condition, and fencing finalizer make retries observable and prevent a delayed unpublish from deleting a replacement owner.
   - Kernel and SPDK targets default to closed host access and authorize exactly the attachment owner. The provider agent revokes and disconnects the old host before releasing the attachment finalizer. A competing node is rejected unless an administrator explicitly annotates the current attachment with `storage.distort.io/force-detach-node=<current-node>` after independently fencing that node.
   - The CSI controller advertises publish/unpublish support, the chart enables `attachRequired`, deploys the external-attacher, and grants its required attachment/status permissions. The guarded Vagrant deploy recreates the immutable `CSIDriver` registration when upgrading the lab.
-- Verification status (2026-08-20): controller, agent, target-backend, chart contract, and E2E compile regressions pass, including same-node retry, competing-node rejection, explicit takeover, stale unpublish, ACL ordering, and finalizer release. In the isolated lab, initial SPDK attach and concurrent-node rejection passed and exposed two integration gaps that were corrected: missing `volumeattachments/status` RBAC and use of a nonexistent standalone SPDK disconnect RPC. The final two-node rerun remains pending because permission to rebuild the corrected local agent image was declined.
+- Verification status (2026-08-25): controller, agent, target-backend, chart contract, and E2E compile regressions pass, including same-node retry, competing-node rejection, explicit takeover, stale unpublish, ACL ordering, and finalizer release. The focused isolated-lab run proved initial SPDK attach and concurrent-node rejection, then exposed an SPDK CLI compatibility defect: `nvmf_subsystem_remove_host` was passed an unsupported `--timeout-ms` method argument. The argument was removed and covered by the exact-command regression. The corrected image was built, but final two-node re-verification is still pending because the lab's worker-1 virtual root disk developed ext4 corruption and raw read errors during the host memory incident; image extraction now fails digest validation even after offline filesystem repair.
 
 ## Cross-cutting release gates
 
@@ -556,7 +929,7 @@ Before considering the implementation production-ready, require all of the follo
 
 - [x] Full unit and envtest suite passes.
 - [x] Race tests pass for controller, agent state logic, and CSI packages.
-- [ ] Lint and vet pass.
+- [x] Lint and vet pass.
 - [x] Generated CRDs, RBAC, DeepCopy code, and Helm CRDs have no drift.
 - [ ] CSI conformance tests pass for the explicitly supported capability set.
 - [x] Two-volume isolation tests pass for every enabled backend.
@@ -564,9 +937,9 @@ Before considering the implementation production-ready, require all of the follo
 - [ ] Single-writer attachment fencing prevents concurrent cross-node filesystem use.
 - [x] Finalizer cleanup proves backend resources are gone.
 - [x] Capacity concurrency tests prove no overcommit.
-- [ ] SPDK target crash and agent restart recovery tests pass.
+- [x] SPDK target crash and agent restart recovery tests pass.
 - [ ] RDMA link/node failure produces actionable non-ready state rather than a false `Exported` result.
-- [ ] Helm RBAC allow/deny matrix passes.
+- [x] Helm RBAC allow/deny matrix passes.
 - [x] E2E tests run only against an isolated disposable cluster.
 
 ## Original environmental verification limitations

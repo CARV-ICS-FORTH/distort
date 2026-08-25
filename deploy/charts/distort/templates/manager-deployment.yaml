@@ -17,7 +17,7 @@ spec:
         {{- include "distort.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: manager
     spec:
-      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      serviceAccountName: {{ include "distort.managerServiceAccountName" . }}
       containers:
         - name: manager
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

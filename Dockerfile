@@ -48,9 +48,9 @@ RUN go mod download
 COPY . .
 
 # Build all three components
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-manager cmd/distort-manager/main.go
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-agent cmd/distort-agent/main.go
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o bin/distort-csi cmd/distort-csi/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bin/distort-manager cmd/distort-manager/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bin/distort-agent cmd/distort-agent/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bin/distort-csi cmd/distort-csi/main.go
 
 
 # Use ubuntu as base image for the final stages since the agent needs

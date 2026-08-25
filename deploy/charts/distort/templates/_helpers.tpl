@@ -51,12 +51,37 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Create the name of the service account to use
+Create a component-specific service account name.
 */}}
-{{- define "distort.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "distort.fullname" .) .Values.serviceAccount.name }}
+{{- define "distort.componentServiceAccountName" -}}
+{{- $root := index . 0 -}}
+{{- $component := index . 1 -}}
+{{- $configured := index $root.Values.serviceAccount.names $component -}}
+{{- $suffix := kebabcase $component -}}
+{{- if $root.Values.serviceAccount.create }}
+{{- default (printf "%s-%s" (include "distort.fullname" $root) $suffix) $configured }}
 {{- else }}
-{{- default "default" .Values.serviceAccount.name }}
+{{- required (printf "serviceAccount.names.%s is required when serviceAccount.create is false" $component) $configured }}
 {{- end }}
+{{- end }}
+
+{{- define "distort.managerServiceAccountName" -}}
+{{- include "distort.componentServiceAccountName" (list . "manager") }}
+{{- end }}
+
+{{- define "distort.agentServiceAccountName" -}}
+{{- include "distort.componentServiceAccountName" (list . "agent") }}
+{{- end }}
+
+{{- define "distort.csiControllerServiceAccountName" -}}
+{{- include "distort.componentServiceAccountName" (list . "csiController") }}
+{{- end }}
+
+{{- define "distort.csiNodeServiceAccountName" -}}
+{{- include "distort.componentServiceAccountName" (list . "csiNode") }}
+{{- end }}
+
+{{/* Backward-compatible alias for extensions that referenced the old helper. */}}
+{{- define "distort.serviceAccountName" -}}
+{{- include "distort.managerServiceAccountName" . }}
 {{- end }}

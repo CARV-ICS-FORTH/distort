@@ -1,7 +1,7 @@
 ## Append samples of your project ##
 resources:
-- storage_v1alpha1_nvmedevice.yaml
+# NVMeDevice and RDMAStorageNode are agent-owned discovery resources. Their
+# example files document shape only and are deliberately not applied here.
 - storage_v1alpha1_nvmedeviceclaim.yaml
 - storage_v1alpha1_nvmepartition.yaml
-- storage_v1alpha1_rdmastoragenode.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

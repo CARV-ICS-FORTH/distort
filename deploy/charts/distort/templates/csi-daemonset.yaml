@@ -17,7 +17,8 @@ spec:
         app.kubernetes.io/component: csi-node
     spec:
       hostNetwork: true
-      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      # The node-driver-registrar and node CSI driver share this Pod identity.
+      serviceAccountName: {{ include "distort.csiNodeServiceAccountName" . }}
       containers:
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.1

@@ -90,8 +90,8 @@ type NVMePartitionSpec struct {
 	// +optional
 	TargetBackend string `json:"targetBackend,omitempty"`
 
-	// VolumeManager specifies the volume manager (e.g., "partition" or "lvm").
-	// +kubebuilder:validation:Enum=partition;lvm
+	// VolumeManager specifies the supported volume-carving strategy.
+	// +kubebuilder:validation:Enum=partition
 	// +kubebuilder:default=partition
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="volumeManager is immutable"
 	// +optional
