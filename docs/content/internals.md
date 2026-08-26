@@ -109,6 +109,7 @@ A **CustomResourceDefinition**, or CRD, extends the Kubernetes API with a new ob
 NVMeDevice
 NVMeDeviceClaim
 NVMePartition
+NVMeVolumeAttachment
 RDMAStorageNode
 ```
 
@@ -422,15 +423,26 @@ Registration tells kubelet:
 
 The registrar does not mount volumes itself.
 
-### 3.8 Why `attachRequired` is false
+### 3.8 Controller-side attachment fencing
 
 The chart creates a `CSIDriver` object with:
 
 ```yaml
-attachRequired: false
+attachRequired: true
 ```
 
-This tells Kubernetes not to run a separate CSI `ControllerPublishVolume` attach operation. DISTORT establishes the remote connection during `NodeStageVolume`, so it does not currently implement the normal CSI attach/detach RPC pair or use `VolumeAttachment` as part of its flow.
+Kubernetes therefore calls `ControllerPublishVolume` before node staging and
+`ControllerUnpublishVolume` during detach. The external-attacher sidecar drives
+those calls through Kubernetes `VolumeAttachment` objects.
+
+DISTORT persists the provider-side decision in one `NVMeVolumeAttachment` per
+immutable partition UID. It contains the authorized node, deterministic host
+NQN, and unique attachment lifetime. The agent reconciles the target ACL to that
+host and reports `AccessReady=True` before controller publish succeeds. A
+competing node receives `FailedPrecondition`. Forced takeover is accepted only
+after an administrator annotates the current attachment to confirm the old node
+has been fenced; the old ACL is revoked before a replacement attachment becomes
+ready.
 
 ## 4. DISTORT custom resources
 
@@ -454,13 +466,18 @@ Important status fields:
 - remaining free capacity;
 - active backend, such as `spdk` or `kernel`.
 
-The serial number is the stable identity used to match claims and partitions. The Linux name, such as `nvme0`, is not stable across boots or device changes.
+The exact serial number is the stable identity used to match claims and
+partitions. The Linux name, such as `nvme0`, is not stable across boots or
+device changes. An `NVMeDevice` object's Kubernetes name combines a readable,
+bounded node prefix with a SHA-256-derived suffix over the node and exact
+serial. This keeps arbitrary hardware serials out of `metadata.name` while
+preserving the original serial in the spec.
 
 `NVMeDevice` is cluster-scoped according to its Go markers.
 
 ### 4.2 `NVMeDeviceClaim`
 
-An `NVMeDeviceClaim` is an administrative reservation of a physical device identified by serial number.
+An `NVMeDeviceClaim` is an administrative reservation of a physical device identified by serial number. The API rejects an empty serial and makes the serial immutable after creation.
 
 The manager's claim reconciler:
 
@@ -499,7 +516,21 @@ Its status contains:
 
 Despite the name, an `NVMePartition` is not always a DOS/GPT partition. With the SPDK backend, the default plugin mapping uses an SPDK logical volume. With the kernel backend, it uses a partitioning implementation.
 
-### 4.4 `RDMAStorageNode`
+### 4.4 `NVMeVolumeAttachment`
+
+`NVMeVolumeAttachment` is the durable single-writer ownership record for an
+exported partition. Its spec contains:
+
+- the partition name and immutable UID;
+- the authorized Kubernetes node ID;
+- the host NQN installed in the target ACL;
+- a unique attachment ID that distinguishes consecutive ownership lifetimes.
+
+Status records the observed attachment ID and an `AccessReady` condition. A
+finalizer keeps the object present until the agent has revoked the old target
+ACL, preventing a delayed CSI unpublish from silently authorizing two consumers.
+
+### 4.5 `RDMAStorageNode`
 
 `RDMAStorageNode` summarizes a storage node:
 
@@ -509,9 +540,18 @@ Despite the name, an `NVMePartition` is not always a DOS/GPT partition. With the
 - aggregate total and free capacity;
 - number of exports.
 
-The reporter currently sets the IP from the Kubernetes Node's `InternalIP`, declares `RoCEv2`, and reports capacity. `ActiveExports` is currently set to zero rather than derived from actual exports.
+The agent discovers an active RDMA port and its interface address, publishes its
+transport and link speed, reports aggregate claimed-device capacity, counts
+currently exported partitions, and refreshes `lastHeartbeatTime` with a `Ready`
+condition. Independent kernel and SPDK discovery conditions feed an aggregate
+`NVMeInventoryReady` condition.
 
-The manager registers an `RDMAStorageNodeReconciler`, but its reconcile method is currently a scaffold with no behavior. Placement currently selects directly from claimed `NVMeDevice` objects rather than using `RDMAStorageNode` health.
+The manager expires `Ready` when the reporter heartbeat becomes stale. Placement
+selects capacity from claimed `NVMeDevice` objects, but it rejects a candidate
+unless the corresponding `RDMAStorageNode` is ready, fresh, has a usable RDMA
+endpoint, and reports `NVMeInventoryReady=True`. It also resolves the device's
+claim reference and verifies the live claim UID, active state, matched device,
+node, and serial before reserving capacity.
 
 ## 5. Manager internals
 
@@ -523,11 +563,9 @@ File: `internal/controller/nvmedeviceclaim_controller.go`
 
 This reconciler binds administrative claims to devices by exact serial number.
 
-Its main limitations today are:
-
-- it watches claims but does not explicitly watch devices, so a claim that initially finds no device may not be retried when a device later appears;
-- it still uses basic status fields rather than conditions for most state transitions;
-- some updates use full `Update` rather than narrower patches.
+The reconciler watches claims, matching devices, and dependent partitions. It
+publishes a generation-aware `Bound` condition and patches status and
+finalizers with conflict-safe ownership checks.
 
 Claim ownership itself is explicit: the device status stores the claim namespace,
 name, and UID, and deletion releases the device only when that UID still matches.
@@ -541,18 +579,19 @@ This reconciler handles `NVMePartition` objects with an empty `spec.nodeName`.
 It:
 
 1. lists all devices;
-2. considers only claimed devices;
-3. excludes devices locked to another backend;
-4. checks free capacity;
-5. selects the device with the greatest free capacity;
-6. writes the node name and parent serial number into the partition spec.
+2. considers only devices owned by an exact active live claim;
+3. requires fresh RDMA and NVMe inventory health for the node;
+4. excludes devices locked to another backend;
+5. calculates free capacity from persisted assignments;
+6. selects the device with the greatest free capacity;
+7. revalidates the device, claim, node health, and capacity while reserving;
+8. writes the node name, parent serial number, and claim reference into the partition spec.
 
 If no device fits, it requeues after five seconds.
 
-This is a simple “most free bytes” scheduler. It does not currently account for:
+This is a “most free bytes” scheduler. It does not currently account for:
 
 - consumer Pod topology;
-- RDMA reachability or node health;
 - NUMA preferences;
 - reservations made concurrently by multiple scheduling reconciliations;
 - access modes;
@@ -620,6 +659,12 @@ It uses `lsblk` to skip controllers with mounted namespaces and supports:
 
 Once a controller is detached from the kernel and owned by a user-space driver, it is no longer represented in the same way through the kernel NVMe subsystem. The agent therefore also queries SPDK JSON-RPC and merges results by serial number.
 
+Discovery validates that every advertised device has a nonempty name and exact
+serial, a normalized PCI address, and positive capacity. A failed source does
+not discard safe results from the other source or valid controllers from the
+same source. Instead, the reporter processes the partial inventory and marks
+the source and aggregate inventory conditions degraded.
+
 ### 6.2 The reporter loop
 
 File: `internal/agent/reporter.go`
@@ -630,9 +675,14 @@ Every 30 seconds the reporter:
 - creates missing `NVMeDevice` resources;
 - reads capacity for existing devices;
 - creates or updates the local `RDMAStorageNode`;
-- aggregates capacity from claimed devices.
+- aggregates capacity from claimed devices;
+- publishes per-source and aggregate inventory health.
 
-This loop is observational, but it also creates API objects. It does not currently remove stale `NVMeDevice` resources when hardware disappears or mark them unavailable.
+This loop is observational, but it also creates API objects. After a complete
+successful scan, hardware that disappeared is marked `Unavailable` while its
+claim identity is retained for safe recovery. During a degraded scan it does
+not infer absence from incomplete data, and placement is blocked until a later
+complete observation restores `NVMeInventoryReady=True`.
 
 ### 6.3 The partition manager
 
@@ -698,13 +748,15 @@ The Linux kernel normally owns a PCIe NVMe controller through the `nvme` driver.
 
 The SPDK backend:
 
-1. starts `nvmf_tgt` if it is not running;
-2. waits for the JSON-RPC service;
-3. runs SPDK's setup script to change driver binding;
-4. attaches the physical NVMe controller to SPDK;
-5. creates or discovers an lvol store;
-6. creates or discovers an lvol;
-7. creates an NVMe-oF transport, subsystem, namespace, and listener.
+1. validates the requested nonzero node-global core mask;
+2. verifies that an existing `nvmf_tgt` process was started with that mask, or starts it if absent;
+3. waits for the JSON-RPC service and completes optional iobuf/framework initialization transactionally;
+4. kills and reaps a newly started process if any initialization step fails, leaving a clean retry;
+5. runs SPDK's setup script to change driver binding;
+6. attaches the physical NVMe controller to SPDK;
+7. creates or discovers an lvol store;
+8. creates or discovers an lvol;
+9. creates an NVMe-oF transport, subsystem, namespace, and listener.
 
 Only one backend should own a physical controller at a time. `NVMeDevice.status.activeBackend` is used as a control-plane lock against mixing kernel and SPDK allocations on the same device.
 
@@ -766,7 +818,13 @@ The **initiator** is the consumer-side host running `nvme connect`. The **target
 
 The kernel backend performs equivalent target configuration through Linux configfs under `/sys/kernel/config/nvmet`.
 
-Instead of an SPDK lvol, the normal pairing uses an on-disk partition created through `parted`. The backend loads kernel modules, builds the subsystem/configfs hierarchy, links the namespace, and configures a port.
+Instead of an SPDK lvol, the normal pairing uses an on-disk partition created
+through `parted`. The backend loads kernel modules and reconciles the exact
+subsystem, namespace device path, enabled state, RDMA listener address family,
+address and service port, port link, and host policy. It repairs partial state
+on retry, periodically verifies exported partitions, restores missing links
+even when the host ACL is already exact, and revokes ACLs before unexporting.
+Kernel listeners use `ipv4` or `ipv6` according to the selected portal address.
 
 Both backends implement the same Go interfaces, but their persistence, device ownership, cleanup behavior, and failure modes differ.
 
@@ -891,8 +949,9 @@ A robust implementation validates and repairs every component, not only the subs
 
 The current code has several areas that should be understood as engineering work rather than guaranteed production behavior:
 
-- An exported SPDK partition is checked when reconciliation occurs, but there is no periodic requeue after a healthy result. If `nvmf_tgt` exits while the agent remains alive and no Kubernetes object changes, recovery may not start automatically.
-- SPDK export validation currently checks only whether the NQN exists. It does not verify the namespace and listener.
+- Exported partitions are checked periodically. SPDK validation verifies the
+  exact namespace backing bdev and RDMA listener; kernel validation verifies and
+  repairs its exact configfs namespace, listener, and port link.
 - The child `nvmf_tgt` exit is logged, but there is no dedicated supervisor loop.
 - Several external commands do not consistently use the reconciliation context, so cancellation and command timeouts are incomplete.
 - CSI `CreateVolume` uses polling and an internal timeout rather than a watch.
@@ -900,10 +959,12 @@ The current code has several areas that should be understood as engineering work
 - `GetDeviceByNQN` assumes namespace 1 and constructs `<controller>n1`.
 - Formatting supports ext4 and XFS, preserves an existing matching filesystem, and rejects a mismatch. Custom format flags and StorageClass mount options remain unsupported.
 - Access modes are not comprehensively enforced.
-- Controller-side attachment fencing is absent (`attachRequired: false` and no ControllerPublish/ControllerUnpublish implementation), so forced cross-node migration can create concurrent filesystem users.
-- `RDMAStorageNode` health and active export reporting are incomplete.
-- The claim reconciler does not watch device creation and may leave an unmatched claim idle until another claim event.
-- Stale hardware resources are not marked unavailable or removed by the reporter.
+- Controller-side attachment fencing is implemented, but the corrected forced
+  takeover path still requires final two-node hardware verification that the old
+  consumer can no longer perform I/O.
+- RDMA readiness, routable IPv4/IPv6 endpoint selection, active export
+  reporting, degraded NVMe inventory health, and fail-closed placement are
+  implemented.
 
 These limitations do not mean the architecture is invalid. They identify places where a production reliability review should focus.
 

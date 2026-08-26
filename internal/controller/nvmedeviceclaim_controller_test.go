@@ -155,6 +155,68 @@ var _ = Describe("NVMeDeviceClaim lifecycle", func() {
 		Expect(result.RequeueAfter).NotTo(BeZero(), "the controller does not watch NVMeDevice creation")
 	})
 
+	It("rejects an empty serial number at admission", func() {
+		err := k8sClient.Create(ctx, &storagev1alpha1.NVMeDeviceClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "claim-empty-serial", Namespace: namespace,
+				Labels: map[string]string{"test.distort.io/suite": claimSuiteLabel},
+			},
+			Spec: storagev1alpha1.NVMeDeviceClaimSpec{},
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("serialNumber"))
+	})
+
+	It("rejects serial mutation for active claims with or without dependent partitions", func() {
+		for _, withPartition := range []bool{false, true} {
+			suffix := "without-partition"
+			if withPartition {
+				suffix = "with-partition"
+			}
+			deviceName := "claim-immutable-device-" + suffix
+			claimName := "claim-immutable-" + suffix
+			serial := "immutable-serial-" + suffix
+			createDevice(deviceName, serial, "node-a", storagev1alpha1.NVMeDeviceStateAvailable)
+			createClaim(claimName, serial)
+			_, err := reconcileClaim(claimName)
+			if err != nil {
+				_, err = reconcileClaim(claimName)
+			}
+			Expect(err).NotTo(HaveOccurred())
+
+			var claim storagev1alpha1.NVMeDeviceClaim
+			key := types.NamespacedName{Name: claimName, Namespace: namespace}
+			Expect(k8sClient.Get(ctx, key, &claim)).To(Succeed())
+			Expect(claim.Status.Active).To(BeTrue())
+			if withPartition {
+				partition := &storagev1alpha1.NVMePartition{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "claim-immutable-dependent", Namespace: namespace,
+						Labels: map[string]string{"test.distort.io/suite": claimSuiteLabel},
+					},
+					Spec: storagev1alpha1.NVMePartitionSpec{
+						Size: resource.MustParse("1Gi"), NodeName: "node-a", ParentDeviceSerialNumber: serial,
+						ClaimRef: &storagev1alpha1.NVMeDeviceClaimReference{
+							Namespace: namespace, Name: claim.Name, UID: claim.UID,
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, partition)).To(Succeed())
+			}
+
+			claim.Spec.SerialNumber = "replacement-serial"
+			err = k8sClient.Update(ctx, &claim)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("serialNumber is immutable"))
+			Expect(k8sClient.Get(ctx, key, &claim)).To(Succeed())
+			Expect(claim.Spec.SerialNumber).To(Equal(serial))
+			var device storagev1alpha1.NVMeDevice
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: deviceName}, &device)).To(Succeed())
+			Expect(device.Status.ClaimRef).NotTo(BeNil())
+			Expect(device.Status.ClaimRef.UID).To(Equal(claim.UID))
+		}
+	})
+
 	It("refreshes an active claim after the device moves to another node", func() {
 		createDevice("claim-moving-device", "moving-serial", "node-old", storagev1alpha1.NVMeDeviceStateClaimed)
 		createClaim("claim-moving", "moving-serial")

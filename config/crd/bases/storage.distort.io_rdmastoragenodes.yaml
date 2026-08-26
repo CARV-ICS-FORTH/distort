@@ -80,7 +80,6 @@ spec:
                 enum:
                 - RoCEv2
                 - InfiniBand
-                - TCP
                 type: string
             required:
             - nodeName

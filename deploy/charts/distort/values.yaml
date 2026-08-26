@@ -1,8 +1,12 @@
 image:
-  repository: distort
+  # A fully qualified repository is required because DISTORT does not yet
+  # publish a default image. Example: ghcr.io/example/distort
+  repository: ""
   pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: "latest"
+  # Defaults to the chart appVersion (0.5.0).
+  tag: ""
+  # Optional immutable sha256 digest. When set, digest takes precedence over tag.
+  digest: ""
 
 imagePullSecrets: []
 nameOverride: ""

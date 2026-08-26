@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -25,7 +28,41 @@ type Reporter struct {
 	discoverRDMA    func() (RDMAEndpoint, error)
 }
 
-const hardwareAvailableCondition = "HardwareAvailable"
+const (
+	hardwareAvailableCondition    = "HardwareAvailable"
+	kernelDiscoveryReadyCondition = "KernelNVMeDiscoveryReady"
+	spdkDiscoveryReadyCondition   = "SPDKNVMeDiscoveryReady"
+)
+
+func deviceObjectName(nodeName, serialNumber string) (string, error) {
+	if strings.TrimSpace(nodeName) == "" {
+		return "", errors.New("node name is empty")
+	}
+	if strings.TrimSpace(serialNumber) == "" {
+		return "", errors.New("serial number is empty")
+	}
+	var prefix strings.Builder
+	lastSeparator := false
+	for _, char := range strings.ToLower(nodeName) {
+		valid := char >= 'a' && char <= 'z' || char >= '0' && char <= '9'
+		if valid {
+			prefix.WriteRune(char)
+			lastSeparator = false
+		} else if !lastSeparator {
+			prefix.WriteByte('-')
+			lastSeparator = true
+		}
+		if prefix.Len() >= 40 {
+			break
+		}
+	}
+	readable := strings.Trim(prefix.String(), "-")
+	if readable == "" {
+		readable = "nvme"
+	}
+	digest := sha256.Sum256([]byte(nodeName + "\x00" + serialNumber))
+	return fmt.Sprintf("%s-%x", readable, digest[:16]), nil
+}
 
 func (r *Reporter) discoverNVMe() ([]HardwareNVMe, error) {
 	if r.discoverDevices != nil {
@@ -63,11 +100,11 @@ func (r *Reporter) Start(ctx context.Context) error {
 }
 
 func (r *Reporter) report(ctx context.Context) {
-	totalCap, freeCap := r.reportDevices(ctx)
-	r.reportNode(ctx, totalCap, freeCap)
+	totalCap, freeCap, inventoryErr := r.reportDevices(ctx)
+	r.reportNode(ctx, totalCap, freeCap, inventoryErr)
 }
 
-func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity int64) {
+func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity int64, inventoryErr error) {
 	logger := log.FromContext(ctx)
 	endpoint, discoveryErr := r.discoverRDMAEndpoint()
 
@@ -133,34 +170,83 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 		condition.Message = discoveryErr.Error()
 	}
 	meta.SetStatusCondition(&nodeCR.Status.Conditions, condition)
+	r.setInventoryConditions(nodeCR, inventoryErr)
 	err = r.Status().Patch(ctx, nodeCR, client.MergeFrom(base))
 	if err != nil {
 		logger.Error(err, "Failed to report RDMAStorageNode")
 	}
 }
 
-func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
+func (r *Reporter) setInventoryConditions(node *storagev1alpha1.RDMAStorageNode, discoveryErr error) {
+	aggregate := metav1.Condition{
+		Type: storagev1alpha1.NVMeInventoryReadyCondition, Status: metav1.ConditionTrue,
+		ObservedGeneration: node.Generation, Reason: "NVMeDiscoverySucceeded",
+		Message: "Kernel and SPDK NVMe inventory sources completed successfully",
+	}
+	kernel := metav1.Condition{
+		Type: kernelDiscoveryReadyCondition, Status: metav1.ConditionTrue,
+		ObservedGeneration: node.Generation, Reason: "KernelDiscoverySucceeded",
+		Message: "Kernel NVMe discovery completed successfully",
+	}
+	spdk := metav1.Condition{
+		Type: spdkDiscoveryReadyCondition, Status: metav1.ConditionTrue,
+		ObservedGeneration: node.Generation, Reason: "SPDKDiscoverySucceeded",
+		Message: "SPDK NVMe discovery completed successfully",
+	}
+	if discoveryErr != nil {
+		aggregate.Status = metav1.ConditionFalse
+		aggregate.Reason = "NVMeDiscoveryDegraded"
+		aggregate.Message = discoveryErr.Error()
+		kernel.Status, spdk.Status = metav1.ConditionUnknown, metav1.ConditionUnknown
+		kernel.Reason, spdk.Reason = "DiscoveryHealthUnknown", "DiscoveryHealthUnknown"
+		kernel.Message, spdk.Message = discoveryErr.Error(), discoveryErr.Error()
+		var sourceErr *NVMeDiscoveryError
+		if errors.As(discoveryErr, &sourceErr) {
+			if sourceErr.Kernel == nil {
+				kernel.Status, kernel.Reason = metav1.ConditionTrue, "KernelDiscoverySucceeded"
+				kernel.Message = "Kernel NVMe discovery completed successfully"
+			} else {
+				kernel.Status, kernel.Reason, kernel.Message = metav1.ConditionFalse, "KernelDiscoveryFailed", sourceErr.Kernel.Error()
+			}
+			if sourceErr.SPDK == nil {
+				spdk.Status, spdk.Reason = metav1.ConditionTrue, "SPDKDiscoverySucceeded"
+				spdk.Message = "SPDK NVMe discovery completed successfully"
+			} else {
+				spdk.Status, spdk.Reason, spdk.Message = metav1.ConditionFalse, "SPDKDiscoveryFailed", sourceErr.SPDK.Error()
+			}
+		}
+	}
+	meta.SetStatusCondition(&node.Status.Conditions, aggregate)
+	meta.SetStatusCondition(&node.Status.Conditions, kernel)
+	meta.SetStatusCondition(&node.Status.Conditions, spdk)
+}
+
+func (r *Reporter) reportDevices(ctx context.Context) (int64, int64, error) {
 	logger := log.FromContext(ctx)
 	var nodeTotalCap, nodeFreeCap int64
 
-	devices, err := r.discoverNVMe()
-	if err != nil {
-		logger.Error(err, "Failed to discover NVMe devices")
-		return 0, 0
+	devices, discoveryErr := r.discoverNVMe()
+	if discoveryErr != nil {
+		logger.Error(discoveryErr, "NVMe inventory discovery is degraded")
 	}
 
 	seen := make(map[string]struct{}, len(devices))
 	for _, d := range devices {
-		serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
-		if serial == "" {
-			serial = "unknown"
+		if err := validateHardwareNVMe(d); err != nil {
+			discoveryErr = errors.Join(discoveryErr, fmt.Errorf("validate discovered NVMe device %q: %w", d.Name, err))
+			logger.Error(err, "Ignoring NVMe device with unsafe metadata", "device", d.Name)
+			continue
 		}
-		// Device name is usually nodeName-serial
-		deviceName := r.NodeName + "-" + serial
+		deviceName, err := deviceObjectName(r.NodeName, d.SerialNumber)
+		if err != nil {
+			discoveryErr = errors.Join(discoveryErr, err)
+			logger.Error(err, "Unable to derive NVMeDevice object name", "device", d.Name)
+			continue
+		}
 		seen[deviceName] = struct{}{}
 
 		devCR := &storagev1alpha1.NVMeDevice{}
-		err := r.Get(ctx, types.NamespacedName{Name: deviceName}, devCR)
+		err = r.Get(ctx, types.NamespacedName{Name: deviceName}, devCR)
 
 		exists := err == nil
 		if client.IgnoreNotFound(err) != nil {
@@ -174,7 +260,7 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 			devCR.Name = deviceName
 			devCR.Spec = storagev1alpha1.NVMeDeviceSpec{
 				NodeName:      r.NodeName,
-				PCIAddress:    d.PCIAddress,
+				PCIAddress:    strings.ToLower(strings.TrimSpace(d.PCIAddress)),
 				SerialNumber:  d.SerialNumber,
 				Model:         d.Model,
 				TotalCapacity: *resource.NewQuantity(d.TotalBytes, resource.BinarySI),
@@ -210,7 +296,7 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 		} else {
 			specBase := devCR.DeepCopy()
 			devCR.Spec.NodeName = r.NodeName
-			devCR.Spec.PCIAddress = d.PCIAddress
+			devCR.Spec.PCIAddress = strings.ToLower(strings.TrimSpace(d.PCIAddress))
 			devCR.Spec.SerialNumber = d.SerialNumber
 			devCR.Spec.Model = d.Model
 			devCR.Spec.TotalCapacity = *resource.NewQuantity(d.TotalBytes, resource.BinarySI)
@@ -249,7 +335,10 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 	var reported storagev1alpha1.NVMeDeviceList
 	if err := r.List(ctx, &reported); err != nil {
 		logger.Error(err, "Failed to list reported NVMeDevices")
-		return nodeTotalCap, nodeFreeCap
+		return nodeTotalCap, nodeFreeCap, errors.Join(discoveryErr, err)
+	}
+	if discoveryErr != nil {
+		return nodeTotalCap, nodeFreeCap, discoveryErr
 	}
 	for i := range reported.Items {
 		dev := &reported.Items[i]
@@ -271,5 +360,5 @@ func (r *Reporter) reportDevices(ctx context.Context) (int64, int64) {
 		}
 	}
 
-	return nodeTotalCap, nodeFreeCap
+	return nodeTotalCap, nodeFreeCap, nil
 }

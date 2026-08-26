@@ -29,6 +29,8 @@ type NVMeDeviceClaimSpec struct {
 	// SerialNumber is the exact hardware serial number of the NVMe device to claim.
 	// This uniquely identifies the drive even if it moves to another node or PCIe slot.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="serialNumber is immutable"
 	SerialNumber string `json:"serialNumber"`
 }
 

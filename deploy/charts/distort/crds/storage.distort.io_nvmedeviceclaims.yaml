@@ -63,7 +63,11 @@ spec:
                 description: |-
                   SerialNumber is the exact hardware serial number of the NVMe device to claim.
                   This uniquely identifies the drive even if it moves to another node or PCIe slot.
+                minLength: 1
                 type: string
+                x-kubernetes-validations:
+                - message: serialNumber is immutable
+                  rule: self == oldSelf
             required:
             - serialNumber
             type: object

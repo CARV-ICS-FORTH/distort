@@ -17,7 +17,7 @@ import (
 
 const (
 	DriverName    = "storage.distort.io"
-	VendorVersion = "0.1.0"
+	VendorVersion = "0.5.0"
 )
 
 type Driver struct {

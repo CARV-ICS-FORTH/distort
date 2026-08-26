@@ -23,6 +23,55 @@ type HardwareNVMe struct {
 	NUMANode     int
 }
 
+// NVMeDiscoveryError preserves health for each independent discovery source
+// while still allowing callers to consume safe partial results.
+type NVMeDiscoveryError struct {
+	Kernel error
+	SPDK   error
+}
+
+func (e *NVMeDiscoveryError) Error() string {
+	var failures []error
+	if e.Kernel != nil {
+		failures = append(failures, fmt.Errorf("kernel NVMe discovery: %w", e.Kernel))
+	}
+	if e.SPDK != nil {
+		failures = append(failures, fmt.Errorf("SPDK NVMe discovery: %w", e.SPDK))
+	}
+	if len(failures) == 0 {
+		return "NVMe discovery degraded"
+	}
+	return errors.Join(failures...).Error()
+}
+
+func (e *NVMeDiscoveryError) Unwrap() []error {
+	failures := make([]error, 0, 2)
+	if e.Kernel != nil {
+		failures = append(failures, e.Kernel)
+	}
+	if e.SPDK != nil {
+		failures = append(failures, e.SPDK)
+	}
+	return failures
+}
+
+func validateHardwareNVMe(device HardwareNVMe) error {
+	if strings.TrimSpace(device.Name) == "" {
+		return errors.New("device name is empty")
+	}
+	if strings.TrimSpace(device.SerialNumber) == "" {
+		return errors.New("serial number is empty")
+	}
+	pciAddress := strings.ToLower(strings.TrimSpace(device.PCIAddress))
+	if !pciAddressPattern.MatchString(pciAddress) {
+		return fmt.Errorf("PCI address %q is invalid", device.PCIAddress)
+	}
+	if device.TotalBytes <= 0 {
+		return fmt.Errorf("capacity must be positive, got %d", device.TotalBytes)
+	}
+	return nil
+}
+
 var sysClassNVMe = "/sys/class/nvme"
 var sysClassBlock = "/sys/class/block"
 
@@ -91,37 +140,30 @@ func DiscoverNVMe() ([]HardwareNVMe, error) {
 	}
 	var devices []HardwareNVMe
 	seenSerials := make(map[string]bool)
-	var discoveryErrors []error
-
 	// 1. Scan kernel-bound devices from sysfs
-	kernelDevs, err := discoverKernelNVMeWithPolicy(policy)
-	if err == nil {
-		for _, d := range kernelDevs {
-			serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
-			if serial != "" && !seenSerials[serial] {
-				devices = append(devices, d)
-				seenSerials[serial] = true
-			}
+	kernelDevs, kernelErr := discoverKernelNVMeWithPolicy(policy)
+	for _, d := range kernelDevs {
+		serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
+		if serial != "" && !seenSerials[serial] {
+			devices = append(devices, d)
+			seenSerials[serial] = true
 		}
-	} else {
-		discoveryErrors = append(discoveryErrors, fmt.Errorf("kernel NVMe discovery: %w", err))
 	}
 
 	// 2. Scan SPDK-bound devices if SPDK is running
-	spdkDevs, err := discoverSPDKNVMeWithPolicy(policy)
-	if err == nil {
-		for _, d := range spdkDevs {
-			serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
-			if serial != "" && !seenSerials[serial] {
-				devices = append(devices, d)
-				seenSerials[serial] = true
-			}
+	spdkDevs, spdkErr := discoverSPDKNVMeWithPolicy(policy)
+	for _, d := range spdkDevs {
+		serial := strings.ToLower(strings.TrimSpace(d.SerialNumber))
+		if serial != "" && !seenSerials[serial] {
+			devices = append(devices, d)
+			seenSerials[serial] = true
 		}
-	} else {
-		discoveryErrors = append(discoveryErrors, fmt.Errorf("SPDK NVMe discovery: %w", err))
 	}
 
-	return devices, errors.Join(discoveryErrors...)
+	if kernelErr != nil || spdkErr != nil {
+		return devices, &NVMeDiscoveryError{Kernel: kernelErr, SPDK: spdkErr}
+	}
+	return devices, nil
 }
 
 func discoverKernelNVMe() ([]HardwareNVMe, error) {
@@ -134,6 +176,7 @@ func discoverKernelNVMe() ([]HardwareNVMe, error) {
 
 func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) {
 	var devices []HardwareNVMe
+	var discoveryErrors []error
 
 	entries, err := os.ReadDir(sysClassNVMe)
 	if err != nil {
@@ -170,10 +213,14 @@ func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error
 			hwDev.Model = strings.TrimSpace(string(b))
 		}
 
-		// Read Serial Number
-		if b, err := os.ReadFile(filepath.Join(devPath, "serial")); err == nil {
-			hwDev.SerialNumber = strings.TrimSpace(string(b))
+		// Serial and PCI identity are mandatory. Skipping either would create an
+		// object that cannot be claimed or provisioned safely.
+		serial, err := os.ReadFile(filepath.Join(devPath, "serial"))
+		if err != nil {
+			discoveryErrors = append(discoveryErrors, fmt.Errorf("read serial for %s: %w", devName, err))
+			continue
 		}
+		hwDev.SerialNumber = strings.TrimSpace(string(serial))
 
 		// Read NUMA Node
 		if b, err := os.ReadFile(filepath.Join(devPath, "numa_node")); err == nil {
@@ -184,9 +231,11 @@ func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error
 
 		// Determine PCI Address by resolving the device symlink
 		link, err := os.Readlink(filepath.Join(devPath, "device"))
-		if err == nil {
-			hwDev.PCIAddress = filepath.Base(link)
+		if err != nil {
+			discoveryErrors = append(discoveryErrors, fmt.Errorf("resolve PCI address for %s: %w", devName, err))
+			continue
 		}
+		hwDev.PCIAddress = strings.ToLower(filepath.Base(link))
 
 		if !policy.permits(hwDev.PCIAddress) {
 			continue
@@ -196,7 +245,8 @@ func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error
 		mounted, err := inspectDeviceMounts(devName)
 		if err != nil {
 			if !policy.unsafeMountInspection {
-				return nil, fmt.Errorf("inspect mount state for %s: %w", devName, err)
+				discoveryErrors = append(discoveryErrors, fmt.Errorf("inspect mount state for %s: %w", devName, err))
+				continue
 			}
 		} else if mounted {
 			continue
@@ -205,13 +255,18 @@ func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error
 		// Calculate total bytes from matching namespace blocks
 		hwDev.TotalBytes, err = calculateTotalBytes(devName)
 		if err != nil {
-			return nil, fmt.Errorf("calculate capacity for %s: %w", devName, err)
+			discoveryErrors = append(discoveryErrors, fmt.Errorf("calculate capacity for %s: %w", devName, err))
+			continue
+		}
+		if err := validateHardwareNVMe(hwDev); err != nil {
+			discoveryErrors = append(discoveryErrors, fmt.Errorf("validate %s: %w", devName, err))
+			continue
 		}
 
 		devices = append(devices, hwDev)
 	}
 
-	return devices, nil
+	return devices, errors.Join(discoveryErrors...)
 }
 
 func inspectDeviceMounts(devName string) (bool, error) {
@@ -303,6 +358,7 @@ func discoverSPDKNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) 
 	}
 
 	var devices []HardwareNVMe
+	var discoveryErrors []error
 	for _, bdev := range bdevs {
 		if bdev.DriverSpecific == nil || len(bdev.DriverSpecific.NVMe) == 0 {
 			continue
@@ -316,10 +372,16 @@ func discoverSPDKNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) 
 			TotalBytes:   bdev.NumBlocks * bdev.BlockSize,
 			NUMANode:     -1,
 		}
-		if policy.permits(hwDev.PCIAddress) {
-			devices = append(devices, hwDev)
+		hwDev.PCIAddress = strings.ToLower(strings.TrimSpace(hwDev.PCIAddress))
+		if !policy.permits(hwDev.PCIAddress) {
+			continue
 		}
+		if err := validateHardwareNVMe(hwDev); err != nil {
+			discoveryErrors = append(discoveryErrors, fmt.Errorf("validate SPDK bdev %s: %w", bdev.Name, err))
+			continue
+		}
+		devices = append(devices, hwDev)
 	}
 
-	return devices, nil
+	return devices, errors.Join(discoveryErrors...)
 }

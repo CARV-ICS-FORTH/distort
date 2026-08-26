@@ -135,3 +135,60 @@ func TestUnsafeMountInspectionOverrideIsExplicit(t *testing.T) {
 		t.Fatalf("unsafe override returned devices=%#v err=%v", devices, err)
 	}
 }
+
+func TestDiscoveryRejectsIncompleteKernelMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T)
+	}{
+		{
+			name: "empty serial",
+			mutate: func(t *testing.T) {
+				writeDiscoveryFile(t, filepath.Join(sysClassNVMe, "nvme0", "serial"), "\n")
+			},
+		},
+		{
+			name: "missing PCI identity",
+			mutate: func(t *testing.T) {
+				if err := os.Remove(filepath.Join(sysClassNVMe, "nvme0", "device")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "zero capacity",
+			mutate: func(t *testing.T) {
+				writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n1", "size"), "0\n")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupDiscoveryFixture(t)
+			test.mutate(t)
+			devices, err := discoverKernelNVMe()
+			if err == nil {
+				t.Fatal("unsafe metadata did not degrade discovery")
+			}
+			if len(devices) != 0 {
+				t.Fatalf("unsafe metadata produced devices: %#v", devices)
+			}
+		})
+	}
+}
+
+func TestDiscoveryReturnsSafePartialKernelResults(t *testing.T) {
+	setupDiscoveryFixture(t)
+	invalid := filepath.Join(sysClassNVMe, "nvme1")
+	writeDiscoveryFile(t, filepath.Join(invalid, "transport"), "pcie\n")
+	writeDiscoveryFile(t, filepath.Join(invalid, "serial"), "\n")
+
+	devices, err := discoverKernelNVMe()
+	if err == nil {
+		t.Fatal("partial kernel scan did not report its invalid controller")
+	}
+	if len(devices) != 1 || devices[0].SerialNumber != "SERIAL-1" {
+		t.Fatalf("safe partial result = %#v, want the valid controller", devices)
+	}
+}

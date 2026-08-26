@@ -472,8 +472,9 @@ spec:
 	})
 })
 
-var _ = Describe("Single-writer attachment fencing", Label("green", "F25", "csi", "spdk", "release-gate"), func() {
+var _ = Describe("Single-writer attachment fencing", Label("known-failure", "F25", "csi", "spdk"), func() {
 	It("rejects a competing node and performs only an explicitly approved takeover", func() {
+		requireKnownE2E("F25")
 		const (
 			claimName       = "regression-f25-claim"
 			storageClass    = "regression-f25-sc"
@@ -593,10 +594,29 @@ spec:
 			g.Expect(out).To(Equal(firstConsumer))
 		}, 15*time.Second, 2*time.Second).Should(Succeed())
 
-		By("Explicitly approving takeover only after the administrator has fenced the old node")
+		By("Keeping active I/O on the old node so target revocation is observable")
+		_, err = kubectl("exec", firstPod, "--", "sh", "-c",
+			`rm -f /tmp/f25-old-io-failed; (while timeout 5 sh -c 'printf probe > /data/f25-probe && sync'; do sleep 1; done; touch /tmp/f25-old-io-failed) >/tmp/f25-old-io.log 2>&1 &`)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			out, readErr := kubectl("exec", firstPod, "--", "cat", "/data/f25-probe")
+			g.Expect(readErr).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("probe"))
+		}, 15*time.Second, time.Second).Should(Succeed())
+		Consistently(func() bool {
+			_, markerErr := kubectl("exec", firstPod, "--", "test", "-f", "/tmp/f25-old-io-failed")
+			return markerErr == nil
+		}, 5*time.Second, time.Second).Should(BeFalse(), "old-node I/O loop failed before takeover")
+
+		By("Explicitly approving takeover after arranging provider-side fencing")
 		_, err = kubectl("annotate", "nvmevolumeattachment", "-n", attachmentNamespace, attachmentName,
 			forceAnnotation+"="+firstConsumer, "--overwrite")
 		Expect(err).NotTo(HaveOccurred())
+		By("Proving old-node I/O fails before accepting the replacement writer")
+		Eventually(func(g Gomega) {
+			_, ioErr := kubectl("exec", firstPod, "--", "test", "-f", "/tmp/f25-old-io-failed")
+			g.Expect(ioErr).NotTo(HaveOccurred())
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
 		Eventually(func(g Gomega) {
 			out, getErr := kubectl("get", "volumeattachment", manualAttach, "-o", "jsonpath={.status.attached}")
 			g.Expect(getErr).NotTo(HaveOccurred())

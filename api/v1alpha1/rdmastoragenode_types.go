@@ -29,8 +29,10 @@ const (
 	RDMATransportRoCEv2 RDMATransportType = "RoCEv2"
 	// RDMATransportInfiniBand represents InfiniBand transport.
 	RDMATransportInfiniBand RDMATransportType = "InfiniBand"
-	// RDMATransportTCP represents TCP transport (standard NVMe/TCP fallback if RDMA fails).
-	RDMATransportTCP RDMATransportType = "TCP"
+
+	// NVMeInventoryReadyCondition reports whether every NVMe discovery source
+	// completed successfully during the latest reporter observation.
+	NVMeInventoryReadyCondition = "NVMeInventoryReady"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -49,7 +51,7 @@ type RDMAStorageNodeSpec struct {
 
 	// Transport is the active RDMA transport type (e.g., RoCEv2, InfiniBand).
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=RoCEv2;InfiniBand;TCP
+	// +kubebuilder:validation:Enum=RoCEv2;InfiniBand
 	Transport RDMATransportType `json:"transport"`
 
 	// LinkSpeed is the speed of the RDMA link (e.g., "100Gbps").

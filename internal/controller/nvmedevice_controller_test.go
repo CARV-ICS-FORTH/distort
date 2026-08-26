@@ -128,4 +128,34 @@ var _ = Describe("NVMeDevice capacity reconciliation", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(used).To(BeZero())
 	})
+
+	It("rejects unsafe discovered-device identity and capacity at admission", func() {
+		valid := storagev1alpha1.NVMeDeviceSpec{
+			NodeName:      "distort-worker-1",
+			PCIAddress:    "0000:01:00.0",
+			SerialNumber:  "safe-serial",
+			TotalCapacity: resource.MustParse("1Gi"),
+		}
+		tests := []struct {
+			name   string
+			mutate func(*storagev1alpha1.NVMeDeviceSpec)
+		}{
+			{name: "empty-node", mutate: func(spec *storagev1alpha1.NVMeDeviceSpec) { spec.NodeName = "" }},
+			{name: "empty-serial", mutate: func(spec *storagev1alpha1.NVMeDeviceSpec) { spec.SerialNumber = "" }},
+			{name: "invalid-pci", mutate: func(spec *storagev1alpha1.NVMeDeviceSpec) { spec.PCIAddress = "not-pci" }},
+			{name: "zero-capacity", mutate: func(spec *storagev1alpha1.NVMeDeviceSpec) {
+				spec.TotalCapacity = resource.MustParse("0")
+			}},
+		}
+
+		for _, test := range tests {
+			spec := valid
+			test.mutate(&spec)
+			err := k8sClient.Create(ctx, &storagev1alpha1.NVMeDevice{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-device-" + test.name},
+				Spec:       spec,
+			})
+			Expect(err).To(HaveOccurred(), test.name)
+		}
+	})
 })

@@ -40,14 +40,17 @@ const (
 type NVMeDeviceSpec struct {
 	// NodeName is the name of the Kubernetes node where the device is attached.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	NodeName string `json:"nodeName"`
 
 	// PCIAddress is the PCIe address of the NVMe controller (e.g., "0000:01:00.0").
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern="^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$"
 	PCIAddress string `json:"pciAddress"`
 
 	// SerialNumber is the device's hardware serial number. Used for claim matching.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	SerialNumber string `json:"serialNumber"`
 
 	// Model is the model name/number of the NVMe device.
@@ -56,6 +59,7 @@ type NVMeDeviceSpec struct {
 
 	// TotalCapacity is the total raw size of the device.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="totalCapacity must be positive"
 	TotalCapacity resource.Quantity `json:"totalCapacity"`
 
 	// NUMANode indicates the NUMA topology node the device is connected to.

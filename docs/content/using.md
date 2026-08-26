@@ -56,14 +56,25 @@ Malformed list entries stop discovery instead of broadening the selection. DISTO
 
 ### RDMA readiness
 
-A storage node is eligible for placement only while its agent discovers an active RDMA port, maps it to a network interface with a non-loopback IP address, and refreshes the node heartbeat. Inspect the published endpoint and readiness with:
+A storage node is eligible for placement only while its agent discovers a port
+whose state is exactly `ACTIVE`, maps it to a supported Ethernet/RoCEv2 or
+InfiniBand interface, selects a routable unicast address, and refreshes the node
+heartbeat. IPv4 is preferred when both address families are configured; a
+global IPv6 address is a supported fallback. Loopback, unspecified, multicast,
+and link-local addresses are rejected. DISTORT does not advertise an NVMe/TCP
+fallback because its current target and CSI data path is RDMA-only. Inspect the
+published endpoint and readiness with:
 
 ```bash
 kubectl get rdmastoragenodes
 kubectl get rdmastoragenode <node-name> -o yaml
 ```
 
-The reported transport, link speed, IP address, active-export count, `Ready` condition, and `lastHeartbeatTime` come from the node's live RDMA state. Placement waits when no endpoint is ready or when its heartbeat is older than 45 seconds; DISTORT does not substitute a Kubernetes InternalIP or loopback address.
+The reported transport, link speed, IP address, active-export count, `Ready`
+condition, and `lastHeartbeatTime` come from the node's live RDMA state.
+Placement waits when no endpoint is ready or when its heartbeat is older than
+45 seconds; DISTORT does not substitute a Kubernetes InternalIP or loopback
+address.
 
 ### Step 2: Allocate Drives via `NVMeDeviceClaim`
 
@@ -111,7 +122,7 @@ DISTORT supports multiple backends and volume carving configurations. These are 
 |---|---|---|---|---|
 | `target-backend` | String | `spdk`, `kernel` | `spdk` | The target export technology to run on the storage nodes. |
 | `volume-manager` | String | `partition` | `partition` | The volume carving method to slice physical drives. Unimplemented managers such as `lvm` are rejected. |
-| `spdk-core-mask` | String | CPU mask (e.g., `0x1`, `0x3`) | `0x1` | Core affinity mask to pass to the SPDK target daemon (SPDK only). |
+| `spdk-core-mask` | String | Nonzero CPU mask (e.g., `0x1`, `0x3`) | `0x1` | Node-global core affinity mask for the SPDK target daemon (SPDK only). |
 | `fsType` | String | `ext4`, `xfs` | `ext4` | Filesystem created on a blank exported volume.|
 | `csi.storage.k8s.io/fstype` | String | `ext4`, `xfs` | `ext4` | CSI ecosystem spelling for the filesystem type. |
 
@@ -192,6 +203,11 @@ The chart exposes resource controls for installations with a deliberately sized 
 | `agent.spdk.skipHugepageSetup` | `false` | Preserve a hugepage reservation managed by the host instead of allowing SPDK setup to replace it. |
 
 Leaving the values unset preserves upstream SPDK behavior. Size them from measured workload concurrency and the node's hugepage reservation; the small values used by the local lab are functional-test settings, not universal production recommendations. The agent validates paired iobuf settings and positive numeric values before starting SPDK.
+
+The SPDK target is one shared node process. Consequently, every SPDK-backed
+StorageClass used on the same node must request the same `spdk-core-mask`.
+DISTORT rejects `0x0` and rejects a request that conflicts with the running
+process instead of silently applying first-request-wins behavior.
 
 ### 2. Request a Volume via PVC
 

@@ -20,10 +20,13 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -79,6 +82,33 @@ func deviceCanHostPartition(device *storagev1alpha1.NVMeDevice, partition *stora
 	return device.Status.ActiveBackend == "" || device.Status.ActiveBackend == backend
 }
 
+func inventoryIsReady(node *storagev1alpha1.RDMAStorageNode) bool {
+	condition := meta.FindStatusCondition(node.Status.Conditions, storagev1alpha1.NVMeInventoryReadyCondition)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+func liveClaimOwnsDevice(
+	ctx context.Context,
+	reader client.Reader,
+	device *storagev1alpha1.NVMeDevice,
+) (bool, error) {
+	ref := device.Status.ClaimRef
+	if ref == nil || ref.Namespace == "" || ref.Name == "" || ref.UID == "" {
+		return false, nil
+	}
+	var claim storagev1alpha1.NVMeDeviceClaim
+	key := client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}
+	if err := reader.Get(ctx, key, &claim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return claim.UID == ref.UID && claim.DeletionTimestamp.IsZero() && claim.Status.Active &&
+		claim.Status.MatchedDevice == device.Name && claim.Status.NodeName == device.Spec.NodeName &&
+		strings.EqualFold(claim.Spec.SerialNumber, device.Spec.SerialNumber), nil
+}
+
 func availableCapacity(device *storagev1alpha1.NVMeDevice, partitions []storagev1alpha1.NVMePartition) (int64, error) {
 	usedBytes, err := allocatedCapacityForDevice(partitions, device.Spec.SerialNumber)
 	if err != nil {
@@ -107,7 +137,7 @@ func (r *NVMePartitionReconciler) placementCandidates(
 	}
 	readyNodes := make(map[string]struct{}, len(rdmaNodes.Items))
 	for i := range rdmaNodes.Items {
-		if err := rdmahealth.Validate(&rdmaNodes.Items[i], time.Now()); err == nil {
+		if err := rdmahealth.Validate(&rdmaNodes.Items[i], time.Now()); err == nil && inventoryIsReady(&rdmaNodes.Items[i]) {
 			readyNodes[rdmaNodes.Items[i].Spec.NodeName] = struct{}{}
 		}
 	}
@@ -119,6 +149,13 @@ func (r *NVMePartitionReconciler) placementCandidates(
 			continue
 		}
 		if !deviceCanHostPartition(device, partition) {
+			continue
+		}
+		owned, err := liveClaimOwnsDevice(ctx, reader, device)
+		if err != nil {
+			return nil, err
+		}
+		if !owned {
 			continue
 		}
 		freeBytes, err := availableCapacity(device, partitions.Items)
@@ -174,11 +211,18 @@ func (r *NVMePartitionReconciler) reserveCandidate(
 		if device.Spec.SerialNumber != candidate.serial || !deviceCanHostPartition(&device, &partition) {
 			return nil
 		}
+		owned, err := liveClaimOwnsDevice(ctx, reader, &device)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return nil
+		}
 		var rdmaNode storagev1alpha1.RDMAStorageNode
 		if err := reader.Get(ctx, client.ObjectKey{Name: device.Spec.NodeName}, &rdmaNode); err != nil {
 			return err
 		}
-		if err := rdmahealth.Validate(&rdmaNode, time.Now()); err != nil {
+		if err := rdmahealth.Validate(&rdmaNode, time.Now()); err != nil || !inventoryIsReady(&rdmaNode) {
 			return nil
 		}
 
@@ -223,6 +267,7 @@ func (r *NVMePartitionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmepartitions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=storage.distort.io,resources=rdmastoragenodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedevices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedeviceclaims,verbs=get;list;watch
 
 // Reconcile assigns unassigned NVMePartitions to optimal RDMAStorageNodes based on available free capacity.
 func (r *NVMePartitionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

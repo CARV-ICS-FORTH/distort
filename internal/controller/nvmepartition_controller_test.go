@@ -94,6 +94,15 @@ var _ = Describe("NVMePartition placement", func() {
 				_ = k8sClient.Delete(ctx, &devices.Items[i])
 			}
 		}
+		var claims storagev1alpha1.NVMeDeviceClaimList
+		Expect(k8sClient.List(ctx, &claims, client.InNamespace(namespace))).To(Succeed())
+		for i := range claims.Items {
+			if claims.Items[i].Labels["test.distort.io/suite"] == placementSuiteLabel {
+				claims.Items[i].Finalizers = nil
+				_ = k8sClient.Update(ctx, &claims.Items[i])
+				_ = k8sClient.Delete(ctx, &claims.Items[i])
+			}
+		}
 		var rdmaNodes storagev1alpha1.RDMAStorageNodeList
 		Expect(k8sClient.List(ctx, &rdmaNodes)).To(Succeed())
 		for i := range rdmaNodes.Items {
@@ -117,6 +126,10 @@ var _ = Describe("NVMePartition placement", func() {
 			meta.SetStatusCondition(&rdmaNode.Status.Conditions, metav1.Condition{
 				Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, Reason: "TestReady", Message: "Test RDMA endpoint is ready",
 			})
+			meta.SetStatusCondition(&rdmaNode.Status.Conditions, metav1.Condition{
+				Type: storagev1alpha1.NVMeInventoryReadyCondition, Status: metav1.ConditionTrue,
+				Reason: "TestInventoryReady", Message: "Test NVMe inventory is fresh",
+			})
 			Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
 		}
 		device := &storagev1alpha1.NVMeDevice{
@@ -133,10 +146,22 @@ var _ = Describe("NVMePartition placement", func() {
 		device.Status.FreeCapacity = resource.MustParse(free)
 		device.Status.ActiveBackend = backend
 		if state == storagev1alpha1.NVMeDeviceStateClaimed {
+			claim := &storagev1alpha1.NVMeDeviceClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name + "-claim", Namespace: namespace,
+					Labels: map[string]string{"test.distort.io/suite": placementSuiteLabel},
+				},
+				Spec: storagev1alpha1.NVMeDeviceClaimSpec{SerialNumber: serial},
+			}
+			Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+			claim.Status.Active = true
+			claim.Status.MatchedDevice = name
+			claim.Status.NodeName = node
+			Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
 			device.Status.ClaimRef = &storagev1alpha1.NVMeDeviceClaimReference{
 				Namespace: namespace,
-				Name:      name + "-claim",
-				UID:       types.UID(name + "-claim-uid"),
+				Name:      claim.Name,
+				UID:       claim.UID,
 			}
 		}
 		Expect(k8sClient.Status().Update(ctx, device)).To(Succeed())
@@ -197,10 +222,10 @@ var _ = Describe("NVMePartition placement", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
 		Expect(actual.Spec.NodeName).To(Equal("node-large"))
 		Expect(actual.Spec.ParentDeviceSerialNumber).To(Equal("serial-large"))
+		var claim storagev1alpha1.NVMeDeviceClaim
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-large-claim", Namespace: namespace}, &claim)).To(Succeed())
 		Expect(actual.Spec.ClaimRef).To(Equal(&storagev1alpha1.NVMeDeviceClaimReference{
-			Namespace: namespace,
-			Name:      "placement-large-claim",
-			UID:       types.UID("placement-large-claim-uid"),
+			Namespace: namespace, Name: claim.Name, UID: claim.UID,
 		}))
 	})
 
@@ -225,6 +250,58 @@ var _ = Describe("NVMePartition placement", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "node-stale-rdma"}, &rdmaNode)).To(Succeed())
 		rdmaNode.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(-2 * rdmahealth.FreshnessWindow))
 		Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+	})
+
+	It("does not place storage while NVMe inventory discovery is degraded", func() {
+		createDevice("placement-stale-inventory", "node-stale-inventory", "serial-stale-inventory", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		var rdmaNode storagev1alpha1.RDMAStorageNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "node-stale-inventory"}, &rdmaNode)).To(Succeed())
+		meta.SetStatusCondition(&rdmaNode.Status.Conditions, metav1.Condition{
+			Type: storagev1alpha1.NVMeInventoryReadyCondition, Status: metav1.ConditionFalse,
+			Reason: "TestDiscoveryFailed", Message: "One inventory source failed",
+		})
+		Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+	})
+
+	It("does not trust a device whose referenced live claim is inactive", func() {
+		createDevice("placement-inactive-claim", "node-inactive-claim", "serial-inactive-claim", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		var claim storagev1alpha1.NVMeDeviceClaim
+		claimKey := types.NamespacedName{Name: "placement-inactive-claim-claim", Namespace: namespace}
+		Expect(k8sClient.Get(ctx, claimKey, &claim)).To(Succeed())
+		claim.Status.Active = false
+		Expect(k8sClient.Status().Update(ctx, &claim)).To(Succeed())
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+	})
+
+	It("does not trust stale device ownership after the referenced claim is deleted", func() {
+		createDevice("placement-missing-claim", "node-missing-claim", "serial-missing-claim", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		var claim storagev1alpha1.NVMeDeviceClaim
+		claimKey := types.NamespacedName{Name: "placement-missing-claim-claim", Namespace: namespace}
+		Expect(k8sClient.Get(ctx, claimKey, &claim)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &claim)).To(Succeed())
 		createPartition("placement-request", "1Gi", "spdk")
 
 		result, err := reconcilePartition("placement-request")

@@ -2,12 +2,15 @@ package agent
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
 	storagev1alpha1 "distort/api/v1alpha1"
 )
+
+const testRDMAIPv4 = "192.0.2.10"
 
 func setupRDMAFixture(t *testing.T, state, linkLayer string) {
 	t.Helper()
@@ -17,7 +20,7 @@ func setupRDMAFixture(t *testing.T, state, linkLayer string) {
 		if name != "rdma0" {
 			return "", errors.New("unexpected interface")
 		}
-		return "192.0.2.10", nil
+		return testRDMAIPv4, nil
 	}
 	t.Cleanup(func() {
 		sysClassInfiniBand = oldRoot
@@ -36,7 +39,7 @@ func TestDiscoverRDMAEndpointFindsActiveRoCEInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if endpoint.Interface != "rdma0" || endpoint.IP != "192.0.2.10" ||
+	if endpoint.Interface != "rdma0" || endpoint.IP != testRDMAIPv4 ||
 		endpoint.Transport != storagev1alpha1.RDMATransportRoCEv2 || endpoint.LinkSpeed != "100 Gb/sec" {
 		t.Fatalf("unexpected RDMA endpoint: %#v", endpoint)
 	}
@@ -46,6 +49,61 @@ func TestDiscoverRDMAEndpointRejectsDownLink(t *testing.T) {
 	setupRDMAFixture(t, "1: DOWN\n", "Ethernet\n")
 	if _, err := DiscoverRDMAEndpoint(); err == nil {
 		t.Fatal("down RDMA link was reported ready")
+	}
+}
+
+func TestDiscoverRDMAEndpointRejectsActiveDeferState(t *testing.T) {
+	setupRDMAFixture(t, "5: ACTIVE_DEFER\n", "Ethernet\n")
+	if _, err := DiscoverRDMAEndpoint(); err == nil {
+		t.Fatal("ACTIVE_DEFER RDMA link was reported ready")
+	}
+}
+
+func TestDiscoverRDMAEndpointRejectsUnknownLinkLayer(t *testing.T) {
+	setupRDMAFixture(t, "4: ACTIVE\n", "TCP\n")
+	if _, err := DiscoverRDMAEndpoint(); err == nil {
+		t.Fatal("unsupported RDMA link layer was reported ready")
+	}
+}
+
+type testNetworkAddress string
+
+func (a testNetworkAddress) Network() string { return "ip" }
+func (a testNetworkAddress) String() string  { return string(a) }
+
+func TestSelectRoutableAddressRejectsUnsafeAddressesAndPrefersIPv4(t *testing.T) {
+	addresses := []net.Addr{
+		testNetworkAddress("fe80::1/64"),
+		testNetworkAddress("ff02::1/64"),
+		testNetworkAddress("2001:db8::10/64"),
+		testNetworkAddress(testRDMAIPv4 + "/24"),
+	}
+	address, err := selectRoutableAddress(addresses)
+	if err != nil || address != testRDMAIPv4 {
+		t.Fatalf("selected address = %q, err=%v; want preferred routable IPv4", address, err)
+	}
+}
+
+func TestSelectRoutableAddressAcceptsGlobalIPv6Fallback(t *testing.T) {
+	addresses := []net.Addr{
+		testNetworkAddress("169.254.1.10/16"),
+		testNetworkAddress("2001:db8::20/64"),
+	}
+	address, err := selectRoutableAddress(addresses)
+	if err != nil || address != "2001:db8::20" {
+		t.Fatalf("selected address = %q, err=%v; want routable IPv6", address, err)
+	}
+}
+
+func TestSelectRoutableAddressRejectsOnlyLocalAndMulticastAddresses(t *testing.T) {
+	addresses := []net.Addr{
+		testNetworkAddress("127.0.0.1/8"),
+		testNetworkAddress("169.254.1.10/16"),
+		testNetworkAddress("fe80::1/64"),
+		testNetworkAddress("224.0.0.1/32"),
+	}
+	if address, err := selectRoutableAddress(addresses); err == nil {
+		t.Fatalf("unsafe address set selected %q", address)
 	}
 }
 

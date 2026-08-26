@@ -6,18 +6,23 @@ type: "page"
 
 # Current Project Review — 2026-08-25
 
+> Batch 1 update (2026-08-26): fixes for F3, F4, F11, F12, and the
+> host-side portion of F13 are implemented and pass the host CI-equivalent
+> suite. Batch 2 resolves F2, F6, and F7 with claim immutability, live ownership
+> checks, fail-closed inventory health, safe partial discovery, and hashed
+> device names. Host regression coverage and the three-node isolated-lab smoke
+> check pass. The corrected F25 takeover remains pending in the isolated Vagrant
+> environment.
+
 ## 1. Executive summary
 
 DISTORT has a credible, well-structured happy path, but the current working tree is not production-ready. The host-side suite and race detector pass, yet several important recovery, deployment, CSI-contract, and state-consistency defects remain outside those tests.
 
-The most serious findings are:
+The most serious unresolved findings are:
 
 - The kernel NVMe target can report a partition as Exported and an attachment as ready when configfs is incomplete or disconnected.
-- NVMeDeviceClaim.spec.serialNumber is mutable, allowing one claim to retain stale ownership while rebinding elsewhere.
-- The documented Helm quick start deploys an unqualified, mutable distort:latest image.
-- The documented make test-env-redeploy workflow silently does nothing because of a Makefile typo.
 - Multiple CSI 1.5 request semantics are implemented incorrectly.
-- The current GitHub module and lint quality gates are deterministically failing even though local make test-suite passes.
+- SPDK startup and shared process options are not transactional or consistently enforced.
 
 No Critical issue was confirmed. Four High-severity defects and several Medium-severity correctness and reliability gaps were found.
 
@@ -44,25 +49,30 @@ Project summary:
 
 | Feature or flow | Intended behavior | Implementation | Status |
 |---|---|---|---|
-| Helm installation | Install a working manager, agent, CSI controller/node, CRDs, and RBAC | deploy/charts/distort | **Broken by default image** |
-| Device discovery | Discover safe, unmounted NVMe controllers and mark disappeared hardware unavailable | internal/agent/nvme_discovery.go, reporter.go | **Partially verified** |
+| Helm installation | Install a working manager, agent, CSI controller/node, CRDs, and RBAC | deploy/charts/distort | **Host-verified; published image pending** |
+| Device discovery | Discover safe, unmounted NVMe controllers and mark disappeared hardware unavailable | internal/agent/nvme_discovery.go, reporter.go | **Host and isolated-lab smoke verified** |
 | RDMA readiness | Publish only active, usable, fresh RDMA endpoints | rdma_discovery.go, rdmahealth/readiness.go | **Partially verified** |
-| Device claims | Bind exact serial to one device and preserve ownership by UID | nvmedeviceclaim_controller.go | **Broken under spec mutation** |
-| Partition placement | Select a claimed device on a fresh RDMA node with sufficient capacity | nvmepartition_controller.go | **Verified on normal path; fragile around stale claims and inventory** |
+| Device claims | Bind exact serial to one device and preserve ownership by UID | nvmedeviceclaim_controller.go | **Host-verified** |
+| Partition placement | Select a claimed device on a fresh RDMA node with sufficient capacity | nvmepartition_controller.go | **Host-verified for live ownership and inventory health** |
 | SPDK provisioning | Bind hardware, create lvol, export, supervise, recover, and clean up | SPDK backend and lvol manager | **Partially verified** |
 | Kernel provisioning | Create GPT partition and complete configfs target, recover idempotently | Kernel backend and parted manager | **Broken under partial state** |
 | CSI Create/Delete | Create stable namespaced volume handles and clean exact backend allocation | controller_server.go | **Partially verified** |
 | Single-writer attachment | Durable owner, exact host ACL, explicit fenced takeover | controller_attachment.go, attachment CRD, agent ACL reconciliation | **Partially verified; hardware gate pending** |
 | CSI node lifecycle | Connect, validate filesystem, format blank volume, stage and publish safely | node_server.go, nvme.go | **Partially verified** |
-| Host-side quality gates | Tests, race, lint, tidy, Helm, docs, and E2E compile should pass | Makefile and GitHub workflows | **Local suite passes; CI gates broken** |
-| Vagrant hardware workflow | Redeploy current image, smoke-check lab, and run isolated E2E | Makefile, vagrant, and E2E tests | **Broken redeploy; lab currently unhealthy** |
-| Documentation | Canonical docs describe current implementation and release status | docs/content | **Inconsistent** |
+| Host-side quality gates | Tests, race, lint, tidy, Helm, docs, and E2E compile should pass | Makefile and GitHub workflows | **Host-verified** |
+| Vagrant hardware workflow | Redeploy current image, smoke-check lab, and run isolated E2E | Makefile, vagrant, and E2E tests | **Redeploy fixed; lab validation pending** |
+| Documentation | Canonical docs describe current implementation and release status | docs/content | **Host-verified** |
 
 ## 3. Findings
 
-### Current F1. Kernel target can falsely report a broken export as ready
+Status legend:
 
-- **Severity:** High
+- [ ] Open, or implemented but still awaiting required verification
+- [x] Resolved and verified at the required test level
+
+### 1. Kernel target can falsely report a broken export as ready
+
+- [ ] **F1 — High — Open**
 - **Confidence:** Confirmed in control flow; hardware consequence not exercised
 - **Affected:** internal/agent/plugins/backend_kernel.go:63, internal/agent/partition_manager.go:488
 - **Expected:** Reconciliation verifies or repairs the namespace device path, enabled state, listener address and port, subsystem link, and host ACL before publishing Exported or AccessReady=True.
@@ -77,10 +87,11 @@ Project summary:
 - **Recommended fix:** Implement an exact kernel CheckExport, make ExportVolume validate and repair each component, derive address family from the portal IP, and always verify or recreate the port link. Revoke ACLs before unexport.
 - **Regression test:** Add fake-configfs tests for partial subsystems, missing/wrong namespaces and listeners, missing links, IPv6, and retry after link failure. Assert that invalid state never produces Exported or AccessReady.
 
-### Current F2. Mutating an active claim creates inconsistent or leaked ownership
+### 2. Mutating an active claim creates inconsistent or leaked ownership
 
-- **Severity:** High
+- [x] **F2 — High — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** The generated API schema rejects empty and mutated serials. Controller envtest covers active claims both with and without dependent partitions, verifies unchanged ownership after rejection, and proves placement ignores inactive or missing live claims. The complete host CI and race gates pass.
 - **Affected:** api/v1alpha1/nvmedeviceclaim_types.go:27, internal/controller/nvmedeviceclaim_controller.go:191, internal/controller/nvmepartition_controller.go:74
 - **Expected:** The serial establishing physical ownership is immutable, or migration safely coordinates every dependent partition and old device.
 - **Actual:** spec.serialNumber has no nonempty or immutability validation. Patching it to a missing serial leaves the old device Claimed. Patching it to another present serial can claim the new device without releasing the old one because the release loop only considers devices matching the new serial. Placement checks device status and ClaimRef but does not resolve the live claim. The agent later rejects old allocations because the claim serial no longer matches.
@@ -89,10 +100,11 @@ Project summary:
 - **Recommended fix:** Add MinLength=1 and CEL immutability to serialNumber. Placement should verify the referenced live claim UID, active state, matched device, node, and serial before reserving capacity.
 - **Regression test:** Patch a bound claim with and without dependent partitions in envtest; expect admission rejection and unchanged ownership.
 
-### Current F3. The documented Helm quick start uses an unsafe non-release image
+### 3. The documented Helm quick start uses an unsafe non-release image
 
-- **Severity:** High
+- [x] **F3 — High — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** The chart requires a qualified repository, defaults to version `0.5.0`, rejects `latest`, supports digest pinning, and passes the host Helm and repository-contract gates. Publishing the first project image remains a release operation.
 - **Affected:** README.md:20, deploy/charts/distort/values.yaml:1
 - **Expected:** A plain documented install deploys a project-owned versioned image or requires an explicit repository.
 - **Actual:** The README provides no image override. The chart renders every DISTORT component as unqualified, mutable distort:latest.
@@ -101,10 +113,11 @@ Project summary:
 - **Recommended fix:** Publish and default to a fully qualified project-controlled image aligned with Chart.appVersion, preferably with optional digest pinning. Otherwise make the repository value mandatory.
 - **Regression test:** Assert that the default rendered image is qualified, not latest, and matches the chart release.
 
-### Current F4. The documented lab redeploy command is a silent no-op
+### 4. The documented lab redeploy command is a silent no-op
 
-- **Severity:** High
+- [ ] **F4 — High — Fix implemented; isolated-lab verification pending**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** The dry-run repository contract passes and emits the complete build/deploy workflow. A real isolated-lab redeploy is still pending.
 - **Affected:** Makefile:184, docs/content/local-testing.md:121
 - **Expected:** make test-env-redeploy builds, imports, deploys, restarts, and waits for the current image.
 - **Actual:** The phony target has no recipe or prerequisite. The deploy prerequisite is attached to the misspelled target test-e test-env-destroynv-redeploy.
@@ -113,9 +126,9 @@ Project summary:
 - **Recommended fix:** Define test-env-redeploy: test-env-deploy.
 - **Regression test:** Add a repository contract that dry-runs the target and verifies that build and deploy commands are emitted.
 
-### Current F5. CSI controller violates multiple CSI 1.5 request contracts
+### 5. CSI controller violates multiple CSI 1.5 request contracts
 
-- **Severity:** Medium
+- [ ] **F5 — Medium — Open**
 - **Confidence:** Confirmed
 - **Affected:** internal/csi/controller_server.go:43, internal/csi/controller_attachment.go:109, CSI 1.5 spec CapacityRange and ControllerUnpublishVolume contracts
 - **Expected:** Follow the request semantics in the declared CSI 1.5 dependency.
@@ -128,10 +141,11 @@ Project summary:
 - **Recommended fix:** Normalize limit-only ranges, resolve exact UID-bearing handles during validation, compare filesystem/context/parameters, and treat empty node ID as deletion of the current attachment.
 - **Regression test:** Add limit-only, both-zero, nonexistent and recreated volume, altered context, parameter mismatch, and all-node-unpublish tests. Run CSI conformance for advertised methods.
 
-### Current F6. Discovery failures leave stale devices schedulable
+### 6. Discovery failures leave stale devices schedulable
 
-- **Severity:** Medium
+- [x] **F6 — Medium — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** Reporter tests prove safe partial results are refreshed while kernel/SPDK and aggregate discovery conditions degrade, recovery requires a complete successful observation, and missing-device invalidation is skipped for incomplete scans. Controller envtest proves `NVMeInventoryReady=False` blocks new placement. The complete host CI and race gates pass. The isolated three-node lab then reported `NVMeInventoryReady=True` for every node and passed smoke validation with three discovered devices.
 - **Affected:** internal/agent/nvme_discovery.go:85, internal/agent/reporter.go:142
 - **Expected:** A degraded scan publishes safe partial results with explicit source health or makes affected inventory unavailable.
 - **Actual:** DiscoverNVMe can return partial devices plus an error. reportDevices discards the entire result, reports zero capacity, and skips invalidating previously reported devices. RDMA readiness can remain true, and placement uses stale NVMeDevice objects instead of reported node capacity.
@@ -140,10 +154,11 @@ Project summary:
 - **Recommended fix:** Track health per discovery source, process safe partial results, publish a degradation condition, and make scheduling reject stale inventory.
 - **Regression test:** Inject successful discovery followed by a partial-source error and assert no new partition is scheduled until a fresh successful observation.
 
-### Current F7. Raw hardware serials are unsafe Kubernetes object names
+### 7. Raw hardware serials are unsafe Kubernetes object names
 
-- **Severity:** Medium
+- [x] **F7 — Medium — Resolved**
 - **Confidence:** Highly likely
+- **Verification (2026-08-26):** Device names now use a bounded readable node prefix plus a 128-bit SHA-256-derived suffix while preserving the exact serial in spec. Tests cover whitespace, punctuation, long serials, deterministic distinct names, missing serial/PCI identity, zero capacity, partial kernel scans, API schema validation, and generated/chart CRD synchronization. The complete host CI and race gates pass, and the isolated three-node lab successfully created all three hardware-backed `NVMeDevice` objects and passed smoke validation.
 - **Affected:** internal/agent/reporter.go:152, internal/agent/nvme_discovery.go:168
 - **Expected:** Supported NVMe serials are preserved as exact identities while producing bounded DNS-safe Kubernetes names.
 - **Actual:** The object name is nodeName plus a lowercased raw serial. There is no sanitization, hash, length bound, or DNS validation. Critical serial and PCI sysfs reads can also be silently omitted, and Required markers do not reject empty strings.
@@ -152,9 +167,9 @@ Project summary:
 - **Recommended fix:** Use a bounded DNS-safe hash in metadata.name, preserve the exact serial in spec, and reject empty serial, PCI address, node, or nonpositive capacity.
 - **Regression test:** Cover whitespace, punctuation, long serials, missing serial/PCI, and deterministic collision resistance.
 
-### Current F8. SPDK process configuration is not transactional or consistently enforced
+### 8. SPDK process configuration is not transactional or consistently enforced
 
-- **Severity:** Medium
+- [ ] **F8 — Medium — Open**
 - **Confidence:** Confirmed for option handling; highly likely for stuck initialization
 - **Affected:** internal/agent/plugins/backend_spdk.go:40, internal/storageoptions/options.go:46
 - **Expected:** A declared core mask is honored or rejected consistently, and failed initialization leaves a clean state for retry.
@@ -167,9 +182,9 @@ Project summary:
 - **Recommended fix:** Treat the core mask as node-global, persist and verify it, reject conflicts and zero masks, and terminate/reap the process on every initialization failure.
 - **Regression test:** Capture first and second masks, reject conflicts and 0x0, and inject every initialization RPC failure while verifying clean retry.
 
-### Current F9. RDMA endpoint validation can select an unusable address or state
+### 9. RDMA endpoint validation can select an unusable address or state
 
-- **Severity:** Medium
+- [ ] **F9 — Medium — Open**
 - **Confidence:** Confirmed
 - **Affected:** internal/agent/rdma_discovery.go:24, internal/rdmahealth/readiness.go:19
 - **Expected:** Placement accepts only an exactly active port with a routable address family supported by the target and CSI node.
@@ -179,9 +194,9 @@ Project summary:
 - **Recommended fix:** Parse exact state, reject unsupported multicast and link-local addresses, prefer configured routable addresses, derive target address family, and align or remove TCP support.
 - **Regression test:** Add address-order, multicast, link-local/global IPv6, ACTIVE_DEFER, and kernel IPv6 cases.
 
-### Current F10. CSI node publish and unpublish paths are not fail-safe
+### 10. CSI node publish and unpublish paths are not fail-safe
 
-- **Severity:** Medium
+- [ ] **F10 — Medium — Open**
 - **Confidence:** Confirmed
 - **Affected:** internal/csi/node_server.go:290 and :332
 - **Expected:** Every mount and unmount RPC requires a non-root absolute kubelet path before privileged filesystem operations.
@@ -191,10 +206,11 @@ Project summary:
 - **Recommended fix:** Centralize clean, absolute, non-root validation and optionally require the configured kubelet-root prefix.
 - **Regression test:** Table-test empty, relative, root, cleaned traversal, and valid kubelet paths while asserting no command is invoked on rejection.
 
-### Current F11. The current GitHub quality gates are deterministically red
+### 11. The current GitHub quality gates are deterministically red
 
-- **Severity:** Medium
+- [x] **F11 — Medium — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** `make test-ci` passes with tidy verification, the project custom linter, E2E compilation, and the race detector.
 - **Affected:** .github/workflows/test.yml:20, .github/workflows/lint.yml:20, .golangci.yml:25, internal/controller/sample_manifests_test.go:11
 - **Expected:** The documented GitHub tidy and lint checks pass on the current green tree.
 - **Actual:** go mod tidy moves sigs.k8s.io/yaml from indirect to direct. The GitHub lint action installs a stock binary, but the configuration enables the custom module plugin logcheck. Local make lint succeeds only because the Makefile builds a custom binary.
@@ -203,10 +219,11 @@ Project summary:
 - **Recommended fix:** Commit tidy output and make the lint workflow invoke the project custom linter through make lint.
 - **Regression test:** Add one local CI-equivalence target and make workflows invoke it.
 
-### Current F12. Canonical documentation contradicts the current attachment implementation
+### 12. Canonical documentation contradicts the current attachment implementation
 
-- **Severity:** Medium
+- [x] **F12 — Medium — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** Documentation contracts and the Hugo build pass against the five-CRD, `attachRequired: true` implementation.
 - **Affected:** docs/content/architecture.md:66 and :124, docs/content/internals.md:425, docs/content/using.md:173
 - **Expected:** Canonical documentation provides one description of current deployed behavior.
 - **Actual:** Architecture lists four CRDs and omits NVMeVolumeAttachment. Architecture and internals say attachRequired is false and publish/unpublish are absent. The chart and CSI implementation do the opposite. Architecture also lists several resolved items as remaining production work.
@@ -215,10 +232,11 @@ Project summary:
 - **Recommended fix:** Update architecture and internals from the current implementation and retain this file as the historical ledger.
 - **Regression test:** Add documentation contracts for the CRD count, attachRequired, implemented CSI methods, and forbidden stale assertions.
 
-### Current F13. Some green verification can pass without proving readiness or fencing
+### 13. Some green verification can pass without proving readiness or fencing
 
-- **Severity:** Low
+- [ ] **F13 — Low — Fix implemented; isolated-lab verification pending**
 - **Confidence:** Confirmed
+- **Verification (2026-08-26):** Host-side contracts, lint, E2E compilation, and the race suite pass. The strengthened smoke check and corrected F25 takeover require isolated-lab verification.
 - **Affected:** vagrant/smoke-test.sh:35, test/e2e/e2e_test.go:34, test/e2e/regression_e2e_test.go:475, test/contracts/repository_contracts_test.go:173
 - **Expected:** Green tests prove the behavior claimed by their documentation and labels.
 - **Actual:** Smoke and base E2E count RDMAStorageNode objects without requiring Ready=True, a fresh heartbeat, or a usable endpoint. F25 is labeled green and release-gate while its corrected hardware run is pending. F25 verifies the SPDK host list but not failed old-node I/O after takeover. The resolved F24 test remains quarantined and fails when selected because its literal version match does not accept equivalent documentation wording.

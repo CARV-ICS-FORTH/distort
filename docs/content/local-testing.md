@@ -112,7 +112,7 @@ make test-env-deploy
 
 The target:
 
-1. Builds `distort:latest` on the host.
+1. Builds `localhost/distort:0.5.0-dev` on the host.
 2. Copies generated CRDs into the chart.
 3. Imports the image into K3s on all three VMs.
 4. Applies the CRDs and performs `helm upgrade --install`.
@@ -162,7 +162,7 @@ make test-env-status
 make test-e2e
 ```
 
-Do not run `helm uninstall` between changes. A redeploy explicitly restarts the workloads because the image keeps the local tag `distort:latest`.
+Do not run `helm uninstall` between changes. A redeploy explicitly restarts the workloads because the image keeps the local development tag `localhost/distort:0.5.0-dev`.
 
 If a test leaves device state behind, reset the isolated storage lab without destroying or reinstalling it:
 

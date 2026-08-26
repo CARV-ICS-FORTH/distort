@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -31,13 +32,42 @@ var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, Label("green"), func
 				g.Expect(len(devices)).To(BeNumerically(">=", 3))
 			}).Should(Succeed())
 
-			By("waiting for RDMAStorageNode CRDs to be populated")
+			By("waiting for fresh RDMAStorageNode CRDs with usable endpoints")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "rdmastoragenodes", "-o", "jsonpath={.items[*].metadata.name}")
+				cmd := exec.Command("kubectl", "get", "rdmastoragenodes", "-o",
+					`jsonpath={range .items[*]}{.metadata.name}{"|"}{.spec.nodeName}{"|"}{.spec.rdmaIP}{"|"}{.spec.transport}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.status.conditions[?(@.type=="NVMeInventoryReady")].status}{"|"}{.status.lastHeartbeatTime}{"\n"}{end}`)
 				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				nodes := strings.Fields(out)
-				g.Expect(len(nodes)).To(BeNumerically(">=", 3))
+				expected := map[string]bool{"distort-master": false, "distort-worker-1": false, "distort-worker-2": false}
+				for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+					fields := strings.Split(line, "|")
+					g.Expect(fields).To(HaveLen(7), "invalid RDMAStorageNode row %q", line)
+					if len(fields) != 7 {
+						continue
+					}
+					if _, ok := expected[fields[0]]; !ok {
+						continue
+					}
+					g.Expect(fields[1]).To(Equal(fields[0]))
+					ip := net.ParseIP(fields[2])
+					g.Expect(ip).NotTo(BeNil())
+					if ip == nil {
+						continue
+					}
+					g.Expect(ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast()).To(BeFalse())
+					g.Expect(fields[3]).To(Or(Equal("RoCEv2"), Equal("InfiniBand")))
+					g.Expect(fields[4]).To(Equal("True"))
+					g.Expect(fields[5]).To(Equal("True"))
+					heartbeat, parseErr := time.Parse(time.RFC3339, fields[6])
+					g.Expect(parseErr).NotTo(HaveOccurred())
+					age := time.Since(heartbeat)
+					g.Expect(age).To(BeNumerically(">=", -5*time.Second))
+					g.Expect(age).To(BeNumerically("<=", 45*time.Second))
+					expected[fields[0]] = true
+				}
+				for node, ready := range expected {
+					g.Expect(ready).To(BeTrue(), "RDMAStorageNode %s is missing or unusable", node)
+				}
 			}).Should(Succeed())
 
 			By("verifying RDMAStorageNode CRDs report 0 capacity initially")

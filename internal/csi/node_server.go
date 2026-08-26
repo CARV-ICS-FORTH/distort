@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
+	"distort/internal/rdmahealth"
 	"distort/internal/volumeidentity"
 )
 
@@ -70,8 +70,7 @@ func (ns *NodeServer) validateNodeStageRequest(req *csi.NodeStageVolumeRequest) 
 	if nqn == "" {
 		return validatedNodeStageRequest{}, status.Error(codes.InvalidArgument, "Volume context NQN must be provided")
 	}
-	parsedIP := net.ParseIP(portalIP)
-	if parsedIP == nil || parsedIP.IsLoopback() || parsedIP.IsUnspecified() || parsedIP.IsMulticast() {
+	if _, err := rdmahealth.ParseUsableIP(portalIP); err != nil {
 		return validatedNodeStageRequest{}, status.Errorf(codes.InvalidArgument, "Volume context portalIP %q is not a usable remote IP", portalIP)
 	}
 	port, err := strconv.Atoi(portalPort)

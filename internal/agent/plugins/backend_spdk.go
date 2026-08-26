@@ -2,9 +2,12 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +28,7 @@ var spdkStartMu sync.Mutex
 var spdkTransportMu sync.Mutex
 var spdkTargetExecutable = "nvmf_tgt"
 var prepareSPDKProcess = raiseMemlockLimit
+var inspectSPDKProcess = inspectRunningSPDKProcess
 var spdkManagedExit chan error
 
 func init() {
@@ -35,15 +39,91 @@ func (s *SPDKBackend) Name() string {
 	return "spdk"
 }
 
-// EnsureSPDKRunning starts nvmf_tgt when needed and waits until its JSON-RPC
-// service is usable. A running process is not necessarily ready to accept RPCs.
-func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
-	spdkStartMu.Lock()
-	defer spdkStartMu.Unlock()
+type spdkProcessState struct {
+	running  bool
+	coreMask string
+}
+
+func canonicalSPDKCoreMask(coreMask string) (string, error) {
 	if coreMask == "" {
 		coreMask = "0x1"
 	}
 	if err := storageoptions.ValidateSPDKCoreMask(coreMask); err != nil {
+		return "", err
+	}
+	value, ok := new(big.Int).SetString(coreMask[2:], 16)
+	if !ok {
+		return "", fmt.Errorf("parse %s %q", storageoptions.SPDKCoreMaskOption, coreMask)
+	}
+	return "0x" + value.Text(16), nil
+}
+
+func inspectRunningSPDKProcess() (spdkProcessState, error) {
+	output, err := exec.Command("pidof", "nvmf_tgt").Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return spdkProcessState{}, nil
+		}
+		return spdkProcessState{}, fmt.Errorf("inspect running nvmf_tgt process: %w", err)
+	}
+	pids := strings.Fields(string(output))
+	if len(pids) != 1 {
+		return spdkProcessState{}, fmt.Errorf("expected one running nvmf_tgt process, found %d", len(pids))
+	}
+	commandLine, err := os.ReadFile(filepath.Join("/proc", pids[0], "cmdline"))
+	if err != nil {
+		return spdkProcessState{}, fmt.Errorf("read nvmf_tgt process %s command line: %w", pids[0], err)
+	}
+	args := strings.Split(strings.TrimRight(string(commandLine), "\x00"), "\x00")
+	for index, arg := range args {
+		var mask string
+		switch {
+		case arg == "-m" || arg == "--cpumask":
+			if index+1 >= len(args) {
+				return spdkProcessState{}, fmt.Errorf("nvmf_tgt process %s has %s without a value", pids[0], arg)
+			}
+			mask = args[index+1]
+		case strings.HasPrefix(arg, "--cpumask="):
+			mask = strings.TrimPrefix(arg, "--cpumask=")
+		default:
+			continue
+		}
+		canonical, err := canonicalSPDKCoreMask(mask)
+		if err != nil {
+			return spdkProcessState{}, fmt.Errorf("nvmf_tgt process %s has invalid core mask: %w", pids[0], err)
+		}
+		return spdkProcessState{running: true, coreMask: canonical}, nil
+	}
+	return spdkProcessState{}, fmt.Errorf("running nvmf_tgt process %s has no verifiable core mask", pids[0])
+}
+
+func stopManagedSPDKProcess(cmd *exec.Cmd, exit <-chan error) error {
+	var failures []error
+	if cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			failures = append(failures, fmt.Errorf("kill nvmf_tgt after initialization failure: %w", err))
+		}
+	}
+	select {
+	case <-exit:
+	case <-time.After(5 * time.Second):
+		failures = append(failures, errors.New("timed out reaping nvmf_tgt after initialization failure"))
+	}
+	if spdkManagedExit == exit {
+		spdkManagedExit = nil
+	}
+	return errors.Join(failures...)
+}
+
+// EnsureSPDKRunning starts nvmf_tgt when needed and waits until its JSON-RPC
+// service is usable. The requested core mask is node-global and must match the
+// command line of an already running process.
+func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
+	spdkStartMu.Lock()
+	defer spdkStartMu.Unlock()
+	requestedMask, err := canonicalSPDKCoreMask(coreMask)
+	if err != nil {
 		return err
 	}
 	if spdkManagedExit != nil {
@@ -57,13 +137,24 @@ func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 		}
 	}
 
-	if err := exec.Command("pidof", "nvmf_tgt").Run(); err != nil {
+	process, err := inspectSPDKProcess()
+	if err != nil {
+		return err
+	}
+	if process.running {
+		if process.coreMask != requestedMask {
+			return fmt.Errorf("running nvmf_tgt uses core mask %s, requested %s", process.coreMask, requestedMask)
+		}
+		return waitForSPDKRPC(ctx)
+	}
+
+	{
 		klog.InfoS("Starting SPDK NVMe-oF target daemon")
 		iobufArgs, configureIobufPools, err := spdkIobufPoolArgs()
 		if err != nil {
 			return err
 		}
-		args := []string{"-m", coreMask}
+		args := []string{"-m", requestedMask}
 		if configureIobufPools {
 			args = append(args, "--wait-for-rpc")
 		}
@@ -77,26 +168,32 @@ func EnsureSPDKRunning(ctx context.Context, coreMask string) error {
 			return fmt.Errorf("failed to start nvmf_tgt: %v", err)
 		}
 		spdkManagedExit = make(chan error, 1)
-		go func(exit chan<- error) { exit <- cmd.Wait() }(spdkManagedExit)
+		exit := spdkManagedExit
+		go func(result chan<- error) { result <- cmd.Wait() }(exit)
+		fail := func(initializationErr error) error {
+			cleanupErr := stopManagedSPDKProcess(cmd, exit)
+			return errors.Join(initializationErr, cleanupErr)
+		}
 
 		if configureIobufPools {
 			if err := waitForSPDKRPC(ctx); err != nil {
-				_ = cmd.Process.Kill()
-				return err
+				return fail(err)
 			}
 			if err := CallSPDKRPCContext(ctx, "iobuf_set_options", nil, iobufArgs...); err != nil {
-				return fmt.Errorf("failed to configure SPDK iobuf pools: %w", err)
+				return fail(fmt.Errorf("failed to configure SPDK iobuf pools: %w", err))
 			}
 			if err := CallSPDKRPCContext(ctx, "framework_start_init", nil); err != nil {
-				return fmt.Errorf("failed to start SPDK framework initialization: %w", err)
+				return fail(fmt.Errorf("failed to start SPDK framework initialization: %w", err))
 			}
 			if err := CallSPDKRPCContext(ctx, "framework_wait_init", nil); err != nil {
-				return fmt.Errorf("SPDK framework initialization failed: %w", err)
+				return fail(fmt.Errorf("SPDK framework initialization failed: %w", err))
 			}
 		}
+		if err := waitForSPDKRPC(ctx); err != nil {
+			return fail(err)
+		}
 	}
-
-	return waitForSPDKRPC(ctx)
+	return nil
 }
 
 func raiseMemlockLimit() error {

@@ -33,16 +33,41 @@ kube rollout status -n distort-system daemonset/distort-agent --timeout=180s
 kube rollout status -n distort-system daemonset/distort-csi-node --timeout=180s
 
 device_count="$(kube get nvmedevices -o jsonpath='{.items[*].metadata.name}' | wc -w | tr -d ' ')"
-rdma_node_count="$(kube get rdmastoragenodes -o jsonpath='{.items[*].metadata.name}' | wc -w | tr -d ' ')"
 
 if [[ "$device_count" -lt "${#expected_nodes[@]}" ]]; then
   echo "ERROR: expected at least one NVMeDevice per node, found $device_count total" >&2
   exit 1
 fi
 
-if [[ "$rdma_node_count" -lt "${#expected_nodes[@]}" ]]; then
-  echo "ERROR: expected an RDMAStorageNode per node, found $rdma_node_count total" >&2
-  exit 1
-fi
+echo "Validating fresh, usable RDMA endpoints"
+for node in "${expected_nodes[@]}"; do
+  kube wait --for=condition=Ready "rdmastoragenode/$node" --timeout=90s
+  kube wait --for=condition=NVMeInventoryReady "rdmastoragenode/$node" --timeout=90s
+  endpoint="$(kube get "rdmastoragenode/$node" -o jsonpath='{.spec.nodeName}{"|"}{.spec.rdmaIP}{"|"}{.spec.transport}{"|"}{.status.lastHeartbeatTime}')"
+  IFS='|' read -r reported_node rdma_ip transport heartbeat <<<"$endpoint"
+  if [[ "$reported_node" != "$node" ]]; then
+    echo "ERROR: RDMAStorageNode $node reports nodeName $reported_node" >&2
+    exit 1
+  fi
+  case "$rdma_ip" in
+    ""|0.0.0.0|127.*|::|::1)
+      echo "ERROR: RDMAStorageNode $node has unusable RDMA IP $rdma_ip" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$transport" != "RoCEv2" && "$transport" != "InfiniBand" ]]; then
+    echo "ERROR: RDMAStorageNode $node has unsupported transport $transport" >&2
+    exit 1
+  fi
+  if ! heartbeat_epoch="$(date -u -d "$heartbeat" +%s 2>/dev/null)"; then
+    echo "ERROR: RDMAStorageNode $node has invalid lastHeartbeatTime $heartbeat" >&2
+    exit 1
+  fi
+  heartbeat_age="$(( $(date -u +%s) - heartbeat_epoch ))"
+  if (( heartbeat_age < -5 || heartbeat_age > 45 )); then
+    echo "ERROR: RDMAStorageNode $node heartbeat age is ${heartbeat_age}s, expected 0-45s" >&2
+    exit 1
+  fi
+done
 
-echo "Smoke test passed: $actual_node_count nodes, $device_count NVMeDevices, $rdma_node_count RDMAStorageNodes"
+echo "Smoke test passed: $actual_node_count nodes, $device_count NVMeDevices, ${#expected_nodes[@]} ready RDMAStorageNodes with healthy NVMe inventory"

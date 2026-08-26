@@ -80,6 +80,21 @@ func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
 		}(),
 		func() *csipb.NodeStageVolumeRequest {
 			req := validNodeStageRequest(t, server.nodeID)
+			req.VolumeContext["portalIP"] = "169.254.1.10"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.VolumeContext["portalIP"] = "fe80::1"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.VolumeContext["portalIP"] = "224.0.0.1"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
 			req.VolumeContext["portalPort"] = "70000"
 			return req
 		}(),
@@ -97,6 +112,19 @@ func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
 	}
 	if connectCalls != 0 {
 		t.Fatalf("invalid requests reached nvme connect %d times", connectCalls)
+	}
+}
+
+func TestNodeStageValidationAcceptsRoutableIPv6(t *testing.T) {
+	server := &NodeServer{nodeID: "distort-worker-1"}
+	request := validNodeStageRequest(t, server.nodeID)
+	request.VolumeContext["portalIP"] = "2001:db8::10"
+	validated, err := server.validateNodeStageRequest(request)
+	if err != nil {
+		t.Fatalf("routable IPv6 portal was rejected: %v", err)
+	}
+	if validated.portalIP != "2001:db8::10" {
+		t.Fatalf("validated portal IP = %q", validated.portalIP)
 	}
 }
 

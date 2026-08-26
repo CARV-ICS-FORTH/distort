@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,8 +10,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"distort/internal/volumeidentity"
 )
 
 func writeTestExecutable(t *testing.T, directory, name, body string) string {
@@ -87,6 +91,155 @@ func TestKernelHostAccessRevokesOldHostBeforeAuthorizingReplacement(t *testing.T
 	allowAny, err := os.ReadFile(filepath.Join(subsystemPath, "attr_allow_any_host"))
 	if err != nil || strings.TrimSpace(string(allowAny)) != "0" {
 		t.Fatalf("allow-any-host remains enabled: value=%q err=%v", allowAny, err)
+	}
+	linkPath := filepath.Join(portSubsystemsPath, nqn)
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ReconcileHostAccess(context.Background(), nqn, ""); err != nil {
+		t.Fatalf("reconciling already exact access after link loss: %v", err)
+	}
+	if !kernelLinkMatches(linkPath, subsystemPath) {
+		t.Fatal("exact host access reconciliation did not restore the missing port link")
+	}
+}
+
+func TestKernelExportRepairsAndVerifiesCompleteConfigFSState(t *testing.T) {
+	oldNVMetPath := nvmetPath
+	nvmetPath = t.TempDir()
+	t.Cleanup(func() { nvmetPath = oldNVMetPath })
+	backend := &KernelBackend{}
+	volumeName := "kernel-repair"
+	blockPath := "/dev/nvme0n1p2"
+	nqn, err := backend.ExportVolume(context.Background(), volumeName, blockPath, "192.0.2.10", 4420, nil)
+	if err != nil {
+		t.Fatalf("initial kernel export: %v", err)
+	}
+	if err := backend.CheckExport(context.Background(), nqn, blockPath, "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("healthy kernel export rejected: %v", err)
+	}
+
+	subsystemPath := filepath.Join(nvmetPath, "subsystems", nqn)
+	portPath := filepath.Join(nvmetPath, "ports", kernelPortID)
+	corruptions := []struct {
+		name  string
+		path  string
+		value string
+	}{
+		{name: "namespace device", path: filepath.Join(subsystemPath, "namespaces", "1", "device_path"), value: "/dev/wrong"},
+		{name: "namespace enable", path: filepath.Join(subsystemPath, "namespaces", "1", "enable"), value: "0"},
+		{name: "address family", path: filepath.Join(portPath, "addr_adrfam"), value: "ipv6"},
+		{name: "transport", path: filepath.Join(portPath, "addr_trtype"), value: "tcp"},
+		{name: "service", path: filepath.Join(portPath, "addr_trsvcid"), value: "4421"},
+		{name: "address", path: filepath.Join(portPath, "addr_traddr"), value: "192.0.2.11"},
+	}
+	for _, corruption := range corruptions {
+		t.Run(corruption.name, func(t *testing.T) {
+			if err := os.WriteFile(corruption.path, []byte(corruption.value), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.CheckExport(context.Background(), nqn, blockPath, "192.0.2.10", 4420, nil); err == nil {
+				t.Fatal("corrupted kernel export passed its health check")
+			}
+			if _, err := backend.ExportVolume(context.Background(), volumeName, blockPath, "192.0.2.10", 4420, nil); err != nil {
+				t.Fatalf("repairing kernel export: %v", err)
+			}
+		})
+	}
+
+	linkPath := filepath.Join(portPath, "subsystems", nqn)
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CheckExport(context.Background(), nqn, blockPath, "192.0.2.10", 4420, nil); err == nil {
+		t.Fatal("kernel export without a port link passed its health check")
+	}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, blockPath, "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("repairing missing kernel port link: %v", err)
+	}
+
+	namespacePath := filepath.Join(subsystemPath, "namespaces", "1")
+	for _, name := range []string{"device_path", "enable"} {
+		if err := os.Remove(filepath.Join(namespacePath, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(namespacePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CheckExport(context.Background(), nqn, blockPath, "192.0.2.10", 4420, nil); err == nil {
+		t.Fatal("kernel export without namespace 1 passed its health check")
+	}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, blockPath, "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("repairing missing kernel namespace: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(portPath, "addr_traddr")); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CheckExport(context.Background(), nqn, blockPath, "192.0.2.10", 4420, nil); err == nil {
+		t.Fatal("kernel export without listener address passed its health check")
+	}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, blockPath, "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("repairing missing kernel listener address: %v", err)
+	}
+
+	extraNamespace := filepath.Join(subsystemPath, "namespaces", "2")
+	if err := os.Mkdir(extraNamespace, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CheckExport(context.Background(), nqn, blockPath, "192.0.2.10", 4420, nil); err == nil {
+		t.Fatal("kernel export with an extra namespace passed its health check")
+	}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, blockPath, "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("removing stale kernel namespace: %v", err)
+	}
+}
+
+func TestKernelExportUsesIPv6AddressFamily(t *testing.T) {
+	oldNVMetPath := nvmetPath
+	nvmetPath = t.TempDir()
+	t.Cleanup(func() { nvmetPath = oldNVMetPath })
+	backend := &KernelBackend{}
+	nqn, err := backend.ExportVolume(context.Background(), "kernel-ipv6", "/dev/nvme0n1p3", "2001:db8::10", 4420, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CheckExport(context.Background(), nqn, "/dev/nvme0n1p3", "2001:db8::10", 4420, nil); err != nil {
+		t.Fatalf("IPv6 kernel export rejected: %v", err)
+	}
+	family, err := configValue(filepath.Join(nvmetPath, "ports", kernelPortID, "addr_adrfam"))
+	if err != nil || family != "ipv6" {
+		t.Fatalf("kernel address family = %q, err=%v; want ipv6", family, err)
+	}
+}
+
+func TestKernelExportRetriesAfterPartialLinkFailure(t *testing.T) {
+	oldNVMetPath := nvmetPath
+	nvmetPath = t.TempDir()
+	t.Cleanup(func() { nvmetPath = oldNVMetPath })
+	volumeName := "kernel-partial"
+	nqn := volumeidentity.NQN(volumeName)
+	linkPath := filepath.Join(nvmetPath, "ports", kernelPortID, "subsystems", nqn)
+	if err := os.MkdirAll(linkPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(linkPath, "not-a-symlink")
+	if err := os.WriteFile(blocker, []byte("blocked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &KernelBackend{}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, "/dev/nvme0n1p4", "192.0.2.10", 4420, nil); err == nil {
+		t.Fatal("non-symlink port entry did not fail kernel export")
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, "/dev/nvme0n1p4", "192.0.2.10", 4420, nil); err != nil {
+		t.Fatalf("kernel export did not recover after partial link failure: %v", err)
 	}
 }
 
@@ -449,6 +602,115 @@ esac`)
 	}
 }
 
+func TestSPDKCoreMaskMustMatchRunningNodeProcess(t *testing.T) {
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", `
+case "$1" in
+  rpc_get_methods) printf '[]\n' ;;
+  *) exit 0 ;;
+esac`)
+	oldInspect := inspectSPDKProcess
+	oldRPC := spdkRPCExecutable
+	oldManagedExit := spdkManagedExit
+	inspectSPDKProcess = func() (spdkProcessState, error) {
+		return spdkProcessState{running: true, coreMask: "0x1"}, nil
+	}
+	spdkRPCExecutable = rpc
+	spdkManagedExit = nil
+	t.Cleanup(func() {
+		inspectSPDKProcess = oldInspect
+		spdkRPCExecutable = oldRPC
+		spdkManagedExit = oldManagedExit
+	})
+
+	if err := EnsureSPDKRunning(context.Background(), "0x0001"); err != nil {
+		t.Fatalf("equivalent running core mask was rejected: %v", err)
+	}
+	if err := EnsureSPDKRunning(context.Background(), "0x3"); err == nil || !strings.Contains(err.Error(), "running nvmf_tgt uses core mask") {
+		t.Fatalf("conflicting node-global core mask error = %v", err)
+	}
+}
+
+func TestSPDKInitializationFailuresTerminateAndPermitCleanRetry(t *testing.T) {
+	for _, failedMethod := range []string{"iobuf_set_options", "framework_start_init", "framework_wait_init"} {
+		t.Run(failedMethod, func(t *testing.T) {
+			fakeBin := t.TempDir()
+			writeTestExecutable(t, fakeBin, "pidof", "exit 1")
+			t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("SPDK_IOBUF_SMALL_POOL_COUNT", "4096")
+			t.Setenv("SPDK_IOBUF_LARGE_POOL_COUNT", "256")
+			t.Setenv("FAIL_METHOD", failedMethod)
+			pidPath := filepath.Join(t.TempDir(), "nvmf-target-pid")
+			t.Setenv("SPDK_TEST_PID", pidPath)
+			target := writeTestExecutable(t, fakeBin, "nvmf_tgt", `printf '%s' "$$" > "$SPDK_TEST_PID"
+exec sleep 30`)
+			rpc := writeTestExecutable(t, fakeBin, "rpc.py", `
+if [ "$1" = rpc_get_methods ]; then
+  printf '[]\n'
+elif [ "$1" = "${FAIL_METHOD:-}" ]; then
+  printf 'injected failure for %s\n' "$1" >&2
+  exit 9
+else
+  printf 'true\n'
+fi`)
+
+			oldTarget := spdkTargetExecutable
+			oldRPC := spdkRPCExecutable
+			oldPrepare := prepareSPDKProcess
+			oldManagedExit := spdkManagedExit
+			spdkTargetExecutable = target
+			spdkRPCExecutable = rpc
+			prepareSPDKProcess = func() error { return nil }
+			spdkManagedExit = nil
+			t.Cleanup(func() {
+				spdkTargetExecutable = oldTarget
+				spdkRPCExecutable = oldRPC
+				prepareSPDKProcess = oldPrepare
+				spdkManagedExit = oldManagedExit
+			})
+
+			if err := EnsureSPDKRunning(context.Background(), "0x1"); err == nil || !strings.Contains(err.Error(), failedMethod) {
+				t.Fatalf("initialization failure = %v, want %s", err, failedMethod)
+			}
+			if spdkManagedExit != nil {
+				t.Fatal("failed initialization retained managed process state")
+			}
+			pidBytes, err := os.ReadFile(pidPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(string(pidBytes))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+				t.Fatalf("failed initialization left process %d alive: %v", pid, err)
+			}
+
+			t.Setenv("FAIL_METHOD", "")
+			if err := EnsureSPDKRunning(context.Background(), "0x1"); err != nil {
+				t.Fatalf("clean retry failed: %v", err)
+			}
+			pidBytes, err = os.ReadFile(pidPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err = strconv.Atoi(string(pidBytes))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-spdkManagedExit:
+				spdkManagedExit = nil
+			case <-time.After(time.Second):
+				t.Fatal("timed out reaping successful test nvmf_tgt process")
+			}
+		})
+	}
+}
+
 func TestSPDKIobufPoolArgs(t *testing.T) {
 	t.Run("disabled by default", func(t *testing.T) {
 		t.Setenv("SPDK_IOBUF_SMALL_POOL_COUNT", "")
@@ -585,8 +847,15 @@ case "$1" in
   *) printf 'unexpected method %s\n' "$1" >&2; exit 8 ;;
 esac`)
 	oldExecutable := spdkRPCExecutable
+	oldInspect := inspectSPDKProcess
 	spdkRPCExecutable = rpc
-	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+	inspectSPDKProcess = func() (spdkProcessState, error) {
+		return spdkProcessState{running: true, coreMask: "0x1"}, nil
+	}
+	t.Cleanup(func() {
+		spdkRPCExecutable = oldExecutable
+		inspectSPDKProcess = oldInspect
+	})
 
 	backend := &SPDKBackend{}
 	if err := backend.CheckExport(context.Background(), "nqn.test", "lvs/volume", "192.0.2.10", 4420, nil); err != nil {

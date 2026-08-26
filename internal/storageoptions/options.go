@@ -4,6 +4,7 @@ package storageoptions
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -50,6 +51,9 @@ func ValidateSPDKCoreMask(coreMask string) error {
 	}
 	if !spdkCoreMaskPattern.MatchString(coreMask) {
 		return fmt.Errorf("%s must match 0x followed by hexadecimal digits, got %q", SPDKCoreMaskOption, coreMask)
+	}
+	if strings.Trim(coreMask[2:], "0") == "" {
+		return fmt.Errorf("%s must select at least one CPU, got %q", SPDKCoreMaskOption, coreMask)
 	}
 	return nil
 }

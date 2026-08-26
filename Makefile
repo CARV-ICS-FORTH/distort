@@ -6,8 +6,8 @@ VAGRANT_NODES ?= distort-master distort-worker-1 distort-worker-2
 E2E_ARGS ?=
 FINDING ?=
 LOCAL_KUBECONFIG ?= $(shell pwd)/kubeconfig.yaml
-TEST_ENV_IMAGE_REPOSITORY ?= distort
-TEST_ENV_IMAGE_TAG ?= latest
+TEST_ENV_IMAGE_REPOSITORY ?= localhost/distort
+TEST_ENV_IMAGE_TAG ?= 0.5.0-dev
 TEST_ENV_IMG = $(TEST_ENV_IMAGE_REPOSITORY):$(TEST_ENV_IMAGE_TAG)
 TEST_ENV_BUILD_JOBS ?= 1
 TEST_ENV_GO_BUILD_PROCS ?= 1
@@ -84,9 +84,16 @@ test-suite: test test-static lint ## Run the complete green host-side suite and 
 .PHONY: test-static
 test-static: ## Run repository contracts and validate Helm and Hugo artifacts.
 	go test ./test/contracts -count=1
-	helm lint ./deploy/charts/distort
-	helm template distort ./deploy/charts/distort --namespace distort-system >/dev/null
+	helm lint ./deploy/charts/distort --set-string image.repository=registry.example.com/distort
+	helm template distort ./deploy/charts/distort --namespace distort-system --set-string image.repository=registry.example.com/distort >/dev/null
 	hugo --source docs --destination /tmp/distort-docs-test --minify
+
+.PHONY: verify-modules
+verify-modules: ## Verify go.mod and go.sum are tidy without modifying them.
+	go mod tidy -diff
+
+.PHONY: test-ci
+test-ci: verify-modules test-suite test-race ## Run the complete host-side CI-equivalent validation.
 
 .PHONY: test-race
 test-race: setup-envtest ## Run host-side tests under the Go race detector.
@@ -182,7 +189,7 @@ test-env-deploy: test-env-guard manifests ## Build/load the image and Helm-upgra
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system daemonset/distort-csi-node --timeout=180s
 
 .PHONY: test-env-redeploy
-test-e test-env-destroynv-redeploy: test-env-deploy ## Alias for the normal edit/build/load/Helm-upgrade inner loop.
+test-env-redeploy: test-env-deploy ## Alias for the normal edit/build/load/Helm-upgrade inner loop.
 
 .PHONY: test-env-status
 test-env-status: test-env-guard ## Show VMs, Kubernetes workloads, discovered hardware, and allocations.

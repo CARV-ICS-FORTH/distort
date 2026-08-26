@@ -19,13 +19,23 @@ NVMe-over-Fabrics/RDMA and provisions it through CSI.
 
 ## Quick start
 
-Install the Helm chart into a cluster with suitable NVMe and RDMA hardware:
+DISTORT does not yet publish a public container image. Build and push version
+`0.5.0` to a registry reachable by every cluster node, then install the chart
+with that fully qualified repository:
 
 ```bash
+export DISTORT_IMAGE_REPOSITORY=registry.example.com/your-project/distort
+make docker-build docker-push IMG="${DISTORT_IMAGE_REPOSITORY}:0.5.0"
 helm install distort ./deploy/charts/distort \
   --namespace distort-system \
-  --create-namespace
+  --create-namespace \
+  --set-string image.repository="${DISTORT_IMAGE_REPOSITORY}"
 ```
+
+The tag defaults to the chart application version, `0.5.0`. Production users
+can instead set `image.digest=sha256:<digest>` to pin an immutable image. The
+chart rejects an omitted or unqualified repository and rejects the `latest`
+tag so a release install cannot silently select a local or mutable image.
 
 DISTORT never claims physical storage automatically. After installation, an
 administrator must create an `NVMeDeviceClaim` for each device that DISTORT may

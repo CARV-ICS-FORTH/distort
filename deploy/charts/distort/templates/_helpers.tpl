@@ -31,6 +31,29 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{/*
+Resolve the DISTORT image from an explicit qualified repository and either the
+chart application version, an explicit non-latest tag, or an immutable digest.
+*/}}
+{{- define "distort.image" -}}
+{{- $repository := required "image.repository is required and must be a fully qualified repository such as ghcr.io/example/distort" .Values.image.repository -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+$" $repository) -}}
+{{- fail "image.repository must be a fully qualified repository without a tag or digest, such as ghcr.io/example/distort" -}}
+{{- end -}}
+{{- if .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
+{{- fail "image.digest must be an immutable sha256 digest" -}}
+{{- end -}}
+{{- printf "%s@%s" $repository .Values.image.digest -}}
+{{- else -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if eq $tag "latest" -}}
+{{- fail "image.tag must be versioned; latest is not allowed" -}}
+{{- end -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Common labels
 */}}
 {{- define "distort.labels" -}}

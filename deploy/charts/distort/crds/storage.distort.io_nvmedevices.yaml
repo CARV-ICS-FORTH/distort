@@ -65,6 +65,7 @@ spec:
               nodeName:
                 description: NodeName is the name of the Kubernetes node where the
                   device is attached.
+                minLength: 1
                 type: string
               numaNode:
                 description: NUMANode indicates the NUMA topology node the device
@@ -73,10 +74,12 @@ spec:
               pciAddress:
                 description: PCIAddress is the PCIe address of the NVMe controller
                   (e.g., "0000:01:00.0").
+                pattern: ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$
                 type: string
               serialNumber:
                 description: SerialNumber is the device's hardware serial number.
                   Used for claim matching.
+                minLength: 1
                 type: string
               totalCapacity:
                 anyOf:
@@ -85,6 +88,9 @@ spec:
                 description: TotalCapacity is the total raw size of the device.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: totalCapacity must be positive
+                  rule: quantity(string(self)).isGreaterThan(quantity('0'))
             required:
             - nodeName
             - pciAddress

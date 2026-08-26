@@ -19,6 +19,8 @@ func TestValidateSPDKCoreMask(t *testing.T) {
 		mask string
 	}{
 		{name: "empty", mask: ""},
+		{name: "zero", mask: "0x0"},
+		{name: "zero padded", mask: "0x0000"},
 		{name: "semicolon", mask: "0x1;id"},
 		{name: "substitution", mask: "$(id)"},
 		{name: "space", mask: "0x1 0x2"},

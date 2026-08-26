@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/rdmahealth"
 )
 
 var sysClassInfiniBand = "/sys/class/infiniband"
@@ -38,16 +39,23 @@ func DiscoverRDMAEndpoint() (RDMAEndpoint, error) {
 		for _, port := range ports {
 			portRoot := filepath.Join(portsRoot, port.Name())
 			state, err := os.ReadFile(filepath.Join(portRoot, "state"))
-			if err != nil || !strings.Contains(strings.ToUpper(string(state)), "ACTIVE") {
+			if err != nil || !rdmaPortIsActive(string(state)) {
 				continue
 			}
 			linkLayer, err := os.ReadFile(filepath.Join(portRoot, "link_layer"))
 			if err != nil {
 				continue
 			}
-			transport := storagev1alpha1.RDMATransportInfiniBand
-			if strings.EqualFold(strings.TrimSpace(string(linkLayer)), "Ethernet") {
+			var transport storagev1alpha1.RDMATransportType
+			switch {
+			case strings.EqualFold(strings.TrimSpace(string(linkLayer)), "Ethernet"):
 				transport = storagev1alpha1.RDMATransportRoCEv2
+			case strings.EqualFold(strings.TrimSpace(string(linkLayer)), "InfiniBand"):
+				transport = storagev1alpha1.RDMATransportInfiniBand
+			default:
+				failures = append(failures, fmt.Sprintf("%s port %s: unsupported link layer %q",
+					device.Name(), port.Name(), strings.TrimSpace(string(linkLayer))))
+				continue
 			}
 			interfaceName := rdmaPortInterface(portRoot)
 			if interfaceName == "" {
@@ -66,6 +74,14 @@ func DiscoverRDMAEndpoint() (RDMAEndpoint, error) {
 		return RDMAEndpoint{}, fmt.Errorf("no usable active RDMA endpoint: %s", strings.Join(failures, "; "))
 	}
 	return RDMAEndpoint{}, fmt.Errorf("no active RDMA port with a non-loopback IP address")
+}
+
+func rdmaPortIsActive(state string) bool {
+	state = strings.TrimSpace(state)
+	if _, value, found := strings.Cut(state, ":"); found {
+		state = strings.TrimSpace(value)
+	}
+	return strings.EqualFold(state, "ACTIVE")
 }
 
 func rdmaPortInterface(portRoot string) string {
@@ -95,11 +111,31 @@ func interfaceAddress(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("list RDMA interface %s addresses: %w", name, err)
 	}
-	for _, address := range addresses {
-		ip, _, err := net.ParseCIDR(address.String())
-		if err == nil && !ip.IsLoopback() && !ip.IsUnspecified() {
-			return ip.String(), nil
-		}
+	if ip, err := selectRoutableAddress(addresses); err == nil {
+		return ip, nil
 	}
 	return "", fmt.Errorf("RDMA interface %s has no usable IP address", name)
+}
+
+func selectRoutableAddress(addresses []net.Addr) (string, error) {
+	var ipv6 string
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err != nil {
+			continue
+		}
+		if _, err := rdmahealth.ParseUsableIP(ip.String()); err != nil {
+			continue
+		}
+		if ip.To4() != nil {
+			return ip.String(), nil
+		}
+		if ipv6 == "" {
+			ipv6 = ip.String()
+		}
+	}
+	if ipv6 != "" {
+		return ipv6, nil
+	}
+	return "", fmt.Errorf("no routable unicast IP address")
 }
