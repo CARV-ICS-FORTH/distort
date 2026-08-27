@@ -368,7 +368,7 @@ func TestPartitionManagerRejectsMismatchedClaimUIDBeforePluginCalls(t *testing.T
 	}
 }
 
-func TestPartitionManagerAcceptsMatchingLiveClaim(t *testing.T) {
+func TestPartitionManagerAcceptsHashedDeviceNameFromMatchingLiveClaim(t *testing.T) {
 	backend := &countingBackend{}
 	manager := &countingVolumeManager{}
 	plugins.RegisterTargetBackend(backend)
@@ -379,7 +379,7 @@ func TestPartitionManagerAcceptsMatchingLiveClaim(t *testing.T) {
 		Spec:       storagev1alpha1.NVMeDeviceClaimSpec{SerialNumber: "CLAIMED-SERIAL"},
 		Status: storagev1alpha1.NVMeDeviceClaimStatus{
 			Active:        true,
-			MatchedDevice: "node-a-claimed-serial",
+			MatchedDevice: "node-a-8ccd10f0f1fc67e8a20b124d7f41ac70",
 			NodeName:      "node-a",
 		},
 	}

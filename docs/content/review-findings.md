@@ -12,19 +12,24 @@ type: "page"
 > checks, fail-closed inventory health, safe partial discovery, and hashed
 > device names. Host regression coverage and the three-node isolated-lab smoke
 > check pass. The corrected F25 takeover remains pending in the isolated Vagrant
-> environment.
+> environment. Batch 3 implements F1, F8, and F9: kernel exports are now
+> exactly verified and repaired, SPDK startup and core-mask handling are
+> transactional, and RDMA endpoint selection is strict and IPv6-aware. The
+> complete host CI-equivalent suite passes, and the focused isolated-lab Batch
+> 3 run passed both scenarios after also confirming three healthy SoftRoCE
+> endpoints. F1, F8, and F9 are resolved.
 
 ## 1. Executive summary
 
-DISTORT has a credible, well-structured happy path, but the current working tree is not production-ready. The host-side suite and race detector pass, yet several important recovery, deployment, CSI-contract, and state-consistency defects remain outside those tests.
+DISTORT has a credible, well-structured happy path, but the current working tree is not production-ready. The host-side suite and race detector pass, and Batches 1–3 have addressed and verified the deployment, ownership, discovery, kernel-recovery, SPDK-startup, and RDMA-validation findings assigned to them. Several CSI-contract and privileged-path defects remain.
 
 The most serious unresolved findings are:
 
-- The kernel NVMe target can report a partition as Exported and an attachment as ready when configfs is incomplete or disconnected.
 - Multiple CSI 1.5 request semantics are implemented incorrectly.
-- SPDK startup and shared process options are not transactional or consistently enforced.
+- CSI publish, unpublish, and unstage paths do not consistently reject unsafe filesystem paths before privileged operations.
+- The corrected F25 takeover isolated-lab release gate remains pending.
 
-No Critical issue was confirmed. Four High-severity defects and several Medium-severity correctness and reliability gaps were found.
+No Critical issue was confirmed in the original review. The finding checkboxes below are the authoritative current status; unchecked implemented findings remain open until their required isolated-lab verification passes.
 
 This review covers the current working tree, which was already dirty: 36 modified and 5 untracked files. It therefore does not necessarily represent a committed release.
 
@@ -51,11 +56,11 @@ Project summary:
 |---|---|---|---|
 | Helm installation | Install a working manager, agent, CSI controller/node, CRDs, and RBAC | deploy/charts/distort | **Host-verified; published image pending** |
 | Device discovery | Discover safe, unmounted NVMe controllers and mark disappeared hardware unavailable | internal/agent/nvme_discovery.go, reporter.go | **Host and isolated-lab smoke verified** |
-| RDMA readiness | Publish only active, usable, fresh RDMA endpoints | rdma_discovery.go, rdmahealth/readiness.go | **Partially verified** |
+| RDMA readiness | Publish only active, usable, fresh RDMA endpoints | rdma_discovery.go, rdmahealth/readiness.go | **Host and isolated-lab verified** |
 | Device claims | Bind exact serial to one device and preserve ownership by UID | nvmedeviceclaim_controller.go | **Host-verified** |
 | Partition placement | Select a claimed device on a fresh RDMA node with sufficient capacity | nvmepartition_controller.go | **Host-verified for live ownership and inventory health** |
-| SPDK provisioning | Bind hardware, create lvol, export, supervise, recover, and clean up | SPDK backend and lvol manager | **Partially verified** |
-| Kernel provisioning | Create GPT partition and complete configfs target, recover idempotently | Kernel backend and parted manager | **Broken under partial state** |
+| SPDK provisioning | Bind hardware, create lvol, export, supervise, recover, and clean up | SPDK backend and lvol manager | **Host and isolated-lab verified for transactional startup and core-mask enforcement** |
+| Kernel provisioning | Create GPT partition and complete configfs target, recover idempotently | Kernel backend and parted manager | **Host and isolated-lab verified for exact repair** |
 | CSI Create/Delete | Create stable namespaced volume handles and clean exact backend allocation | controller_server.go | **Partially verified** |
 | Single-writer attachment | Durable owner, exact host ACL, explicit fenced takeover | controller_attachment.go, attachment CRD, agent ACL reconciliation | **Partially verified; hardware gate pending** |
 | CSI node lifecycle | Connect, validate filesystem, format blank volume, stage and publish safely | node_server.go, nvme.go | **Partially verified** |
@@ -72,8 +77,9 @@ Status legend:
 
 ### 1. Kernel target can falsely report a broken export as ready
 
-- [ ] **F1 — High — Open**
-- **Confidence:** Confirmed in control flow; hardware consequence not exercised
+- [x] **F1 — High — Resolved**
+- **Confidence:** Confirmed and exercised
+- **Verification (2026-08-27):** Fake-configfs regressions cover exact namespace, listener, port-link, host-ACL, address-family, extra-namespace, and retry behavior. KernelBackend now participates in periodic export health checks. The complete host CI-equivalent and race suites pass. The focused Vagrant scenario exported a real kernel target, removed its live configfs subsystem link, and observed automatic repair; it passed in 22.3 seconds.
 - **Affected:** internal/agent/plugins/backend_kernel.go:63, internal/agent/partition_manager.go:488
 - **Expected:** Reconciliation verifies or repairs the namespace device path, enabled state, listener address and port, subsystem link, and host ACL before publishing Exported or AccessReady=True.
 - **Actual:**
@@ -115,9 +121,9 @@ Status legend:
 
 ### 4. The documented lab redeploy command is a silent no-op
 
-- [ ] **F4 — High — Fix implemented; isolated-lab verification pending**
+- [x] **F4 — High — Resolved**
 - **Confidence:** Confirmed
-- **Verification (2026-08-26):** The dry-run repository contract passes and emits the complete build/deploy workflow. A real isolated-lab redeploy is still pending.
+- **Verification (2026-08-27):** The dry-run repository contract emits the complete build/deploy workflow. A real `make test-env-redeploy` then built the `0.5.0-dev` image, imported the same digest into all three VMs, upgraded the Helm release, restarted all four workloads, and completed every rollout successfully.
 - **Affected:** Makefile:184, docs/content/local-testing.md:121
 - **Expected:** make test-env-redeploy builds, imports, deploys, restarts, and waits for the current image.
 - **Actual:** The phony target has no recipe or prerequisite. The deploy prerequisite is attached to the misspelled target test-e test-env-destroynv-redeploy.
@@ -158,7 +164,7 @@ Status legend:
 
 - [x] **F7 — Medium — Resolved**
 - **Confidence:** Highly likely
-- **Verification (2026-08-26):** Device names now use a bounded readable node prefix plus a 128-bit SHA-256-derived suffix while preserving the exact serial in spec. Tests cover whitespace, punctuation, long serials, deterministic distinct names, missing serial/PCI identity, zero capacity, partial kernel scans, API schema validation, and generated/chart CRD synchronization. The complete host CI and race gates pass, and the isolated three-node lab successfully created all three hardware-backed `NVMeDevice` objects and passed smoke validation.
+- **Verification (2026-08-27):** Device names now use a bounded readable node prefix plus a 128-bit SHA-256-derived suffix while preserving the exact serial in spec. Tests cover whitespace, punctuation, long serials, deterministic distinct names, missing serial/PCI identity, zero capacity, partial kernel scans, API schema validation, and generated/chart CRD synchronization. A follow-up hardware test exposed and fixed one remaining consumer of the legacy `node-serial` name: agent authorization and cleanup now resolve the exact device recorded by the live claim. Unit coverage and both Batch 3 hardware provisioning scenarios pass with hashed device names.
 - **Affected:** internal/agent/reporter.go:152, internal/agent/nvme_discovery.go:168
 - **Expected:** Supported NVMe serials are preserved as exact identities while producing bounded DNS-safe Kubernetes names.
 - **Actual:** The object name is nodeName plus a lowercased raw serial. There is no sanitization, hash, length bound, or DNS validation. Critical serial and PCI sysfs reads can also be silently omitted, and Required markers do not reject empty strings.
@@ -169,8 +175,9 @@ Status legend:
 
 ### 8. SPDK process configuration is not transactional or consistently enforced
 
-- [ ] **F8 — Medium — Open**
-- **Confidence:** Confirmed for option handling; highly likely for stuck initialization
+- [x] **F8 — Medium — Resolved**
+- **Confidence:** Confirmed and exercised
+- **Verification (2026-08-27):** API admission and unit regressions reject zero masks, while plugin tests reject conflicting masks, accept canonically equivalent masks, inject each configurable initialization RPC failure, prove the failed child is terminated and reaped, and prove a clean retry. The complete host CI-equivalent and race suites pass. The focused Vagrant scenario exported a real SPDK partition with mask `0x1`, rejected a second partition requesting `0x3` with `RetryableDeviceSetupFailed`, and passed in 16.5 seconds.
 - **Affected:** internal/agent/plugins/backend_spdk.go:40, internal/storageoptions/options.go:46
 - **Expected:** A declared core mask is honored or rejected consistently, and failed initialization leaves a clean state for retry.
 - **Actual:**
@@ -184,8 +191,9 @@ Status legend:
 
 ### 9. RDMA endpoint validation can select an unusable address or state
 
-- [ ] **F9 — Medium — Open**
-- **Confidence:** Confirmed
+- [x] **F9 — Medium — Resolved**
+- **Confidence:** Confirmed and exercised
+- **Verification (2026-08-27):** Agent, shared readiness, CSI node, and repository-contract regressions cover exact ACTIVE parsing, supported link-layer/transport pairs, address ordering, multicast and link-local rejection, routable IPv4 preference, global IPv6 fallback, kernel IPv6 configuration, TCP removal, and generated/Helm CRD synchronization. The complete host CI-equivalent and race suites pass. The isolated-lab smoke and E2E preflight then verified fresh, usable RoCEv2 endpoints on all three nodes before both Batch 3 hardware scenarios passed.
 - **Affected:** internal/agent/rdma_discovery.go:24, internal/rdmahealth/readiness.go:19
 - **Expected:** Placement accepts only an exactly active port with a routable address family supported by the target and CSI node.
 - **Actual:** Port state uses substring matching for ACTIVE; address selection accepts multicast and link-local addresses and returns the first address; readiness repeats the weak validation; node staging disagrees by rejecting multicast; and kernel export always configures IPv4. The CRD also permits TCP while readiness rejects it.
@@ -234,9 +242,9 @@ Status legend:
 
 ### 13. Some green verification can pass without proving readiness or fencing
 
-- [ ] **F13 — Low — Fix implemented; isolated-lab verification pending**
+- [ ] **F13 — Low — Fix implemented; F25 takeover verification pending**
 - **Confidence:** Confirmed
-- **Verification (2026-08-26):** Host-side contracts, lint, E2E compilation, and the race suite pass. The strengthened smoke check and corrected F25 takeover require isolated-lab verification.
+- **Verification (2026-08-27):** Host-side contracts, lint, E2E compilation, and the race suite pass. The strengthened smoke check now passes against all three isolated-lab nodes. The corrected F25 takeover still requires its focused isolated-lab rerun, so this broader finding remains open.
 - **Affected:** vagrant/smoke-test.sh:35, test/e2e/e2e_test.go:34, test/e2e/regression_e2e_test.go:475, test/contracts/repository_contracts_test.go:173
 - **Expected:** Green tests prove the behavior claimed by their documentation and labels.
 - **Actual:** Smoke and base E2E count RDMAStorageNode objects without requiring Ready=True, a fresh heartbeat, or a usable endpoint. F25 is labeled green and release-gate while its corrected hardware run is pending. F25 verifies the SPDK host list but not failed old-node I/O after takeover. The resolved F24 test remains quarantined and fails when selected because its literal version match does not accept equivalent documentation wording.

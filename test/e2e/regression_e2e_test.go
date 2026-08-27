@@ -240,6 +240,131 @@ spec:
 	})
 })
 
+var _ = Describe("Kernel export repair", Label("green", "batch3", "kernel-repair"), func() {
+	It("restores a missing configfs port link for an exported partition", func() {
+		const (
+			claimName     = "batch3-kernel-claim"
+			partitionName = "batch3-kernel-repair"
+			targetNode    = "distort-worker-2"
+		)
+		serial := serialForNode(targetNode)
+		DeferCleanup(func() {
+			_, _ = kubectl("delete", "nvmepartition", partitionName, "--ignore-not-found", "--wait=false")
+			_, _ = kubectl("delete", "nvmedeviceclaim", claimName, "--ignore-not-found", "--wait=false")
+		})
+
+		_, err := applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: %s
+spec:
+  serialNumber: %s
+---
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: %s
+spec:
+  size: 64Mi
+  targetBackend: kernel
+  volumeManager: partition
+`, claimName, serial, partitionName))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			state, getErr := kubectl("get", "nvmepartition", partitionName, "-o", "jsonpath={.status.state}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(state).To(Equal("Exported"))
+		}, 180*time.Second, 5*time.Second).Should(Succeed())
+
+		nqn, err := kubectl("get", "nvmepartition", partitionName, "-o", "jsonpath={.status.nqn}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nqn).NotTo(BeEmpty())
+		agentPod, err := kubectl(
+			"get", "pod", "-n", "distort-system",
+			"-l", "app.kubernetes.io/component=agent",
+			"--field-selector", "spec.nodeName="+targetNode,
+			"-o", "jsonpath={.items[0].metadata.name}",
+		)
+		Expect(err).NotTo(HaveOccurred())
+		agentPod = strings.TrimSpace(agentPod)
+		linkPath := "/sys/kernel/config/nvmet/ports/1/subsystems/" + strings.TrimSpace(nqn)
+		_, err = kubectl("exec", "-n", "distort-system", agentPod, "--", "test", "-L", linkPath)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = kubectl("exec", "-n", "distort-system", agentPod, "--", "rm", linkPath)
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func(g Gomega) {
+			_, checkErr := kubectl("exec", "-n", "distort-system", agentPod, "--", "test", "-L", linkPath)
+			g.Expect(checkErr).NotTo(HaveOccurred())
+		}, 180*time.Second, 5*time.Second).Should(Succeed())
+	})
+})
+
+var _ = Describe("SPDK node-global configuration", Label("green", "batch3", "spdk-core-mask"), func() {
+	It("rejects a partition whose core mask conflicts with the running target", func() {
+		const (
+			claimName      = "batch3-spdk-claim"
+			firstPartition = "batch3-spdk-mask-owner"
+			conflict       = "batch3-spdk-mask-conflict"
+		)
+		serial := serialForNode("distort-master")
+		DeferCleanup(func() {
+			for _, name := range []string{conflict, firstPartition} {
+				_, _ = kubectl("delete", "nvmepartition", name, "--ignore-not-found", "--wait=false")
+			}
+			_, _ = kubectl("delete", "nvmedeviceclaim", claimName, "--ignore-not-found", "--wait=false")
+		})
+
+		_, err := applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: %s
+spec:
+  serialNumber: %s
+---
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: %s
+spec:
+  size: 64Mi
+  targetBackend: spdk
+  volumeManager: partition
+  targetOptions:
+    spdk-core-mask: "0x1"
+`, claimName, serial, firstPartition))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			state, getErr := kubectl("get", "nvmepartition", firstPartition, "-o", "jsonpath={.status.state}")
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(state).To(Equal("Exported"))
+		}, 180*time.Second, 5*time.Second).Should(Succeed())
+
+		_, err = applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMePartition
+metadata:
+  name: %s
+spec:
+  size: 64Mi
+  targetBackend: spdk
+  volumeManager: partition
+  targetOptions:
+    spdk-core-mask: "0x3"
+`, conflict))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			result, getErr := kubectl("get", "nvmepartition", conflict, "-o",
+				`jsonpath={.status.state}{"|"}{.status.conditions[?(@.type=="ProvisioningReady")].reason}{"|"}{.status.conditions[?(@.type=="ProvisioningReady")].message}`)
+			g.Expect(getErr).NotTo(HaveOccurred())
+			g.Expect(result).To(HavePrefix("Failed|RetryableDeviceSetupFailed|"))
+			g.Expect(result).To(ContainSubstring("running nvmf_tgt uses core mask 0x1, requested 0x3"))
+		}, 120*time.Second, 5*time.Second).Should(Succeed())
+	})
+})
+
 var _ = Describe("Kernel partition isolation", Label("green", "F3", "kernel", "release-gate", "volume-isolation", "backend-cleanup"), func() {
 	It("allocates reusable partition numbers without damaging surviving volumes", func() {
 		const (

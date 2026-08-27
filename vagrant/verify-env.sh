@@ -14,9 +14,9 @@ vagrant_ssh() {
   local node="$1"
   local cmd="$2"
   if [ -f "Vagrantfile" ]; then
-    vagrant ssh "$node" -c "$cmd"
+    vagrant ssh "$node" -c "$cmd" | tr -d '\r'
   else
-    (cd vagrant && vagrant ssh "$node" -c "$cmd")
+    (cd vagrant && vagrant ssh "$node" -c "$cmd") | tr -d '\r'
   fi
 }
 

@@ -224,22 +224,6 @@ func (p *PartitionManager) verifyProvisioningAuthorization(ctx context.Context, 
 		return nil, fmt.Errorf("NVMePartition %s is missing ParentDeviceSerialNumber", partition.Name)
 	}
 
-	deviceName := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
-	var device storagev1alpha1.NVMeDevice
-	if err := p.Get(ctx, types.NamespacedName{Name: deviceName}, &device); err != nil {
-		return nil, fmt.Errorf("resolve parent NVMeDevice %s: %w", deviceName, err)
-	}
-	if device.Spec.NodeName != partition.Spec.NodeName ||
-		!strings.EqualFold(device.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
-		return nil, fmt.Errorf("NVMeDevice %s does not match the assigned node and serial", device.Name)
-	}
-	if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed && !recoveringExistingAllocation {
-		return nil, fmt.Errorf("NVMeDevice %s is not claimed", device.Name)
-	}
-	if !claimReferencesEqual(device.Status.ClaimRef, claimRef) {
-		return nil, fmt.Errorf("NVMeDevice %s is owned by a different claim", device.Name)
-	}
-
 	var claim storagev1alpha1.NVMeDeviceClaim
 	claimKey := types.NamespacedName{Namespace: claimRef.Namespace, Name: claimRef.Name}
 	if err := p.Get(ctx, claimKey, &claim); err != nil {
@@ -251,13 +235,27 @@ func (p *PartitionManager) verifyProvisioningAuthorization(ctx context.Context, 
 	if !claim.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("NVMeDeviceClaim %s is being deleted", claimKey)
 	}
-	if claim.Status.MatchedDevice != device.Name ||
-		claim.Status.NodeName != partition.Spec.NodeName ||
+	if claim.Status.MatchedDevice == "" || claim.Status.NodeName != partition.Spec.NodeName ||
 		!strings.EqualFold(claim.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
-		return nil, fmt.Errorf("NVMeDeviceClaim %s does not match NVMeDevice %s", claimKey, device.Name)
+		return nil, fmt.Errorf("NVMeDeviceClaim %s does not match the assigned device identity", claimKey)
 	}
 	if !claim.Status.Active && !recoveringExistingAllocation {
-		return nil, fmt.Errorf("NVMeDeviceClaim %s is not actively bound to NVMeDevice %s", claimKey, device.Name)
+		return nil, fmt.Errorf("NVMeDeviceClaim %s is not actively bound to NVMeDevice %s", claimKey, claim.Status.MatchedDevice)
+	}
+
+	var device storagev1alpha1.NVMeDevice
+	if err := p.Get(ctx, types.NamespacedName{Name: claim.Status.MatchedDevice}, &device); err != nil {
+		return nil, fmt.Errorf("resolve parent NVMeDevice %s: %w", claim.Status.MatchedDevice, err)
+	}
+	if device.Spec.NodeName != partition.Spec.NodeName ||
+		!strings.EqualFold(device.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
+		return nil, fmt.Errorf("NVMeDevice %s does not match the assigned node and serial", device.Name)
+	}
+	if device.Status.State != storagev1alpha1.NVMeDeviceStateClaimed && !recoveringExistingAllocation {
+		return nil, fmt.Errorf("NVMeDevice %s is not claimed", device.Name)
+	}
+	if !claimReferencesEqual(device.Status.ClaimRef, claimRef) {
+		return nil, fmt.Errorf("NVMeDevice %s is owned by a different claim", device.Name)
 	}
 
 	return &device, nil
@@ -370,9 +368,56 @@ func resolvePartitionPlugins(partition *storagev1alpha1.NVMePartition) (resolved
 	}, "", nil
 }
 
-func (p *PartitionManager) resolveDeletionDevice(partition *storagev1alpha1.NVMePartition, targetBackendName string) (string, string, error) {
+func (p *PartitionManager) assignedDeviceName(ctx context.Context, partition *storagev1alpha1.NVMePartition) (string, error) {
+	claimRef := partition.Spec.ClaimRef
+	if claimRef != nil && claimRef.Namespace != "" && claimRef.Name != "" && claimRef.UID != "" {
+		var claim storagev1alpha1.NVMeDeviceClaim
+		claimKey := types.NamespacedName{Namespace: claimRef.Namespace, Name: claimRef.Name}
+		if err := p.Get(ctx, claimKey, &claim); err == nil {
+			if claim.UID != claimRef.UID {
+				return "", fmt.Errorf("NVMeDeviceClaim %s UID does not match the allocation", claimKey)
+			}
+			if claim.Status.MatchedDevice != "" && claim.Status.NodeName == partition.Spec.NodeName &&
+				strings.EqualFold(claim.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
+				return claim.Status.MatchedDevice, nil
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("resolve owning NVMeDeviceClaim %s during cleanup: %w", claimKey, err)
+		}
+	}
+
+	var devices storagev1alpha1.NVMeDeviceList
+	if err := p.List(ctx, &devices); err != nil {
+		return "", fmt.Errorf("list NVMeDevices during cleanup: %w", err)
+	}
+	var matches []string
+	for _, device := range devices.Items {
+		if device.Spec.NodeName == partition.Spec.NodeName &&
+			strings.EqualFold(device.Spec.SerialNumber, partition.Spec.ParentDeviceSerialNumber) {
+			matches = append(matches, device.Name)
+		}
+	}
+	if len(matches) == 0 {
+		// Preserve cleanup of pre-hash allocations whose claim and device objects
+		// are already gone. New SPDK allocations persist their exact base bdev.
+		return p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber), nil
+	}
+	if len(matches) != 1 {
+		return "", fmt.Errorf("found %d NVMeDevices for node %s and serial %s during cleanup, want exactly one",
+			len(matches), partition.Spec.NodeName, partition.Spec.ParentDeviceSerialNumber)
+	}
+	return matches[0], nil
+}
+
+func (p *PartitionManager) resolveDeletionDevice(ctx context.Context, partition *storagev1alpha1.NVMePartition, targetBackendName string) (string, string, error) {
 	if targetBackendName == spdkTargetBackend {
-		name := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
+		if partition.Status.SPDKBaseBdev != "" {
+			return partition.Status.SPDKBaseBdev, partition.Status.SPDKBaseBdev, nil
+		}
+		name, err := p.assignedDeviceName(ctx, partition)
+		if err != nil {
+			return "", "", err
+		}
 		return name, name, nil
 	}
 	devices, err := DiscoverNVMe()
@@ -402,7 +447,10 @@ func (p *PartitionManager) clearInactiveBackend(ctx context.Context, partition *
 			return nil
 		}
 	}
-	deviceName := p.NodeName + "-" + strings.ToLower(partition.Spec.ParentDeviceSerialNumber)
+	deviceName, err := p.assignedDeviceName(ctx, partition)
+	if err != nil {
+		return err
+	}
 	return p.updateDeviceStatus(ctx, types.NamespacedName{Name: deviceName}, func(status *storagev1alpha1.NVMeDeviceStatus) {
 		status.ActiveBackend = ""
 	})
@@ -435,7 +483,7 @@ func (p *PartitionManager) reconcilePartitionDeletion(
 	}
 
 	if partition.Spec.ParentDeviceSerialNumber != "" {
-		devicePath, deviceName, err := p.resolveDeletionDevice(partition, resolved.targetBackendName)
+		devicePath, deviceName, err := p.resolveDeletionDevice(ctx, partition, resolved.targetBackendName)
 		if err != nil {
 			logger.Error(err, "Failed to resolve NVMe device during teardown")
 			return ctrl.Result{}, err

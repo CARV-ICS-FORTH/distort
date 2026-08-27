@@ -100,7 +100,7 @@ type NVMePartitionSpec struct {
 	// TargetOptions provides backend-specific customization flags (e.g., spdk core masks).
 	// +kubebuilder:validation:MaxProperties=1
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k == 'spdk-core-mask')",message="targetOptions contains an unsupported backend option"
-	// +kubebuilder:validation:XValidation:rule="!('spdk-core-mask' in self) || (size(self['spdk-core-mask']) <= 258 && self['spdk-core-mask'].matches('^0x[0-9A-Fa-f]+$'))",message="spdk-core-mask must be at most 258 characters and match 0x followed by hexadecimal digits"
+	// +kubebuilder:validation:XValidation:rule="!('spdk-core-mask' in self) || (size(self['spdk-core-mask']) <= 258 && self['spdk-core-mask'].matches('^0x[0-9A-Fa-f]*[1-9A-Fa-f][0-9A-Fa-f]*$'))",message="spdk-core-mask must be at most 258 characters, match 0x followed by hexadecimal digits, and select at least one CPU"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="targetOptions is immutable"
 	// +optional
 	TargetOptions map[string]string `json:"targetOptions,omitempty"`

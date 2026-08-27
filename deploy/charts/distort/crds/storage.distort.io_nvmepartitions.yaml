@@ -167,10 +167,10 @@ spec:
                 x-kubernetes-validations:
                 - message: targetOptions contains an unsupported backend option
                   rule: self.all(k, k == 'spdk-core-mask')
-                - message: spdk-core-mask must be at most 258 characters and match
-                    0x followed by hexadecimal digits
+                - message: spdk-core-mask must be at most 258 characters, match 0x
+                    followed by hexadecimal digits, and select at least one CPU
                   rule: '!(''spdk-core-mask'' in self) || (size(self[''spdk-core-mask''])
-                    <= 258 && self[''spdk-core-mask''].matches(''^0x[0-9A-Fa-f]+$''))'
+                    <= 258 && self[''spdk-core-mask''].matches(''^0x[0-9A-Fa-f]*[1-9A-Fa-f][0-9A-Fa-f]*$''))'
                 - message: targetOptions is immutable
                   rule: self == oldSelf
               volumeManager:

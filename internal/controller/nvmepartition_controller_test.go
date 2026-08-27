@@ -396,6 +396,7 @@ var _ = Describe("NVMePartition placement", func() {
 			options map[string]string
 		}{
 			{name: "shell-syntax", backend: "spdk", options: map[string]string{"spdk-core-mask": "0x1;id"}},
+			{name: "zero-mask", backend: "spdk", options: map[string]string{"spdk-core-mask": "0x0000"}},
 			{name: "oversized", backend: "spdk", options: map[string]string{"spdk-core-mask": "0x" + strings.Repeat("f", 257)}},
 			{name: "unknown", backend: "spdk", options: map[string]string{"unknown": "value"}},
 			{name: "wrong-backend", backend: "kernel", options: map[string]string{"spdk-core-mask": "0x1"}},
