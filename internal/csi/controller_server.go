@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ type ControllerServer struct {
 const (
 	defaultVolumeCapacityBytes int64 = 1024 * 1024 * 1024
 	spdkTargetBackend                = "spdk"
+	kernelTargetBackend              = "kernel"
 	partitionVolumeManager           = "partition"
 )
 
@@ -46,11 +48,24 @@ func normalizeCapacityRange(capacityRange *csi.CapacityRange) (int64, int64, err
 	}
 	requiredBytes := capacityRange.GetRequiredBytes()
 	limitBytes := capacityRange.GetLimitBytes()
-	if requiredBytes <= 0 {
-		return 0, 0, fmt.Errorf("required_bytes must be positive when CapacityRange is provided")
+	if requiredBytes < 0 {
+		return 0, 0, fmt.Errorf("required_bytes cannot be negative")
 	}
 	if limitBytes < 0 {
 		return 0, 0, fmt.Errorf("limit_bytes cannot be negative")
+	}
+	if requiredBytes == 0 && limitBytes == 0 {
+		return 0, 0, fmt.Errorf("at least one of required_bytes or limit_bytes must be positive")
+	}
+	if requiredBytes == 0 {
+		requiredBytes = defaultVolumeCapacityBytes
+		if limitBytes < requiredBytes {
+			requiredBytes = limitBytes / capacity.AllocationUnitBytes * capacity.AllocationUnitBytes
+			if requiredBytes == 0 {
+				return 0, 0, fmt.Errorf("limit_bytes %d is smaller than the minimum allocation unit %d",
+					limitBytes, capacity.AllocationUnitBytes)
+			}
+		}
 	}
 	if limitBytes > 0 && requiredBytes > limitBytes {
 		return 0, 0, fmt.Errorf("required_bytes %d exceeds limit_bytes %d", requiredBytes, limitBytes)
@@ -63,6 +78,45 @@ func normalizeCapacityRange(capacityRange *csi.CapacityRange) (int64, int64, err
 		return 0, 0, fmt.Errorf("required capacity rounds up to %d bytes, exceeding limit_bytes %d", allocatedBytes, limitBytes)
 	}
 	return requiredBytes, allocatedBytes, nil
+}
+
+func storageConfiguration(parameters map[string]string) (string, string, map[string]string, error) {
+	targetBackend := parameters["target-backend"]
+	if targetBackend == "" {
+		targetBackend = spdkTargetBackend
+	}
+	volumeManager := parameters["volume-manager"]
+	if volumeManager == "" {
+		volumeManager = partitionVolumeManager
+	}
+	if err := validateStorageCombination(targetBackend, volumeManager); err != nil {
+		return "", "", nil, err
+	}
+	targetOptions := make(map[string]string)
+	// csi.storage.k8s.io/* keys are injected by the provisioner sidecar and are not for backends.
+	for key, value := range parameters {
+		if !strings.HasPrefix(key, "csi.storage.k8s.io/") && key != "target-backend" &&
+			key != "volume-manager" && key != filesystemParameter {
+			targetOptions[key] = value
+		}
+	}
+	if err := storageoptions.Validate(targetBackend, targetOptions); err != nil {
+		return "", "", nil, err
+	}
+	return targetBackend, volumeManager, targetOptions, nil
+}
+
+func volumeContextForPartition(partition *storagev1alpha1.NVMePartition) map[string]string {
+	filesystem := partition.Spec.Filesystem
+	if filesystem == "" {
+		filesystem = defaultFilesystem
+	}
+	return map[string]string{
+		"nqn":               partition.Status.NQN,
+		"portalIP":          partition.Status.PortalIP,
+		"portalPort":        fmt.Sprintf("%d", partition.Status.PortalPort),
+		filesystemParameter: filesystem,
+	}
 }
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -88,26 +142,9 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		ns = "default"
 	}
 
-	targetBackend := req.GetParameters()["target-backend"]
-	if targetBackend == "" {
-		targetBackend = spdkTargetBackend
-	}
-	volumeManager := req.GetParameters()["volume-manager"]
-	if volumeManager == "" {
-		volumeManager = partitionVolumeManager
-	}
-	if err := validateStorageCombination(targetBackend, volumeManager); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Unsupported storage configuration: %v", err)
-	}
-	targetOptions := make(map[string]string)
-	// csi.storage.k8s.io/* keys are injected by the provisioner sidecar and are not for backends.
-	for k, v := range req.GetParameters() {
-		if !strings.HasPrefix(k, "csi.storage.k8s.io/") && k != "target-backend" && k != "volume-manager" && k != filesystemParameter {
-			targetOptions[k] = v
-		}
-	}
-	if err := storageoptions.Validate(targetBackend, targetOptions); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Invalid backend options: %v", err)
+	targetBackend, volumeManager, targetOptions, err := storageConfiguration(req.GetParameters())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid storage configuration: %v", err)
 	}
 	canonicalRequest := canonicalCreateVolumeRequest{
 		RequiredBytes: requiredBytes,
@@ -201,12 +238,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	// Construct context for the Node Stage/Publish calls
-	volCtx := map[string]string{
-		"nqn":               partition.Status.NQN,
-		"portalIP":          partition.Status.PortalIP,
-		"portalPort":        fmt.Sprintf("%d", partition.Status.PortalPort),
-		filesystemParameter: capability.Filesystem,
-	}
+	volCtx := volumeContextForPartition(partition)
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -219,7 +251,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 func validateStorageCombination(targetBackend, volumeManager string) error {
 	switch targetBackend {
-	case spdkTargetBackend, "kernel":
+	case spdkTargetBackend, kernelTargetBackend:
 	default:
 		return fmt.Errorf("target backend %q is not implemented", targetBackend)
 	}
@@ -229,16 +261,95 @@ func validateStorageCombination(targetBackend, volumeManager string) error {
 	return nil
 }
 
-func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+func unconfirmedCapabilities(message string) *csi.ValidateVolumeCapabilitiesResponse {
+	return &csi.ValidateVolumeCapabilitiesResponse{Message: message}
+}
+
+func validatePersistedVolumeRequest(partition *storagev1alpha1.NVMePartition, req *csi.ValidateVolumeCapabilitiesRequest) error {
+	expectedContext := volumeContextForPartition(partition)
+	if len(req.GetVolumeContext()) != 0 && !maps.Equal(req.GetVolumeContext(), expectedContext) {
+		return fmt.Errorf("volume context does not match the persisted volume")
+	}
+
+	validationParameters := maps.Clone(req.GetParameters())
+	if validationParameters == nil {
+		validationParameters = make(map[string]string)
+	}
+	if _, hasFilesystem := validationParameters[filesystemParameter]; !hasFilesystem {
+		if _, hasCSIFilesystem := validationParameters[csiFilesystemParameter]; !hasCSIFilesystem {
+			if filesystem := req.GetVolumeContext()[filesystemParameter]; filesystem != "" {
+				validationParameters[filesystemParameter] = filesystem
+			} else {
+				hasCapabilityFilesystem := false
+				for _, capability := range req.GetVolumeCapabilities() {
+					if capability != nil && capability.GetMount() != nil && strings.TrimSpace(capability.GetMount().GetFsType()) != "" {
+						hasCapabilityFilesystem = true
+						break
+					}
+				}
+				if !hasCapabilityFilesystem {
+					validationParameters[filesystemParameter] = expectedContext[filesystemParameter]
+				}
+			}
+		}
+	}
+	capability, err := validateVolumeCapabilities(validationParameters, req.GetVolumeCapabilities())
+	if err != nil {
+		return err
+	}
+	expectedAccessMode := partition.Spec.AccessMode
+	if expectedAccessMode == "" {
+		expectedAccessMode = supportedAccessMode.String()
+	}
+	if capability.AccessMode != expectedAccessMode || capability.Filesystem != expectedContext[filesystemParameter] {
+		return fmt.Errorf("requested capability does not match the persisted access mode and filesystem")
+	}
+
+	if len(req.GetParameters()) == 0 {
+		return nil
+	}
+	targetBackend, volumeManager, targetOptions, err := storageConfiguration(req.GetParameters())
+	if err != nil {
+		return err
+	}
+	expectedBackend := partition.Spec.TargetBackend
+	if expectedBackend == "" {
+		expectedBackend = spdkTargetBackend
+	}
+	expectedManager := partition.Spec.VolumeManager
+	if expectedManager == "" {
+		expectedManager = partitionVolumeManager
+	}
+	if targetBackend != expectedBackend || volumeManager != expectedManager || !maps.Equal(targetOptions, partition.Spec.TargetOptions) {
+		return fmt.Errorf("volume creation parameters do not match the persisted storage configuration")
+	}
+	if namespace, ok := req.GetParameters()["csi.storage.k8s.io/pvc/namespace"]; ok {
+		if namespace == "" {
+			namespace = "default"
+		}
+		if namespace != partition.Namespace {
+			return fmt.Errorf("volume namespace parameter does not match the persisted volume")
+		}
+	}
+	return nil
+}
+
+func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
 	}
-	if _, err := validateVolumeCapabilities(req.GetVolumeContext(), req.GetVolumeCapabilities()); err != nil {
-		return &csi.ValidateVolumeCapabilitiesResponse{Message: err.Error()}, nil
+	partition, err := cs.partitionForVolumeHandle(ctx, req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePersistedVolumeRequest(partition, req); err != nil {
+		return unconfirmedCapabilities(err.Error()), nil
 	}
 	return &csi.ValidateVolumeCapabilitiesResponse{
 		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
+			VolumeContext:      req.GetVolumeContext(),
 			VolumeCapabilities: req.GetVolumeCapabilities(),
+			Parameters:         req.GetParameters(),
 		},
 	}, nil
 }

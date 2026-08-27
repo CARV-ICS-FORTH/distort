@@ -12,6 +12,8 @@ import (
 	csipb "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"distort/internal/volumeidentity"
 )
 
 func TestNodeIdentityAndCapabilities(t *testing.T) {
@@ -54,6 +56,124 @@ func TestNodeUnstageAndUnpublishValidateRequiredFields(t *testing.T) {
 	}
 }
 
+func TestNodeOperationsRejectUnsafePathsBeforeSideEffects(t *testing.T) {
+	invalidPaths := []struct {
+		name string
+		path string
+	}{
+		{name: "missing", path: ""},
+		{name: "relative", path: "var/lib/kubelet/volume"},
+		{name: "root", path: "/"},
+		{name: "parent traversal", path: "/var/lib/kubelet/pods/../plugins/volume"},
+		{name: "trailing separator", path: "/var/lib/kubelet/volume/"},
+		{name: "null byte", path: "/var/lib/kubelet/volume\x00suffix"},
+	}
+	for _, invalid := range invalidPaths {
+		t.Run(invalid.name, func(t *testing.T) {
+			operations := 0
+			server := &NodeServer{
+				publishMount: func(context.Context, string, string, bool) error {
+					operations++
+					return nil
+				},
+				unstageMount: func(context.Context, string) error {
+					operations++
+					return nil
+				},
+				disconnectRDMA: func(context.Context, string) error {
+					operations++
+					return nil
+				},
+			}
+			validPath := filepath.Join(t.TempDir(), "volume")
+			calls := []struct {
+				name string
+				call func() error
+			}{
+				{name: "unstage", call: func() error {
+					_, err := server.NodeUnstageVolume(context.Background(), &csipb.NodeUnstageVolumeRequest{
+						VolumeId: "volume", StagingTargetPath: invalid.path,
+					})
+					return err
+				}},
+				{name: "publish source", call: func() error {
+					_, err := server.NodePublishVolume(context.Background(), &csipb.NodePublishVolumeRequest{
+						VolumeId: "volume", StagingTargetPath: invalid.path, TargetPath: validPath,
+						VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+					})
+					return err
+				}},
+				{name: "publish target", call: func() error {
+					_, err := server.NodePublishVolume(context.Background(), &csipb.NodePublishVolumeRequest{
+						VolumeId: "volume", StagingTargetPath: validPath, TargetPath: invalid.path,
+						VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+					})
+					return err
+				}},
+				{name: "unpublish", call: func() error {
+					_, err := server.NodeUnpublishVolume(context.Background(), &csipb.NodeUnpublishVolumeRequest{
+						VolumeId: "volume", TargetPath: invalid.path,
+					})
+					return err
+				}},
+			}
+			for _, call := range calls {
+				t.Run(call.name, func(t *testing.T) {
+					requireCode(t, call.call(), codes.InvalidArgument)
+				})
+			}
+			if operations != 0 {
+				t.Fatalf("invalid path reached %d mount or NVMe operations", operations)
+			}
+		})
+	}
+}
+
+func TestNodeOperationsAcceptCanonicalPaths(t *testing.T) {
+	var publishedSource, publishedTarget, disconnectedNQN string
+	var unmountedTargets []string
+	server := &NodeServer{
+		publishMount: func(_ context.Context, source, target string, _ bool) error {
+			publishedSource, publishedTarget = source, target
+			return nil
+		},
+		unstageMount: func(_ context.Context, target string) error {
+			unmountedTargets = append(unmountedTargets, target)
+			return nil
+		},
+		disconnectRDMA: func(_ context.Context, nqn string) error {
+			disconnectedNQN = nqn
+			return nil
+		},
+	}
+	stagingPath := filepath.Join(t.TempDir(), "staging")
+	targetPath := filepath.Join(t.TempDir(), "published")
+	if _, err := server.NodePublishVolume(context.Background(), &csipb.NodePublishVolumeRequest{
+		VolumeId: "volume", StagingTargetPath: stagingPath, TargetPath: targetPath,
+		VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	}); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	if _, err := server.NodeUnpublishVolume(context.Background(), &csipb.NodeUnpublishVolumeRequest{
+		VolumeId: "volume", TargetPath: targetPath,
+	}); err != nil {
+		t.Fatalf("NodeUnpublishVolume: %v", err)
+	}
+	if _, err := server.NodeUnstageVolume(context.Background(), &csipb.NodeUnstageVolumeRequest{
+		VolumeId: "volume", StagingTargetPath: stagingPath,
+	}); err != nil {
+		t.Fatalf("NodeUnstageVolume: %v", err)
+	}
+	if publishedSource != stagingPath || publishedTarget != targetPath || len(unmountedTargets) != 2 ||
+		unmountedTargets[0] != targetPath || unmountedTargets[1] != stagingPath {
+		t.Fatalf("unexpected validated paths: publish=%q->%q unmounted=%q",
+			publishedSource, publishedTarget, unmountedTargets)
+	}
+	if disconnectedNQN != volumeidentity.NQN("volume") {
+		t.Fatalf("disconnected NQN = %q", disconnectedNQN)
+	}
+}
+
 func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
 	connectCalls := 0
 	server := &NodeServer{
@@ -65,6 +185,21 @@ func TestNodeStageValidatesEverythingBeforeConnecting(t *testing.T) {
 	}
 	requests := []*csipb.NodeStageVolumeRequest{
 		{VolumeId: "volume", VolumeContext: map[string]string{}},
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.StagingTargetPath = "relative/path"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.StagingTargetPath = "/"
+			return req
+		}(),
+		func() *csipb.NodeStageVolumeRequest {
+			req := validNodeStageRequest(t, server.nodeID)
+			req.StagingTargetPath = "/var/lib/kubelet/pods/../plugins/volume"
+			return req
+		}(),
 		{
 			VolumeId:          "volume",
 			StagingTargetPath: t.TempDir(),

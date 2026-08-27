@@ -30,6 +30,7 @@ type NodeServer struct {
 	mkdirAll               func(string, os.FileMode) error
 	removePath             func(string) error
 	stageMount             func(context.Context, string, string, string) (bool, error)
+	publishMount           func(context.Context, string, string, bool) error
 	unstageMount           func(context.Context, string) error
 	devicePollInterval     time.Duration
 	deviceDiscoveryTimeout time.Duration
@@ -51,13 +52,30 @@ type validatedNodeStageRequest struct {
 	filesystem        string
 }
 
+func validateNodePath(field, path string) (string, error) {
+	if path == "" {
+		return "", status.Errorf(codes.InvalidArgument, "%s must be provided", field)
+	}
+	if strings.ContainsRune(path, '\x00') || !filepath.IsAbs(path) {
+		return "", status.Errorf(codes.InvalidArgument, "%s must be an absolute path", field)
+	}
+	cleaned := filepath.Clean(path)
+	if cleaned == string(filepath.Separator) {
+		return "", status.Errorf(codes.InvalidArgument, "%s must not be the filesystem root", field)
+	}
+	if cleaned != path {
+		return "", status.Errorf(codes.InvalidArgument, "%s must be canonical", field)
+	}
+	return cleaned, nil
+}
+
 func (ns *NodeServer) validateNodeStageRequest(req *csi.NodeStageVolumeRequest) (validatedNodeStageRequest, error) {
 	if req.GetVolumeId() == "" {
 		return validatedNodeStageRequest{}, status.Error(codes.InvalidArgument, "Volume ID must be provided")
 	}
-	stagingTargetPath := req.GetStagingTargetPath()
-	if stagingTargetPath == "" || !filepath.IsAbs(stagingTargetPath) || filepath.Clean(stagingTargetPath) == "/" {
-		return validatedNodeStageRequest{}, status.Error(codes.InvalidArgument, "Staging target path must be a non-root absolute path")
+	stagingTargetPath, err := validateNodePath("Staging target path", req.GetStagingTargetPath())
+	if err != nil {
+		return validatedNodeStageRequest{}, err
 	}
 	capability, err := validateVolumeCapabilities(req.GetVolumeContext(), []*csi.VolumeCapability{req.GetVolumeCapability()})
 	if err != nil {
@@ -90,7 +108,7 @@ func (ns *NodeServer) validateNodeStageRequest(req *csi.NodeStageVolumeRequest) 
 	}
 	return validatedNodeStageRequest{
 		volumeID:          req.GetVolumeId(),
-		stagingTargetPath: filepath.Clean(stagingTargetPath),
+		stagingTargetPath: stagingTargetPath,
 		nqn:               nqn,
 		portalIP:          portalIP,
 		portalPort:        strconv.Itoa(port),
@@ -160,6 +178,13 @@ func (ns *NodeServer) unmount(ctx context.Context, target string) error {
 		return ns.unstageMount(ctx, target)
 	}
 	return unmount(ctx, target)
+}
+
+func (ns *NodeServer) mountPublished(ctx context.Context, source, target string, readonly bool) error {
+	if ns.publishMount != nil {
+		return ns.publishMount(ctx, source, target, readonly)
+	}
+	return publishBindMount(ctx, source, target, readonly)
 }
 
 func (ns *NodeServer) waitForDevice(ctx context.Context, path string) error {
@@ -293,16 +318,16 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
 	}
 
-	stagingTargetPath := req.GetStagingTargetPath()
-	if stagingTargetPath == "" {
-		return nil, status.Error(codes.InvalidArgument, "Staging Target Path must be provided")
+	stagingTargetPath, err := validateNodePath("Staging target path", req.GetStagingTargetPath())
+	if err != nil {
+		return nil, err
 	}
 
 	klog.InfoS("Unstaging volume", "volumeID", volID, "targetPath", stagingTargetPath)
 
 	// 1. Unmount the staging path
 	unmountStarted := time.Now()
-	if err := unmount(ctx, stagingTargetPath); err != nil {
+	if err := ns.unmount(ctx, stagingTargetPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to unmount staging path: %v", err)
 	}
 	klog.InfoS("Unmounted staging path", "targetPath", stagingTargetPath, "duration", time.Since(unmountStarted))
@@ -319,7 +344,7 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	}
 
 	disconnectStarted := time.Now()
-	if err := DisconnectRDMA(ctx, nqn); err != nil {
+	if err := ns.disconnect(ctx, nqn); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to disconnect NVMe target: %v", err)
 	}
 	klog.InfoS("Disconnected NVMe target", "nqn", nqn, "duration", time.Since(disconnectStarted))
@@ -330,10 +355,16 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	volID := req.GetVolumeId()
-	source := req.GetStagingTargetPath()
-	target := req.GetTargetPath()
-	if volID == "" || source == "" || target == "" {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID, staging target path, and target path must be provided")
+	if volID == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
+	}
+	source, err := validateNodePath("Staging target path", req.GetStagingTargetPath())
+	if err != nil {
+		return nil, err
+	}
+	target, err := validateNodePath("Target path", req.GetTargetPath())
+	if err != nil {
+		return nil, err
 	}
 	if _, err := validateVolumeCapabilities(req.GetVolumeContext(), []*csi.VolumeCapability{req.GetVolumeCapability()}); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume capability: %v", err)
@@ -341,7 +372,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	klog.InfoS("Publishing volume", "volumeID", volID, "sourcePath", source, "targetPath", target)
 
-	if err := publishBindMount(ctx, source, target, req.GetReadonly()); err != nil {
+	if err := ns.mountPublished(ctx, source, target, req.GetReadonly()); err != nil {
 		var mismatch *mountMismatchError
 		if errors.As(err, &mismatch) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
@@ -356,14 +387,17 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	started := time.Now()
 	volID := req.GetVolumeId()
-	target := req.GetTargetPath()
-	if volID == "" || target == "" {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID and target path must be provided")
+	if volID == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
+	}
+	target, err := validateNodePath("Target path", req.GetTargetPath())
+	if err != nil {
+		return nil, err
 	}
 
 	klog.InfoS("Unpublishing volume", "volumeID", volID, "targetPath", target)
 
-	if err := unmount(ctx, target); err != nil {
+	if err := ns.unmount(ctx, target); err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to unmount target path: %v", err)
 	}
 

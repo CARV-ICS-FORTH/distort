@@ -17,21 +17,25 @@ type: "page"
 > transactional, and RDMA endpoint selection is strict and IPv6-aware. The
 > complete host CI-equivalent suite passes, and the focused isolated-lab Batch
 > 3 run passed both scenarios after also confirming three healthy SoftRoCE
-> endpoints. F1, F8, and F9 are resolved.
+> endpoints. F1, F8, and F9 are resolved. Batch 4 resolves F5 and F10 with
+> CSI 1.5-compliant capacity, validation, and detach behavior plus centralized
+> fail-safe node-path validation. The complete host CI-equivalent and race
+> suites pass; no hardware exercise is required for these request-boundary
+> fixes.
 
 ## 1. Executive summary
 
-DISTORT has a credible, well-structured happy path, but the current working tree is not production-ready. The host-side suite and race detector pass, and Batches 1–3 have addressed and verified the deployment, ownership, discovery, kernel-recovery, SPDK-startup, and RDMA-validation findings assigned to them. Several CSI-contract and privileged-path defects remain.
+DISTORT has a credible, well-structured happy path, but the current working tree is not production-ready. The host-side suite and race detector pass, and Batches 1–4 have addressed and verified the deployment, ownership, discovery, kernel-recovery, SPDK-startup, RDMA-validation, CSI-contract, and privileged-path findings assigned to them.
 
-The most serious unresolved findings are:
-
-- Multiple CSI 1.5 request semantics are implemented incorrectly.
-- CSI publish, unpublish, and unstage paths do not consistently reject unsafe filesystem paths before privileged operations.
-- The corrected F25 takeover isolated-lab release gate remains pending.
+The only unresolved finding in this review is the corrected F25 takeover
+isolated-lab release gate. Broader production-hardening and CSI conformance work
+remain listed separately below.
 
 No Critical issue was confirmed in the original review. The finding checkboxes below are the authoritative current status; unchecked implemented findings remain open until their required isolated-lab verification passes.
 
-This review covers the current working tree, which was already dirty: 36 modified and 5 untracked files. It therefore does not necessarily represent a committed release.
+This review originated from an already-dirty working tree. The status and
+verification notes below track the subsequent remediation work rather than a
+single committed release snapshot.
 
 Project summary:
 
@@ -46,7 +50,7 @@ Project summary:
   - Kernel configfs or SPDK JSON-RPC state stores live target configuration.
 - Dependencies: Go 1.25.3, Kubebuilder/controller-runtime, Kubernetes 0.35, CSI 1.5, gRPC, SPDK 26.01, nvme-cli, parted, ext4/XFS, Helm, K3s/Vagrant/VirtualBox, and RDMA/SoftRoCE.
 - Review limitations:
-  - Kernel configfs and real SPDK behavior were code-reviewed but not exercised because the lab deployment is unhealthy.
+  - Focused kernel configfs and real SPDK scenarios have isolated-lab evidence, but the complete hardware failure matrix has not been exercised.
   - No CSI conformance suite was available.
   - Generated files were checked for drift but were not treated as hand-maintained source.
 
@@ -61,11 +65,11 @@ Project summary:
 | Partition placement | Select a claimed device on a fresh RDMA node with sufficient capacity | nvmepartition_controller.go | **Host-verified for live ownership and inventory health** |
 | SPDK provisioning | Bind hardware, create lvol, export, supervise, recover, and clean up | SPDK backend and lvol manager | **Host and isolated-lab verified for transactional startup and core-mask enforcement** |
 | Kernel provisioning | Create GPT partition and complete configfs target, recover idempotently | Kernel backend and parted manager | **Host and isolated-lab verified for exact repair** |
-| CSI Create/Delete | Create stable namespaced volume handles and clean exact backend allocation | controller_server.go | **Partially verified** |
+| CSI Create/Delete | Create stable namespaced volume handles and clean exact backend allocation | controller_server.go | **Host-verified, including CSI request semantics** |
 | Single-writer attachment | Durable owner, exact host ACL, explicit fenced takeover | controller_attachment.go, attachment CRD, agent ACL reconciliation | **Partially verified; hardware gate pending** |
-| CSI node lifecycle | Connect, validate filesystem, format blank volume, stage and publish safely | node_server.go, nvme.go | **Partially verified** |
+| CSI node lifecycle | Connect, validate filesystem, format blank volume, stage and publish safely | node_server.go, nvme.go | **Host-verified, including fail-safe path validation** |
 | Host-side quality gates | Tests, race, lint, tidy, Helm, docs, and E2E compile should pass | Makefile and GitHub workflows | **Host-verified** |
-| Vagrant hardware workflow | Redeploy current image, smoke-check lab, and run isolated E2E | Makefile, vagrant, and E2E tests | **Redeploy fixed; lab validation pending** |
+| Vagrant hardware workflow | Redeploy current image, smoke-check lab, and run isolated E2E | Makefile, vagrant, and E2E tests | **Workflow verified; corrected F25 takeover pending** |
 | Documentation | Canonical docs describe current implementation and release status | docs/content | **Host-verified** |
 
 ## 3. Findings
@@ -134,8 +138,9 @@ Status legend:
 
 ### 5. CSI controller violates multiple CSI 1.5 request contracts
 
-- [ ] **F5 — Medium — Open**
+- [x] **F5 — Medium — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-27):** Controller regressions cover limit-only ranges above and below the default, allocation-unit rounding, both-zero and undersized ranges, exact live and recreated UID-bearing handles, altered volume context, filesystem and storage-parameter mismatches, and empty-node all-attachment unpublish. The complete host CI-equivalent and race suites pass. CSI conformance remains a broader release-quality recommendation rather than a blocker for this finding.
 - **Affected:** internal/csi/controller_server.go:43, internal/csi/controller_attachment.go:109, CSI 1.5 spec CapacityRange and ControllerUnpublishVolume contracts
 - **Expected:** Follow the request semantics in the declared CSI 1.5 dependency.
 - **Actual:**
@@ -204,8 +209,9 @@ Status legend:
 
 ### 10. CSI node publish and unpublish paths are not fail-safe
 
-- [ ] **F10 — Medium — Open**
+- [x] **F10 — Medium — Resolved**
 - **Confidence:** Confirmed
+- **Verification (2026-08-27):** A shared validator now rejects empty, relative, root, non-canonical traversal, trailing-separator, and embedded-null paths before mount, unmount, directory, or NVMe operations. Node stage, publish, unpublish, and unstage regressions cover rejected and accepted paths with injected side-effect counters. The complete host CI-equivalent and race suites pass.
 - **Affected:** internal/csi/node_server.go:290 and :332
 - **Expected:** Every mount and unmount RPC requires a non-root absolute kubelet path before privileged filesystem operations.
 - **Actual:** NodeStageVolume performs this validation, but NodeUnstageVolume, NodePublishVolume, and NodeUnpublishVolume only require nonempty strings. The implementation then calls MkdirAll, mount --bind, or umount directly.
@@ -271,18 +277,8 @@ The following are material risks inferred from code but not fully proven in the 
 
 | Test type | Scenario and input | Expected result | Suggested location |
 |---|---|---|---|
-| Kernel integration | Partial configfs subsystem, missing link/listener/namespace | Repair succeeds or partition remains non-exported | internal/agent/plugins/backend_kernel_test.go |
-| Envtest | Patch active claim serial after binding | Admission rejection; ownership unchanged | Claim controller tests |
-| CSI unit/conformance | Limit-only capacity, fake volume validation, empty-node unpublish | CSI 1.5-compliant responses | CSI controller tests |
-| Reporter/controller integration | One discovery source errors after prior success | Stale device cannot be scheduled | Agent/controller tests |
-| SPDK failure injection | Fail each custom initialization RPC | Process killed and next retry fully initializes | Plugin tests |
-| Configuration | Two volumes request conflicting core masks | Second request rejected observably | Plugin/agent tests |
-| RDMA unit/hardware | Link-local, multicast, IPv6, ACTIVE_DEFER | Only explicitly supported endpoint becomes ready | RDMA tests |
-| CSI privileged path | Root, relative, and traversal-like cleaned paths | InvalidArgument and no mount command | Node request tests |
-| Helm/Make contract | Default image and redeploy dependency | Qualified image and emitted deploy commands | Repository contracts |
+| CSI conformance | Advertised controller and node capability set | CSI 1.5-compliant responses | External conformance suite |
 | E2E fencing | Continue I/O from old node after forced takeover | Old I/O fails before new writer is authorized | F25 E2E |
-| Recovery E2E | Corrupt kernel link/listener while exported | Agent repairs it and preserves attachment | Vagrant kernel E2E |
-| Smoke | Stale or non-ready RDMA object exists | Smoke fails despite object count | Shell or E2E test |
 
 The coverage profile also reports important production functions at 0%, including kernel ExportVolume, UnexportVolume and SetupDevice, SPDK ExportVolume and device reset/transport setup, and several real filesystem-formatting paths.
 
@@ -292,23 +288,15 @@ The coverage profile also reports important production functions at 0%, includin
 
 | Recommendation | Impact | Effort |
 |---|---:|---:|
-| Make kernel export and ACL reconciliation exact and repairable | High | Medium |
-| Make claim serial nonempty and immutable; validate live claim during placement | High | Low–Medium |
-| Correct test-env-redeploy and rerun the isolated hardware suite | High | Low |
-| Replace distort:latest with a qualified versioned release image | High | Low |
-| Correct CSI capacity, validation, and all-node unpublish semantics | High | Medium |
-| Commit tidy output and align GitHub lint with the custom binary | Medium | Low |
+| Complete the corrected F25 isolated-lab takeover gate | High | Low |
+| Publish the first qualified, versioned project image | High | Medium |
 
 ### Near-term hardening
 
 | Recommendation | Impact | Effort |
 |---|---:|---:|
-| Surface degraded discovery and make inventory freshness schedulable state | High | Medium |
-| Make SPDK initialization transactional and core-mask configuration node-global | High | Medium |
-| Strengthen RDMA address, state, and family validation | Medium | Medium |
-| Validate every CSI mount and unmount path consistently | Medium | Low |
 | Add workload health probes and meaningful CSI dependency checks | Medium | Medium |
-| Update architecture and internals to the current five-CRD design | Medium | Low |
+| Add cleanup, target-health, and attachment-revocation metrics | Medium | Medium |
 
 ### Longer-term improvements
 
@@ -323,45 +311,32 @@ The coverage profile also reports important production functions at 0%, includin
 
 ## 7. Verification performed
 
-Successful commands and checks:
-
-- make test-suite passed unit, envtest, contract, vet, manifests/generate/fmt, Helm lint/render, Hugo, custom golangci-lint, and tagged E2E compilation.
-- Reported package coverage was 59.8% for agent, 58.7% for plugins, 71.4% for controllers, and 67.6% for CSI.
-- make test-race passed all non-E2E packages.
-- GOCACHE=/tmp/distort-go-build go build ./cmd/... passed for all three binaries.
-- git diff --check passed.
-- Generated and Helm CRD copies compared equal.
-- helm template rendered successfully and confirmed distort:latest and attachRequired: true.
-- vagrant status from vagrant/ reported all three VMs running.
-- make test-env-status verified the guarded cluster and three Ready Kubernetes nodes, but showed several ErrImageNeverPull workloads and an unhealthy CSI controller.
-- GOCACHE=/tmp/distort-go-build go tool cover -func=cover.out completed with aggregate statement coverage of 52.6%.
-
-Commands that exposed project failures:
-
-- GOCACHE=/tmp/distort-go-build go mod tidy -diff exited 1 because sigs.k8s.io/yaml must become a direct dependency.
-- The stock golangci-lint 2.8.0 binary exited 3 because logcheck was not present.
-- make -n test-env-redeploy exited 0 but performed nothing.
-- The selected F24 contract test failed because its literal version assertion does not accept the architecture guide wording.
-
-Limitations:
-
-- Initial tidy and coverage attempts using the default cache hit the read-only sandbox cache and were rerun with a cache under /tmp.
-- Hardware E2E, destructive lab reset, Docker image build, real SPDK/configfs operations, and CSI conformance were not run.
-- Hardware E2E was not meaningful while the guarded lab workloads were unhealthy and the documented F25 worker-disk problem remained unresolved.
-- No intentional source edits were made during the audit. The test-suite target inherently invokes generation and formatting; the same 41 working-tree entries remained present, but no pre-run byte-level snapshot was available.
+- `make test-ci` passes module-tidy verification, generation and formatting,
+  vet, unit and envtest coverage, repository contracts, Helm lint/render, Hugo,
+  the custom linter, tagged E2E compilation, and the race detector.
+- The latest run reports 61.6% agent, 63.4% plugin, 71.8% controller, and
+  72.1% CSI package coverage.
+- Focused isolated-lab runs verify redeployment of the current image, fresh
+  three-node RDMA/NVMe readiness, kernel target repair, transactional SPDK
+  configuration, and the Batch 2 discovery/identity behavior.
+- The corrected F25 forced-takeover scenario and an external CSI conformance
+  run remain outstanding.
 
 ## 8. Final assessment
 
 | Area | Rating | Rationale |
 |---|---:|---|
-| Functional correctness | **6/10** | Major normal flows are implemented and tested, but kernel recovery, claim mutation, CSI semantics, and deployment defaults contain real defects. |
-| Robustness | **4/10** | Partial configfs state, stale discovery, SPDK initialization failures, and incomplete recovery validation remain fragile. |
-| Error handling | **5/10** | Many failures are surfaced with Conditions and structured logs, but several device errors are suppressed or converted into misleading success. |
-| Test quality | **6/10** | Broad host, race, envtest, Helm, docs, and E2E coverage exists, but critical hardware functions remain untested and some green assertions mask invalid behavior. |
-| Maintainability | **7/10** | Code is reasonably modular with stable identities and structured controllers; stale documentation and node-global configuration reduce clarity. |
-| Production readiness | **3/10** | Default installation is not reproducible, hardware release gates remain incomplete, the current lab cannot run the full suite, and kernel target recovery is not trustworthy. |
+| Functional correctness | **8/10** | Reviewed normal and recovery flows now have focused regressions; the corrected forced-takeover hardware gate remains. |
+| Robustness | **6/10** | Target repair, discovery degradation, SPDK startup, and CSI boundaries are hardened, while cross-leader capacity and broader failure injection remain. |
+| Error handling | **7/10** | Conditions, typed retry behavior, rollback, and fail-safe request validation cover the reviewed defects; some cleanup helpers still suppress errors. |
+| Test quality | **8/10** | Host CI, race, envtest, contracts, and focused hardware scenarios are green; CSI conformance and the final fencing rerun are absent. |
+| Maintainability | **8/10** | Shared validation, stable identities, structured controllers, synchronized manifests, and updated canonical documentation improve clarity. |
+| Production readiness | **5/10** | The reviewed defects are fixed except the fencing gate, but production still needs published artifacts, CSI conformance, probes, and broader operational evidence. |
 
-Overall, the project is suitable for continued development and controlled lab testing, but not for production storage workloads until the High findings, CSI conformance gaps, and hardware recovery and fencing gates are resolved.
+Overall, the project is suitable for continued development and controlled lab
+testing, but not for production storage workloads until the final fencing gate,
+CSI conformance gap, release artifacts, and broader operational hardening are
+completed.
 
 ---
 

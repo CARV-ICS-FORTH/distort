@@ -129,6 +129,6 @@ Consumer-side ownership is also explicit. The chart declares `attachRequired: tr
 
 ## Current capability boundary
 
-DISTORT is under active development. The implemented path includes claimed-device authorization, namespace-safe volume identity, durable single-writer attachment ownership, transactional SPDK startup, exact SPDK and kernel target checks, ext4/XFS detection and formatting, and readiness-aware RDMA and NVMe inventory placement. Important remaining production work includes durable capacity reservation across leadership overlap, complete CSI request semantics, and final hardware recovery and fencing evidence.
+DISTORT is under active development. The implemented path includes claimed-device authorization, namespace-safe volume identity, durable single-writer attachment ownership, transactional SPDK startup, exact SPDK and kernel target checks, ext4/XFS detection and formatting, fail-safe CSI request/path validation, and readiness-aware RDMA and NVMe inventory placement. Important remaining production work includes durable capacity reservation across leadership overlap, CSI conformance, and final hardware recovery and fencing evidence.
 
 For controller-by-controller behavior and recovery details, see [Project Internals](/internals/). For the prioritized defect ledger and release gates, see [Review Findings](/review-findings/).

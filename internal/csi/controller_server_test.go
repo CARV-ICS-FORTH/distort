@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,8 @@ import (
 	"distort/internal/capacity"
 	"distort/internal/volumeidentity"
 )
+
+const testSPDKCoreMask = "0x3"
 
 type immediatelyExportingClient struct {
 	client.Client
@@ -172,7 +175,7 @@ func TestCreateVolumeValidatesRequiredFields(t *testing.T) {
 func TestCreateVolumeCreatesExpectedPartitionAndResponse(t *testing.T) {
 	server, k8sClient := newControllerTestServer(t)
 	req := validCreateRequest("volume-valid", "team-a")
-	req.Parameters["spdk-core-mask"] = "0x3"
+	req.Parameters["spdk-core-mask"] = testSPDKCoreMask
 	req.Parameters["csi.storage.k8s.io/pvc/name"] = "ignored-metadata"
 
 	response, err := server.CreateVolume(context.Background(), req)
@@ -197,7 +200,7 @@ func TestCreateVolumeCreatesExpectedPartitionAndResponse(t *testing.T) {
 	if partition.Spec.TargetBackend != "spdk" || partition.Spec.VolumeManager != "partition" {
 		t.Fatalf("unexpected backend selection: %#v", partition.Spec)
 	}
-	if partition.Spec.TargetOptions["spdk-core-mask"] != "0x3" {
+	if partition.Spec.TargetOptions["spdk-core-mask"] != testSPDKCoreMask {
 		t.Fatalf("backend option was not forwarded: %#v", partition.Spec.TargetOptions)
 	}
 	if partition.Spec.AccessMode != csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER.String() || partition.Spec.Filesystem != "ext4" || len(partition.Spec.RequestFingerprint) != 64 {
@@ -266,6 +269,7 @@ func TestCreateVolumeRejectsInvalidCapacityRanges(t *testing.T) {
 		{name: "zero", required: 0},
 		{name: "negative", required: -1},
 		{name: "negative limit", required: 1, limit: -1},
+		{name: "limit below allocation unit", limit: capacity.AllocationUnitBytes - 1},
 		{name: "required exceeds limit", required: 2 * 1024 * 1024, limit: 1024 * 1024},
 		{name: "rounded allocation exceeds limit", required: 1024*1024 + 1, limit: 1024*1024 + 1},
 		{name: "rounding overflows", required: capacity.MaxAllocatableBytes + 1},
@@ -290,6 +294,9 @@ func TestCreateVolumeDefaultsMissingRangeAndReturnsRoundedCapacity(t *testing.T)
 		{name: "missing range", wantSize: defaultVolumeCapacityBytes},
 		{name: "sub MiB", range_: &csipb.CapacityRange{RequiredBytes: 1, LimitBytes: capacity.AllocationUnitBytes}, wantSize: capacity.AllocationUnitBytes},
 		{name: "one MiB plus one", range_: &csipb.CapacityRange{RequiredBytes: capacity.AllocationUnitBytes + 1}, wantSize: 2 * capacity.AllocationUnitBytes},
+		{name: "limit only below default", range_: &csipb.CapacityRange{LimitBytes: 64 * capacity.AllocationUnitBytes}, wantSize: 64 * capacity.AllocationUnitBytes},
+		{name: "limit only rounds down", range_: &csipb.CapacityRange{LimitBytes: capacity.AllocationUnitBytes + 1}, wantSize: capacity.AllocationUnitBytes},
+		{name: "limit only above default", range_: &csipb.CapacityRange{LimitBytes: 2 * defaultVolumeCapacityBytes}, wantSize: defaultVolumeCapacityBytes},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -316,8 +323,8 @@ func TestCreateVolumeRejectsIncompatibleRetries(t *testing.T) {
 		{name: "limit", mutate: func(req *csipb.CreateVolumeRequest) {
 			req.CapacityRange.LimitBytes = req.CapacityRange.RequiredBytes + 1024*1024
 		}},
-		{name: "backend", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["target-backend"] = "kernel" }},
-		{name: "filesystem", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters[filesystemParameter] = "xfs" }},
+		{name: "backend", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["target-backend"] = kernelTargetBackend }},
+		{name: "filesystem", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters[filesystemParameter] = xfsFilesystem }},
 		{name: "backend option", mutate: func(req *csipb.CreateVolumeRequest) { req.Parameters["spdk-core-mask"] = "0x7" }},
 	}
 
@@ -363,7 +370,7 @@ func TestCreateVolumeRejectsUnsupportedCapabilities(t *testing.T) {
 		server, _ := newControllerTestServer(t)
 		req := validCreateRequest("unsupported-conflicting-capabilities", "default")
 		xfs := mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
-		xfs.GetMount().FsType = "xfs"
+		xfs.GetMount().FsType = xfsFilesystem
 		req.VolumeCapabilities = append(req.VolumeCapabilities, xfs)
 		_, err := server.CreateVolume(context.Background(), req)
 		requireCode(t, err, codes.InvalidArgument)
@@ -371,19 +378,32 @@ func TestCreateVolumeRejectsUnsupportedCapabilities(t *testing.T) {
 }
 
 func TestValidateVolumeCapabilities(t *testing.T) {
-	server, _ := newControllerTestServer(t)
+	server, k8sClient := newControllerTestServer(t)
+	createRequest := validCreateRequest("validated-volume", "team-a")
+	createRequest.Parameters["spdk-core-mask"] = testSPDKCoreMask
+	created, err := server.CreateVolume(context.Background(), createRequest)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
 	valid := mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
-	response, err := server.ValidateVolumeCapabilities(context.Background(), &csipb.ValidateVolumeCapabilitiesRequest{
-		VolumeId:           "volume",
+	validRequest := &csipb.ValidateVolumeCapabilitiesRequest{
+		VolumeId:           created.Volume.VolumeId,
 		VolumeCapabilities: []*csipb.VolumeCapability{valid},
-		VolumeContext:      map[string]string{filesystemParameter: "ext4"},
-	})
+		VolumeContext:      created.Volume.VolumeContext,
+		Parameters:         createRequest.Parameters,
+	}
+	response, err := server.ValidateVolumeCapabilities(context.Background(), validRequest)
 	if err != nil || response.GetConfirmed() == nil {
 		t.Fatalf("ValidateVolumeCapabilities valid response = %#v, error = %v", response, err)
 	}
+	if len(response.GetConfirmed().GetVolumeCapabilities()) != 1 ||
+		!maps.Equal(response.GetConfirmed().GetVolumeContext(), validRequest.VolumeContext) ||
+		!maps.Equal(response.GetConfirmed().GetParameters(), validRequest.Parameters) {
+		t.Fatalf("confirmed request was not echoed: %#v", response.GetConfirmed())
+	}
 
 	response, err = server.ValidateVolumeCapabilities(context.Background(), &csipb.ValidateVolumeCapabilitiesRequest{
-		VolumeId: "volume",
+		VolumeId: created.Volume.VolumeId,
 		VolumeCapabilities: []*csipb.VolumeCapability{
 			valid,
 			blockCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
@@ -394,6 +414,100 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 	}
 	if response.GetConfirmed() != nil || response.GetMessage() == "" {
 		t.Fatalf("unsupported capabilities were confirmed: %#v", response)
+	}
+
+	for name, mutate := range map[string]func(*csipb.ValidateVolumeCapabilitiesRequest){
+		"volume context": func(req *csipb.ValidateVolumeCapabilitiesRequest) {
+			req.VolumeContext = maps.Clone(req.VolumeContext)
+			req.VolumeContext["portalIP"] = "192.0.2.11"
+		},
+		"filesystem capability": func(req *csipb.ValidateVolumeCapabilitiesRequest) {
+			req.VolumeCapabilities = []*csipb.VolumeCapability{mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)}
+			req.VolumeCapabilities[0].GetMount().FsType = xfsFilesystem
+			req.VolumeContext = nil
+			req.Parameters = nil
+		},
+		"backend parameters": func(req *csipb.ValidateVolumeCapabilitiesRequest) {
+			req.Parameters = maps.Clone(req.Parameters)
+			req.Parameters["target-backend"] = kernelTargetBackend
+		},
+		"backend options": func(req *csipb.ValidateVolumeCapabilitiesRequest) {
+			req.Parameters = maps.Clone(req.Parameters)
+			req.Parameters["spdk-core-mask"] = "0x7"
+		},
+		"namespace parameter": func(req *csipb.ValidateVolumeCapabilitiesRequest) {
+			req.Parameters = maps.Clone(req.Parameters)
+			req.Parameters["csi.storage.k8s.io/pvc/namespace"] = "team-b"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := &csipb.ValidateVolumeCapabilitiesRequest{
+				VolumeId:           validRequest.VolumeId,
+				VolumeCapabilities: validRequest.VolumeCapabilities,
+				VolumeContext:      validRequest.VolumeContext,
+				Parameters:         validRequest.Parameters,
+			}
+			mutate(request)
+			response, err := server.ValidateVolumeCapabilities(context.Background(), request)
+			if err != nil {
+				t.Fatalf("ValidateVolumeCapabilities returned RPC error: %v", err)
+			}
+			if response.GetConfirmed() != nil || response.GetMessage() == "" {
+				t.Fatalf("mismatched request was confirmed: %#v", response)
+			}
+		})
+	}
+
+	_, err = server.ValidateVolumeCapabilities(context.Background(), &csipb.ValidateVolumeCapabilitiesRequest{
+		VolumeId:           "not-a-volume-handle",
+		VolumeCapabilities: []*csipb.VolumeCapability{valid},
+	})
+	requireCode(t, err, codes.NotFound)
+
+	reference, err := volumeidentity.ParseVolumeHandle(created.Volume.VolumeId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partition storagev1alpha1.NVMePartition
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: reference.Namespace, Name: reference.Name}, &partition); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8sClient.Delete(context.Background(), &partition); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CreateVolume(context.Background(), validCreateRequest("validated-volume", "team-a")); err != nil {
+		t.Fatalf("recreate volume: %v", err)
+	}
+	_, err = server.ValidateVolumeCapabilities(context.Background(), validRequest)
+	requireCode(t, err, codes.NotFound)
+}
+
+func TestControllerUnpublishWithEmptyNodeDetachesVolume(t *testing.T) {
+	server, k8sClient := newControllerTestServer(t)
+	created, err := server.CreateVolume(context.Background(), validCreateRequest("detach-all", "team-a"))
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if _, err := server.ControllerPublishVolume(context.Background(), &csipb.ControllerPublishVolumeRequest{
+		VolumeId: created.Volume.VolumeId, NodeId: "consumer-a",
+		VolumeCapability: mountCapability(csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		VolumeContext:    created.Volume.VolumeContext,
+	}); err != nil {
+		t.Fatalf("ControllerPublishVolume: %v", err)
+	}
+	reference, err := volumeidentity.ParseVolumeHandle(created.Volume.VolumeId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: attachmentidentity.Name(reference.UID)}
+	if _, err := server.ControllerUnpublishVolume(context.Background(), &csipb.ControllerUnpublishVolumeRequest{
+		VolumeId: created.Volume.VolumeId,
+	}); err != nil {
+		t.Fatalf("ControllerUnpublishVolume: %v", err)
+	}
+	var attachment storagev1alpha1.NVMeVolumeAttachment
+	if err := k8sClient.Get(context.Background(), key, &attachment); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment still exists after all-node unpublish: %v", err)
 	}
 }
 
@@ -634,7 +748,7 @@ func TestCreateVolumeRejectsUnimplementedManagers(t *testing.T) {
 		manager string
 	}{
 		{name: "lvm manager", backend: "spdk", manager: "lvm"},
-		{name: "unknown manager", backend: "kernel", manager: "zfs"},
+		{name: "unknown manager", backend: kernelTargetBackend, manager: "zfs"},
 		{name: "unknown backend", backend: "userspace", manager: "partition"},
 	}
 	for _, tt := range tests {

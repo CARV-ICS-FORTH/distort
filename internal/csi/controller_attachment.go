@@ -107,8 +107,8 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 }
 
 func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csipb.ControllerUnpublishVolumeRequest) (*csipb.ControllerUnpublishVolumeResponse, error) {
-	if req.GetVolumeId() == "" || req.GetNodeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID and node ID must be provided")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID must be provided")
 	}
 	partition, err := cs.partitionForVolumeHandle(ctx, req.GetVolumeId())
 	if status.Code(err) == codes.NotFound {
@@ -125,7 +125,7 @@ func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 		}
 		return nil, status.Errorf(codes.Internal, "Failed to get volume attachment: %v", err)
 	}
-	if existing.Spec.NodeID != req.GetNodeId() {
+	if req.GetNodeId() != "" && existing.Spec.NodeID != req.GetNodeId() {
 		return &csipb.ControllerUnpublishVolumeResponse{}, nil
 	}
 	if err := cs.k8sClient.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {

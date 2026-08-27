@@ -343,12 +343,15 @@ The kubelet and sidecars use this to identify and validate the driver.
 
 ### 3.4 CSI Controller service
 
-The Controller service runs in the CSI controller Deployment. In DISTORT, its main methods are `CreateVolume` and `DeleteVolume`.
+The Controller service runs in the CSI controller Deployment. DISTORT implements
+`CreateVolume`, `DeleteVolume`, `ValidateVolumeCapabilities`,
+`ControllerPublishVolume`, and `ControllerUnpublishVolume`.
 
 `CreateVolume`:
 
 1. validates the CSI request;
-2. reads capacity and StorageClass parameters;
+2. reads capacity and StorageClass parameters, accepting either a required
+   capacity or a limit-only range;
 3. creates an `NVMePartition`;
 4. waits for its status to become `Exported`;
 5. returns a CSI volume containing the NQN, portal IP, and portal port in `VolumeContext`.
@@ -356,6 +359,11 @@ The Controller service runs in the CSI controller Deployment. In DISTORT, its ma
 The method currently polls the `NVMePartition` every five seconds with a two-minute internal timeout.
 
 `CreateVolume` must be idempotent because the external provisioner may repeat it with the same name. The code handles `AlreadyExists` by fetching the existing partition and checking at least its target backend before continuing.
+
+`ValidateVolumeCapabilities` resolves the exact namespace/name/UID-bearing
+volume handle before confirming it. When supplied, volume context and creation
+parameters must match the persisted partition configuration. A missing or
+recreated volume returns `NotFound`.
 
 `DeleteVolume` finds the `NVMePartition` by volume ID and requests its deletion. The agent finalizer performs actual target and volume cleanup. The current CSI method returns without waiting for finalizer completion.
 
@@ -410,6 +418,11 @@ Unstaging:
 2. disconnects the NVMe-oF controller by NQN.
 
 Staging and publishing are separate because a volume can be prepared once on a node and then made available to a workload path. This separation is required by the CSI capability that DISTORT advertises.
+
+Every staging, publishing, unpublishing, and unstaging path is validated before
+filesystem or NVMe side effects. Paths must be absolute, non-root, and already
+in canonical lexical form; relative, traversal-like, trailing-separator, and
+embedded-null inputs are rejected with `InvalidArgument`.
 
 ### 3.7 The node-driver-registrar sidecar
 
