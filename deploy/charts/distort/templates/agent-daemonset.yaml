@@ -23,7 +23,7 @@ spec:
       initContainers:
         - name: load-modules
           image: busybox:1.36
-          command: ["chroot", "/host", "sh", "-c", "modprobe vfio-pci uio_pci_generic nvme-tcp nvme-rdma nvme-fabrics nvme-core || true"]
+          command: ["chroot", "/host", "sh", "-c", "modprobe -a vfio-pci uio_pci_generic nvme-tcp nvme-rdma nvme-fabrics nvme-core ib_ipoib || true"]
           securityContext:
             privileged: true
           volumeMounts:

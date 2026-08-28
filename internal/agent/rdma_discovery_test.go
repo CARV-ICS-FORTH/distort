@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	storagev1alpha1 "distort/api/v1alpha1"
@@ -12,10 +13,15 @@ import (
 
 const testRDMAIPv4 = "192.0.2.10"
 
-func setupRDMAFixture(t *testing.T, state, linkLayer string) {
+func setupRDMAFixture(t *testing.T, state, linkLayer string) string {
 	t.Helper()
-	oldRoot, oldLookup := sysClassInfiniBand, lookupInterfaceAddress
-	sysClassInfiniBand = t.TempDir()
+	oldRoot, oldNetRoot, oldLookup := sysClassInfiniBand, sysClassNet, lookupInterfaceAddress
+	fixtureRoot := t.TempDir()
+	sysClassInfiniBand = filepath.Join(fixtureRoot, "infiniband")
+	sysClassNet = filepath.Join(fixtureRoot, "net")
+	if err := os.MkdirAll(sysClassNet, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	lookupInterfaceAddress = func(name string) (string, error) {
 		if name != "rdma0" {
 			return "", errors.New("unexpected interface")
@@ -24,6 +30,7 @@ func setupRDMAFixture(t *testing.T, state, linkLayer string) {
 	}
 	t.Cleanup(func() {
 		sysClassInfiniBand = oldRoot
+		sysClassNet = oldNetRoot
 		lookupInterfaceAddress = oldLookup
 	})
 	port := filepath.Join(sysClassInfiniBand, "rxe0", "ports", "1")
@@ -31,6 +38,7 @@ func setupRDMAFixture(t *testing.T, state, linkLayer string) {
 	writeDiscoveryFile(t, filepath.Join(port, "link_layer"), linkLayer)
 	writeDiscoveryFile(t, filepath.Join(port, "rate"), "100 Gb/sec\n")
 	writeDiscoveryFile(t, filepath.Join(port, "gid_attrs", "ndevs", "0"), "rdma0\n")
+	return port
 }
 
 func TestDiscoverRDMAEndpointFindsActiveRoCEInterface(t *testing.T) {
@@ -42,6 +50,68 @@ func TestDiscoverRDMAEndpointFindsActiveRoCEInterface(t *testing.T) {
 	if endpoint.Interface != "rdma0" || endpoint.IP != testRDMAIPv4 ||
 		endpoint.Transport != storagev1alpha1.RDMATransportRoCEv2 || endpoint.LinkSpeed != "100 Gb/sec" {
 		t.Fatalf("unexpected RDMA endpoint: %#v", endpoint)
+	}
+}
+
+func TestDiscoverRDMAEndpointFindsNativeInfiniBandIPoIBInterface(t *testing.T) {
+	port := setupRDMAFixture(t, "4: ACTIVE\n", "InfiniBand\n")
+	if err := os.RemoveAll(filepath.Join(port, "gid_attrs", "ndevs")); err != nil {
+		t.Fatal(err)
+	}
+
+	devicePath := filepath.Join(t.TempDir(), "devices", "0000:43:00.0")
+	if err := os.MkdirAll(devicePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(devicePath, filepath.Join(sysClassInfiniBand, "rxe0", "device")); err != nil {
+		t.Fatal(err)
+	}
+
+	interfaceRoot := filepath.Join(sysClassNet, "ibs2")
+	writeDiscoveryFile(t, filepath.Join(interfaceRoot, "type"), "32\n")
+	writeDiscoveryFile(t, filepath.Join(interfaceRoot, "dev_port"), "0\n")
+	if err := os.Symlink(devicePath, filepath.Join(interfaceRoot, "device")); err != nil {
+		t.Fatal(err)
+	}
+	lookupInterfaceAddress = func(name string) (string, error) {
+		if name != "ibs2" {
+			return "", errors.New("unexpected interface")
+		}
+		return "192.168.5.94", nil
+	}
+
+	endpoint, err := DiscoverRDMAEndpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint.Interface != "ibs2" || endpoint.IP != "192.168.5.94" ||
+		endpoint.Transport != storagev1alpha1.RDMATransportInfiniBand || endpoint.LinkSpeed != "100 Gb/sec" {
+		t.Fatalf("unexpected RDMA endpoint: %#v", endpoint)
+	}
+}
+
+func TestDiscoverRDMAEndpointDoesNotUseIPoIBInterfaceFromAnotherPort(t *testing.T) {
+	port := setupRDMAFixture(t, "4: ACTIVE\n", "InfiniBand\n")
+	if err := os.Remove(filepath.Join(port, "gid_attrs", "ndevs", "0")); err != nil {
+		t.Fatal(err)
+	}
+
+	devicePath := filepath.Join(t.TempDir(), "devices", "0000:43:00.0")
+	if err := os.MkdirAll(devicePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(devicePath, filepath.Join(sysClassInfiniBand, "rxe0", "device")); err != nil {
+		t.Fatal(err)
+	}
+	interfaceRoot := filepath.Join(sysClassNet, "ibs2")
+	writeDiscoveryFile(t, filepath.Join(interfaceRoot, "type"), "32\n")
+	writeDiscoveryFile(t, filepath.Join(interfaceRoot, "dev_port"), "1\n")
+	if err := os.Symlink(devicePath, filepath.Join(interfaceRoot, "device")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := DiscoverRDMAEndpoint(); err == nil || !strings.Contains(err.Error(), "no IPoIB interface matches") {
+		t.Fatalf("different-port IPoIB discovery error = %v", err)
 	}
 }
 

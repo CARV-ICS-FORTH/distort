@@ -62,8 +62,17 @@ InfiniBand interface, selects a routable unicast address, and refreshes the node
 heartbeat. IPv4 is preferred when both address families are configured; a
 global IPv6 address is a supported fallback. Loopback, unspecified, multicast,
 and link-local addresses are rejected. DISTORT does not advertise an NVMe/TCP
-fallback because its current target and CSI data path is RDMA-only. Inspect the
-published endpoint and readiness with:
+fallback because its current target and CSI data path is RDMA-only.
+
+Native InfiniBand nodes must have an IPoIB interface, such as `ib0` or `ibs2`,
+configured with an address reachable from every NVMe/RDMA initiator. The agent
+matches that interface to the active InfiniBand device and port through its
+network type, PCI parent, and port index. This also supports drivers where the
+InfiniBand `gid_attrs/ndevs` files do not expose the associated IPoIB interface.
+The agent loads the `ib_ipoib` module when available, but host networking must
+still configure the interface address and route persistently.
+
+Inspect the published endpoint and readiness with:
 
 ```bash
 kubectl get rdmastoragenodes
@@ -203,6 +212,13 @@ The chart exposes resource controls for installations with a deliberately sized 
 | `agent.spdk.skipHugepageSetup` | `false` | Preserve a hugepage reservation managed by the host instead of allowing SPDK setup to replace it. |
 
 Leaving the values unset preserves upstream SPDK behavior. Size them from measured workload concurrency and the node's hugepage reservation; the small values used by the local lab are functional-test settings, not universal production recommendations. The agent validates paired iobuf settings and positive numeric values before starting SPDK.
+
+The chart reserves two CPUs for the agent and deliberately leaves its CPU
+limit unset. `nvmf_tgt` uses polling reactors, so a CFS quota can throttle the
+target even when the node has otherwise-idle CPUs and can substantially reduce
+IOPS. Keep the CPU request at least as large as the number of CPUs selected by
+`spdk-core-mask`; if you set a CPU limit explicitly, it must also cover the
+polling reactors and the agent's control-plane work.
 
 The SPDK target is one shared node process. Consequently, every SPDK-backed
 StorageClass used on the same node must request the same `spdk-core-mask`.
