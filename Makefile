@@ -141,8 +141,9 @@ test-env-image: ## Build the lab image with constrained SPDK and Go parallelism.
 
 .PHONY: get-kubeconfig
 get-kubeconfig:
-	cd vagrant && vagrant ssh distort-master -c "sudo cat /etc/rancher/k3s/k3s.yaml" | sed "s/127.0.0.1/192.168.56.10/g" > "$(LOCAL_KUBECONFIG).tmp"
+	cd vagrant && vagrant ssh distort-master -c "sudo cat /etc/rancher/k3s/k3s.yaml" | tr -d '\r' | sed -n '/^apiVersion: v1$$/,$$p' | sed "s/127.0.0.1/192.168.56.10/g" > "$(LOCAL_KUBECONFIG).tmp"
 	@test -s "$(LOCAL_KUBECONFIG).tmp" || { echo "ERROR: fetched kubeconfig is empty"; exit 1; }
+	@$(KUBECTL) --kubeconfig "$(LOCAL_KUBECONFIG).tmp" config view --minify >/dev/null || { rm -f "$(LOCAL_KUBECONFIG).tmp"; echo "ERROR: fetched kubeconfig is invalid; existing kubeconfig was preserved"; exit 1; }
 	mv "$(LOCAL_KUBECONFIG).tmp" "$(LOCAL_KUBECONFIG)"
 	chmod 600 "$(LOCAL_KUBECONFIG)"
 
@@ -180,7 +181,7 @@ test-env-deploy: test-env-guard manifests ## Build/load the image and Helm-upgra
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) apply -f config/crd/bases/
 	# CSIDriver.spec.attachRequired is immutable; recreate the isolated lab registration when upgrading fencing behavior.
 	-KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) delete csidriver storage.distort.io --ignore-not-found --wait=true --timeout=60s
-	KUBECONFIG="$(LOCAL_KUBECONFIG)" helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --set image.pullPolicy=Never --set-string image.repository="$(TEST_ENV_IMAGE_REPOSITORY)" --set-string image.tag="$(TEST_ENV_IMAGE_TAG)" --set-string agent.spdk.iobufSmallPoolCount=4096 --set-string agent.spdk.iobufLargePoolCount=256 --set-string agent.spdk.maxSrqDepth=128 --set agent.spdk.skipHugepageSetup=true --set-string agent.resources.requests.memory=256Mi --set-string agent.resources.limits.memory=512Mi --set-string agent.resources.requests.hugepages-2Mi=256Mi --set-string agent.resources.limits.hugepages-2Mi=256Mi
+	KUBECONFIG="$(LOCAL_KUBECONFIG)" helm upgrade --install distort ./deploy/charts/distort --namespace distort-system --create-namespace --values vagrant/helm-values.yaml --set image.pullPolicy=Never --set-string image.repository="$(TEST_ENV_IMAGE_REPOSITORY)" --set-string image.tag="$(TEST_ENV_IMAGE_TAG)"
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system deployment/distort-manager deployment/distort-csi-controller
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout restart -n distort-system daemonset/distort-agent daemonset/distort-csi-node
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system deployment/distort-manager --timeout=180s

@@ -72,15 +72,4 @@ spec:
           hostPath:
             path: /var/lib/kubelet
             type: DirectoryOrCreate
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "distort.scheduling" (list . .Values.csiNode) | nindent 6 }}

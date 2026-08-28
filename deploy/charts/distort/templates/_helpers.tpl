@@ -108,3 +108,24 @@ Create a component-specific service account name.
 {{- define "distort.serviceAccountName" -}}
 {{- include "distort.managerServiceAccountName" . }}
 {{- end }}
+
+{{/*
+Render component scheduling. Non-empty component values override the legacy
+global values so existing installations retain their current placement.
+*/}}
+{{- define "distort.scheduling" -}}
+{{- $root := index . 0 -}}
+{{- $component := index . 1 -}}
+{{- with (default $root.Values.nodeSelector $component.nodeSelector) }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with (default $root.Values.affinity $component.affinity) }}
+affinity:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with (default $root.Values.tolerations $component.tolerations) }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

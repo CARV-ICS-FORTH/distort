@@ -26,6 +26,9 @@ first-time target builds the image while the VMs are stopped and caps SPDK and
 Go build parallelism to avoid competing with the IDE. The lab deployment also
 uses smaller SPDK iobuf pools and a bounded RDMA shared receive queue that fit
 its 256 MiB hugepage reservation; production Helm defaults are unchanged. The
+lab values in `vagrant/helm-values.yaml` request one CPU for the agent, leaving
+headroom for CSI and system Pods on each two-vCPU VM. The agent has no CPU limit,
+so SPDK can still use otherwise-idle lab CPU without CFS quota throttling. The
 same controls are available to production installations that prefer predictable
 DMA-memory use over maximum queue capacity. Because Vagrant provisions the host
 hugepages, the lab also tells SPDK setup not to replace that reservation with

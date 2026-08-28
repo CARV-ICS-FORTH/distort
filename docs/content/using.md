@@ -8,6 +8,38 @@ Once DISTORT is deployed, it seamlessly integrates with standard Kubernetes stor
 
 ---
 
+## Schedule storage providers and consumers
+
+Storage providers and workload consumers do not need to be the same nodes. Use
+the component scheduling values to keep the privileged agent on NVMe/RDMA nodes
+while installing the CSI node service wherever application Pods may consume a
+DISTORT volume:
+
+```yaml
+agent:
+  nodeSelector:
+    distort.io/storage-provider: "true"
+
+csiNode:
+  nodeSelector:
+    distort.io/storage-consumer: "true"
+
+manager:
+  nodeSelector:
+    kubernetes.io/os: linux
+
+csiController:
+  nodeSelector:
+    kubernetes.io/os: linux
+```
+
+Each component also has independent `tolerations` and `affinity` values. The
+CSI node selector must include every node on which a consuming Pod may run. The
+legacy top-level `nodeSelector`, `tolerations`, and `affinity` values remain as
+backward-compatible fallbacks; a non-empty component value takes precedence.
+
+---
+
 ## Hardware Discovery & Device Allocation
 
 By design, DISTORT decouples **physical drive discovery** from **workload allocation**. This ensures that administrators have full, declarative control over which physical devices are consumed by the storage engine.

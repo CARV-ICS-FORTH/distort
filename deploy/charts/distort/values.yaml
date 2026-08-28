@@ -21,6 +21,9 @@ manager:
     requests:
       cpu: 10m
       memory: 64Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 agent:
   spdk:
@@ -44,6 +47,10 @@ agent:
       cpu: "2"
       memory: 1Gi
       hugepages-2Mi: 1Gi
+  # Schedule the privileged storage agent only on NVMe/RDMA provider nodes.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 csi:
   resources:
@@ -53,6 +60,17 @@ csi:
     requests:
       cpu: 10m
       memory: 64Mi
+
+csiController:
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+csiNode:
+  # Select every node on which application Pods may consume DISTORT volumes.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 serviceAccount:
   # Specifies whether component service accounts should be created.
@@ -71,8 +89,8 @@ rbac:
   # Specifies whether RBAC resources should be created
   create: true
 
+# Deprecated scheduling fallback retained for existing installations. A
+# non-empty component-specific value above takes precedence.
 nodeSelector: {}
-
 tolerations: []
-
 affinity: {}

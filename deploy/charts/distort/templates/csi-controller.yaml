@@ -63,3 +63,4 @@ spec:
       volumes:
         - name: socket-dir
           emptyDir: {}
+      {{- include "distort.scheduling" (list . .Values.csiController) | nindent 6 }}

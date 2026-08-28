@@ -11,7 +11,6 @@ repo: distort
 resources:
 - api:
     crdVersion: v1
-    namespaced: true
   controller: true
   domain: distort.io
   group: storage
@@ -38,7 +37,6 @@ resources:
   version: v1alpha1
 - api:
     crdVersion: v1
-    namespaced: true
   controller: true
   domain: distort.io
   group: storage
