@@ -115,7 +115,7 @@ var _ = Describe("NVMeDevice capacity reconciliation", func() {
 
 		actual, err := reconcileDevice()
 		Expect(err).NotTo(HaveOccurred())
-		want := resource.MustParse("10735321088") // 10 GiB - 2 MiB
+		want := resource.MustParse("10733223936") // 10 GiB - 4 MiB
 		Expect(actual.Status.FreeCapacity.Cmp(want)).To(Equal(0))
 	})
 

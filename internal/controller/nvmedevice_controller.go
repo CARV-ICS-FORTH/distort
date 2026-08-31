@@ -64,6 +64,7 @@ type NVMeDeviceReconciler struct {
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedevices/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedevices/finalizers,verbs=update
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmepartitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile recalculates FreeCapacity on the NVMeDevice by deducting assigned NVMePartitions.
 func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

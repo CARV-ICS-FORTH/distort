@@ -85,7 +85,10 @@ spec:
                 anyOf:
                 - type: integer
                 - type: string
-                description: TotalCapacity is the total raw size of the device.
+                description: |-
+                  TotalCapacity is the allocatable capacity of namespace ID 1 after reserving
+                  backend metadata space. DISTORT manages this namespace consistently under
+                  kernel and SPDK; other namespaces are not advertised or modified.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
                 x-kubernetes-validations:

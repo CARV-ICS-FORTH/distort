@@ -5,7 +5,11 @@ import (
 	"math"
 )
 
-const AllocationUnitBytes int64 = 1024 * 1024
+// AllocationUnitBytes matches SPDK's default lvol cluster size. Keeping the
+// control plane on this boundary prevents SPDK from silently allocating more
+// capacity than the manager reserved, without reducing the backend's native
+// cluster size.
+const AllocationUnitBytes int64 = 4 * 1024 * 1024
 
 // MaxAllocatableBytes is the largest positive int64 that can be represented as
 // a whole allocation unit without overflowing during upward rounding.

@@ -140,9 +140,9 @@ spec:
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
                 x-kubernetes-validations:
-                - message: size must be positive and safely roundable to a 1 MiB allocation
+                - message: size must be positive and safely roundable to a 4 MiB allocation
                     unit
-                  rule: quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036853727232'))
+                  rule: quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036850581504'))
                     <= 0
                 - message: size is immutable
                   rule: self == oldSelf

@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+const testNamespaceBlocks = int64(2 * 1024 * 1024)
 
 func writeDiscoveryFile(t *testing.T, path, value string) {
 	t.Helper()
@@ -35,7 +38,7 @@ func setupDiscoveryFixture(t *testing.T) string {
 	if err := os.Symlink("../../../devices/pci0000:00/0000:01:00.0", filepath.Join(controller, "device")); err != nil {
 		t.Fatal(err)
 	}
-	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n1", "size"), "4096\n")
+	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n1", "size"), "2097152\n")
 
 	fakeBin := t.TempDir()
 	lsblk := filepath.Join(fakeBin, "lsblk")
@@ -65,8 +68,73 @@ func TestDiscoverKernelNVMeReadsHardwareAndCapacity(t *testing.T) {
 	if device.PCIAddress != pciAddress || device.SerialNumber != "SERIAL-1" || device.Model != "Virtual NVMe" || device.NUMANode != 2 {
 		t.Fatalf("unexpected discovered metadata: %#v", device)
 	}
-	if device.TotalBytes != 4096*512 {
-		t.Fatalf("TotalBytes = %d, want %d", device.TotalBytes, 4096*512)
+	wantCapacity := int64(1012 * 1024 * 1024)
+	if device.TotalBytes != wantCapacity {
+		t.Fatalf("TotalBytes = %d, want %d", device.TotalBytes, wantCapacity)
+	}
+}
+
+func spdkNamespaceBdev(name string, nsid, numBlocks int64) SpdkBdev {
+	return SpdkBdev{
+		Name: name, NumBlocks: numBlocks, BlockSize: 512,
+		DriverSpecific: &spdkDriverSpecific{NVMe: []spdkNVMeNamespace{{
+			PCIAddress: "0000:01:00.0", NSData: spdkNVMeNamespaceData{ID: nsid},
+			CtrlrData: spdkNVMeControllerData{ModelNumber: "Virtual NVMe", SerialNumber: "SERIAL-1"},
+		}}},
+	}
+}
+
+func TestMultiNamespaceCapacityIsStableAcrossKernelAndSPDK(t *testing.T) {
+	setupDiscoveryFixture(t)
+	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n2", "size"), "4194304\n")
+
+	kernelDevices, err := discoverKernelNVMe()
+	if err != nil || len(kernelDevices) != 1 {
+		t.Fatalf("kernel discovery returned devices=%#v err=%v", kernelDevices, err)
+	}
+	spdkDevices, err := hardwareFromSPDKBdevs([]SpdkBdev{
+		spdkNamespaceBdev("Nvme0n2", 2, 2*testNamespaceBlocks),
+		spdkNamespaceBdev("Nvme0n1", 1, testNamespaceBlocks),
+	}, discoveryPolicy{})
+	if err != nil || len(spdkDevices) != 1 {
+		t.Fatalf("SPDK discovery returned devices=%#v err=%v", spdkDevices, err)
+	}
+
+	kernel, spdk := kernelDevices[0], spdkDevices[0]
+	if kernel.TotalBytes != 1012*1024*1024 || spdk.TotalBytes != kernel.TotalBytes {
+		t.Fatalf("managed capacity changed across backends: kernel=%d SPDK=%d", kernel.TotalBytes, spdk.TotalBytes)
+	}
+	if kernel.SerialNumber != spdk.SerialNumber || kernel.PCIAddress != spdk.PCIAddress {
+		t.Fatalf("managed identity changed across backends: kernel=%#v SPDK=%#v", kernel, spdk)
+	}
+	if spdk.Name != "Nvme0n1" {
+		t.Fatalf("SPDK selected bdev %q, want namespace 1", spdk.Name)
+	}
+}
+
+func TestDiscoveryRejectsMissingPrimaryNamespaceAndUnsafeCapacity(t *testing.T) {
+	setupDiscoveryFixture(t)
+	if err := os.RemoveAll(filepath.Join(sysClassBlock, "nvme0n1")); err != nil {
+		t.Fatal(err)
+	}
+	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n2", "size"), "4096\n")
+	if devices, err := discoverKernelNVMe(); err == nil || len(devices) != 0 {
+		t.Fatalf("kernel discovery without namespace 1 returned devices=%#v err=%v", devices, err)
+	}
+
+	missingNSID := spdkNamespaceBdev("Nvme0n1", 0, 4096)
+	if devices, err := hardwareFromSPDKBdevs([]SpdkBdev{missingNSID}, discoveryPolicy{}); err == nil || len(devices) != 0 {
+		t.Fatalf("SPDK discovery without NSID returned devices=%#v err=%v", devices, err)
+	}
+
+	overflow := spdkNamespaceBdev("Nvme0n1", 1, math.MaxInt64)
+	if devices, err := hardwareFromSPDKBdevs([]SpdkBdev{overflow}, discoveryPolicy{}); err == nil || len(devices) != 0 {
+		t.Fatalf("overflowing SPDK capacity returned devices=%#v err=%v", devices, err)
+	}
+
+	tooSmall := spdkNamespaceBdev("Nvme0n1", 1, 1)
+	if devices, err := hardwareFromSPDKBdevs([]SpdkBdev{tooSmall}, discoveryPolicy{}); err == nil || len(devices) != 0 {
+		t.Fatalf("sub-allocation-unit SPDK capacity returned devices=%#v err=%v", devices, err)
 	}
 }
 

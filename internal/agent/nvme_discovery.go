@@ -3,6 +3,7 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"distort/internal/agent/plugins"
+	"distort/internal/capacity"
 )
 
 // HardwareNVMe represents a discovered physical NVMe namespace mapped into SPDK or Kernel.
@@ -75,7 +77,11 @@ func validateHardwareNVMe(device HardwareNVMe) error {
 var sysClassNVMe = "/sys/class/nvme"
 var sysClassBlock = "/sys/class/block"
 
-const unsafeMountInspectionEnv = "NVME_ALLOW_UNSAFE_MOUNT_INSPECTION"
+const (
+	unsafeMountInspectionEnv = "NVME_ALLOW_UNSAFE_MOUNT_INSPECTION"
+	primaryNamespaceID       = int64(1)
+	managedCapacityPercent   = int64(99)
+)
 
 var pciAddressPattern = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$`)
 
@@ -252,8 +258,9 @@ func discoverKernelNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error
 			continue
 		}
 
-		// Calculate total bytes from matching namespace blocks
-		hwDev.TotalBytes, err = calculateTotalBytes(devName)
+		// DISTORT manages namespace 1 under both kernel and SPDK backends.
+		// Advertising only that namespace keeps capacity stable across rebinding.
+		hwDev.TotalBytes, err = calculatePrimaryNamespaceBytes(devName)
 		if err != nil {
 			discoveryErrors = append(discoveryErrors, fmt.Errorf("calculate capacity for %s: %w", devName, err))
 			continue
@@ -297,54 +304,76 @@ func inspectDeviceMounts(devName string) (bool, error) {
 	return false, nil
 }
 
-func calculateTotalBytes(nvmeName string) (int64, error) {
-	var total int64
-	entries, err := os.ReadDir(sysClassBlock)
+func checkedCapacityBytes(name string, numBlocks, blockSize int64) (int64, error) {
+	if numBlocks <= 0 || blockSize <= 0 {
+		return 0, fmt.Errorf("%s has invalid capacity metadata: %d blocks of %d bytes", name, numBlocks, blockSize)
+	}
+	if numBlocks > math.MaxInt64/blockSize {
+		return 0, fmt.Errorf("%s capacity overflows int64", name)
+	}
+	return numBlocks * blockSize, nil
+}
+
+func allocatableNamespaceBytes(name string, rawBytes int64) (int64, error) {
+	if rawBytes <= 0 {
+		return 0, fmt.Errorf("%s has invalid raw capacity %d", name, rawBytes)
+	}
+	// Reserve one percent for the GPT boundaries or SPDK blobstore metadata,
+	// then expose only whole allocation units. SPDK's pinned default metadata
+	// ratio is below one percent; the explicit margin keeps pre-transition
+	// placement conservative if those internals change.
+	usableBytes := rawBytes/100*managedCapacityPercent +
+		rawBytes%100*managedCapacityPercent/100
+	usableBytes = usableBytes / capacity.AllocationUnitBytes * capacity.AllocationUnitBytes
+	if usableBytes <= 0 {
+		return 0, fmt.Errorf("%s has no allocatable capacity after metadata reservation", name)
+	}
+	return usableBytes, nil
+}
+
+func calculatePrimaryNamespaceBytes(nvmeName string) (int64, error) {
+	namespaceName := fmt.Sprintf("%sn%d", nvmeName, primaryNamespaceID)
+	b, err := os.ReadFile(filepath.Join(sysClassBlock, namespaceName, "size"))
 	if err != nil {
 		return 0, err
 	}
-
-	for _, entry := range entries {
-		bName := entry.Name()
-		if strings.HasPrefix(bName, nvmeName+"n") {
-			sizePath := filepath.Join(sysClassBlock, bName, "size")
-			b, err := os.ReadFile(sizePath)
-			if err != nil {
-				return 0, err
-			}
-			blocks, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-			if err != nil {
-				return 0, err
-			}
-			total += blocks * 512
-		}
+	blocks, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0, err
 	}
-	return total, nil
+	rawBytes, err := checkedCapacityBytes(namespaceName, blocks, 512)
+	if err != nil {
+		return 0, err
+	}
+	return allocatableNamespaceBytes(namespaceName, rawBytes)
+}
+
+type spdkNVMeControllerData struct {
+	ModelNumber  string `json:"model_number"`
+	SerialNumber string `json:"serial_number"`
+}
+
+type spdkNVMeNamespaceData struct {
+	ID int64 `json:"id"`
+}
+
+type spdkNVMeNamespace struct {
+	PCIAddress string                 `json:"pci_address"`
+	CtrlrData  spdkNVMeControllerData `json:"ctrlr_data"`
+	NSData     spdkNVMeNamespaceData  `json:"ns_data"`
+}
+
+type spdkDriverSpecific struct {
+	NVMe []spdkNVMeNamespace `json:"nvme"`
 }
 
 type SpdkBdev struct {
-	Name           string `json:"name"`
-	ProductName    string `json:"product_name"`
-	BlockSize      int64  `json:"block_size"`
-	NumBlocks      int64  `json:"num_blocks"`
-	UUID           string `json:"uuid"`
-	DriverSpecific *struct {
-		NVMe []struct {
-			PCIAddress string `json:"pci_address"`
-			CtrlrData  struct {
-				ModelNumber  string `json:"model_number"`
-				SerialNumber string `json:"serial_number"`
-			} `json:"ctrlr_data"`
-		} `json:"nvme"`
-	} `json:"driver_specific"`
-}
-
-type SpdkNVMeController struct {
-	Name  string `json:"name"`
-	Ctrlr struct {
-		Model        string `json:"model"`
-		SerialNumber string `json:"serial_number"`
-	} `json:"ctrlr"`
+	Name           string              `json:"name"`
+	ProductName    string              `json:"product_name"`
+	BlockSize      int64               `json:"block_size"`
+	NumBlocks      int64               `json:"num_blocks"`
+	UUID           string              `json:"uuid"`
+	DriverSpecific *spdkDriverSpecific `json:"driver_specific"`
 }
 
 func discoverSPDKNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) {
@@ -357,19 +386,41 @@ func discoverSPDKNVMeWithPolicy(policy discoveryPolicy) ([]HardwareNVMe, error) 
 		return nil, err
 	}
 
-	var devices []HardwareNVMe
+	return hardwareFromSPDKBdevs(bdevs, policy)
+}
+
+func hardwareFromSPDKBdevs(bdevs []SpdkBdev, policy discoveryPolicy) ([]HardwareNVMe, error) {
+	devices := make([]HardwareNVMe, 0, len(bdevs))
 	var discoveryErrors []error
 	for _, bdev := range bdevs {
 		if bdev.DriverSpecific == nil || len(bdev.DriverSpecific.NVMe) == 0 {
 			continue
 		}
+		namespace := bdev.DriverSpecific.NVMe[0]
+		if namespace.NSData.ID == 0 {
+			discoveryErrors = append(discoveryErrors, fmt.Errorf("SPDK bdev %s is missing its NVMe namespace ID", bdev.Name))
+			continue
+		}
+		if namespace.NSData.ID != primaryNamespaceID {
+			continue
+		}
+		capacityBytes, err := checkedCapacityBytes(bdev.Name, bdev.NumBlocks, bdev.BlockSize)
+		if err != nil {
+			discoveryErrors = append(discoveryErrors, err)
+			continue
+		}
+		capacityBytes, err = allocatableNamespaceBytes(bdev.Name, capacityBytes)
+		if err != nil {
+			discoveryErrors = append(discoveryErrors, err)
+			continue
+		}
 
 		hwDev := HardwareNVMe{
 			Name:         bdev.Name,
-			PCIAddress:   bdev.DriverSpecific.NVMe[0].PCIAddress,
-			SerialNumber: strings.TrimSpace(bdev.DriverSpecific.NVMe[0].CtrlrData.SerialNumber),
-			Model:        strings.TrimSpace(bdev.DriverSpecific.NVMe[0].CtrlrData.ModelNumber),
-			TotalBytes:   bdev.NumBlocks * bdev.BlockSize,
+			PCIAddress:   namespace.PCIAddress,
+			SerialNumber: strings.TrimSpace(namespace.CtrlrData.SerialNumber),
+			Model:        strings.TrimSpace(namespace.CtrlrData.ModelNumber),
+			TotalBytes:   capacityBytes,
 			NUMANode:     -1,
 		}
 		hwDev.PCIAddress = strings.ToLower(strings.TrimSpace(hwDev.PCIAddress))

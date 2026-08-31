@@ -69,7 +69,7 @@ graph TD
 
 At the core of DISTORT's declarative model are five Custom Resource Definitions that mirror the physical, logical, and attachment state of the storage fabric:
 
-1. **`NVMeDevice`:** Represents a discovered physical NVMe storage controller on a worker node, including attributes like serial number, NUMA alignment, and block capacity.
+1. **`NVMeDevice`:** Represents a discovered physical NVMe storage controller on a worker node, including attributes like serial number, NUMA alignment, and the allocatable capacity of the explicitly managed namespace ID 1 after a small backend-metadata reserve. Additional namespaces remain untouched and are not advertised for placement.
 2. **`NVMeDeviceClaim`:** Allows administrators or automated provisioners to reserve specific `NVMeDevice` instances for dedicated workloads.
 3. **`NVMePartition`:** Represents a logical slice of an `NVMeDevice`. It dictates the required capacity and, once scheduled, tracks the NVMe-oF network endpoint details (NQN, Portal IP, Port) required for client connections.
 4. **`RDMAStorageNode`:** Represents a worker node's capability to participate in the storage fabric, providing health status and available network interfaces for RDMA traffic.

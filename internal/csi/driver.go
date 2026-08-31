@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	DriverName    = "storage.distort.io"
-	VendorVersion = "0.5.0"
+	DriverName      = "storage.distort.io"
+	VendorVersion   = "0.5.0"
+	DefaultEndpoint = "unix:///tmp/csi.sock"
 )
 
 type Driver struct {
@@ -51,23 +53,15 @@ func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
 }
 
 func (d *Driver) Run() error {
-	parts := strings.SplitN(d.endpoint, "://", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid endpoint format %q", d.endpoint)
-	}
-	protocol, addr := parts[0], parts[1]
-
-	if protocol == "unix" {
-		klog.InfoS("Removing existing socket", "path", addr)
-		if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove existing socket %s: %w", addr, err)
-		}
-	}
-
-	listener, err := net.Listen(protocol, addr)
+	listener, err := listenEndpoint(d.endpoint)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
+		return err
 	}
+	defer func() {
+		if err := listener.Close(); err != nil {
+			klog.ErrorS(err, "Failed to close CSI listener")
+		}
+	}()
 
 	server := grpc.NewServer()
 	csi.RegisterIdentityServer(server, d.ids)
@@ -79,6 +73,42 @@ func (d *Driver) Run() error {
 		return fmt.Errorf("serve CSI GRPC endpoint: %w", err)
 	}
 	return nil
+}
+
+func listenEndpoint(endpoint string) (net.Listener, error) {
+	parts := strings.SplitN(endpoint, "://", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid endpoint format %q", endpoint)
+	}
+	protocol, addr := parts[0], parts[1]
+
+	if protocol == "unix" {
+		if !filepath.IsAbs(addr) {
+			return nil, fmt.Errorf("unix endpoint path must be absolute: %q", addr)
+		}
+		if err := os.MkdirAll(filepath.Dir(addr), 0o750); err != nil {
+			return nil, fmt.Errorf("create unix socket directory %s: %w", filepath.Dir(addr), err)
+		}
+		info, err := os.Lstat(addr)
+		switch {
+		case os.IsNotExist(err):
+		case err != nil:
+			return nil, fmt.Errorf("inspect existing socket %s: %w", addr, err)
+		case info.Mode()&os.ModeSocket == 0:
+			return nil, fmt.Errorf("refusing to remove non-socket path %s", addr)
+		default:
+			klog.InfoS("Removing stale socket", "path", addr)
+			if err := os.Remove(addr); err != nil {
+				return nil, fmt.Errorf("remove existing socket %s: %w", addr, err)
+			}
+		}
+	}
+
+	listener, err := net.Listen(protocol, addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	return listener, nil
 }
 
 // ==========================================

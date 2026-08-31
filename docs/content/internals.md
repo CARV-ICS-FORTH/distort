@@ -351,7 +351,8 @@ The Controller service runs in the CSI controller Deployment. DISTORT implements
 
 1. validates the CSI request;
 2. reads capacity and StorageClass parameters, accepting either a required
-   capacity or a limit-only range;
+   capacity or a limit-only range, and rounds the allocation to the shared
+   4 MiB kernel/SPDK allocation unit;
 3. creates an `NVMePartition`;
 4. waits for its status to become `Exported`;
 5. returns a CSI volume containing the NQN, portal IP, and portal port in `VolumeContext`.
@@ -365,7 +366,12 @@ volume handle before confirming it. When supplied, volume context and creation
 parameters must match the persisted partition configuration. A missing or
 recreated volume returns `NotFound`.
 
-`DeleteVolume` finds the `NVMePartition` by volume ID and requests its deletion. The agent finalizer performs actual target and volume cleanup. The current CSI method returns without waiting for finalizer completion.
+`DeleteVolume` finds the `NVMePartition` by volume ID and requests its deletion.
+The agent finalizer performs actual target and volume cleanup. CSI then waits,
+within the RPC deadline, for that exact namespace/name/UID object to disappear.
+A replacement object with the same name is not mistaken for the deleted
+volume, and incomplete cleanup returns a retryable status instead of being
+acknowledged prematurely.
 
 ### 3.5 The external provisioner sidecar
 
@@ -469,7 +475,7 @@ Important spec fields:
 - PCI address;
 - hardware serial number;
 - model;
-- total capacity;
+- allocatable capacity of namespace ID 1 after the backend-metadata reserve;
 - NUMA node.
 
 Important status fields:
@@ -479,10 +485,13 @@ Important status fields:
 - remaining free capacity;
 - active backend, such as `spdk` or `kernel`.
 
-The exact serial number is the stable identity used to match claims and
-partitions. The Linux name, such as `nvme0`, is not stable across boots or
-device changes. An `NVMeDevice` object's Kubernetes name combines a readable,
-bounded node prefix with a SHA-256-derived suffix over the node and exact
+DISTORT currently manages namespace ID 1 under both kernel and SPDK backends.
+Other namespaces on the same controller are left untouched and are not
+advertised for placement. The exact serial number is the stable identity used
+to match claims and partitions. The Linux name, such as `nvme0`, is not stable
+across boots or device changes. An `NVMeDevice` object's Kubernetes name
+combines a readable, bounded node prefix with a SHA-256-derived suffix over the
+node and exact
 serial. This keeps arbitrary hardware serials out of `metadata.name` while
 preserving the original serial in the spec.
 
@@ -617,7 +626,7 @@ File: `internal/controller/nvmedevice_controller.go`
 This controller calculates:
 
 ```text
-free capacity = physical total capacity - sum(size of assigned partitions)
+free capacity = advertised allocatable capacity - sum(rounded capacity of assigned partitions)
 ```
 
 It watches both `NVMeDevice` and `NVMePartition`. A partition event is mapped back to its parent device so capacity is recalculated.
@@ -659,7 +668,7 @@ The agent reads `/sys/class/nvme` and `/sys/class/block` to obtain:
 - model;
 - serial number;
 - NUMA node;
-- namespace capacity.
+- namespace ID 1 capacity.
 
 It excludes non-PCIe controllers so that remote NVMe-oF devices connected on the same host are not accidentally advertised as local physical storage.
 
@@ -671,6 +680,18 @@ It uses `lsblk` to skip controllers with mounted namespaces and supports:
 #### SPDK-bound devices
 
 Once a controller is detached from the kernel and owned by a user-space driver, it is no longer represented in the same way through the kernel NVMe subsystem. The agent therefore also queries SPDK JSON-RPC and merges results by serial number.
+
+SPDK discovery also requires an explicit namespace ID and selects only namespace
+ID 1. This matches kernel provisioning, keeps identity and capacity stable
+across driver rebinding, and avoids silently aggregating capacity the selected
+volume manager cannot address. A controller without namespace ID 1 is degraded
+rather than guessed.
+
+Discovery reserves one percent of namespace ID 1 and rounds the remainder down
+to the 4 MiB allocation unit before publishing capacity. This conservative
+control-plane calculation covers GPT boundaries and SPDK blobstore metadata
+without an extra command or RPC, ensuring that a request accepted before driver
+rebinding remains allocatable afterward.
 
 Discovery validates that every advertised device has a nonempty name and exact
 serial, a normalized PCI address, and positive capacity. A failed source does

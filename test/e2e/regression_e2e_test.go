@@ -588,7 +588,7 @@ spec:
 			out, getErr := kubectl("get", "nvmepartition", partitionName,
 				"-o", "jsonpath={.status.state} {.status.allocatedCapacity}")
 			g.Expect(getErr).NotTo(HaveOccurred())
-			g.Expect(out).To(Equal("Exported 2Mi"))
+			g.Expect(out).To(Equal("Exported 4Mi"))
 		}, 180*time.Second, 5*time.Second).Should(Succeed())
 		_, err = kubectl("delete", "nvmepartition", partitionName, "--wait=true", "--timeout=120s")
 		Expect(err).NotTo(HaveOccurred())

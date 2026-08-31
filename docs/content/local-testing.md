@@ -20,6 +20,12 @@ There is no need to uninstall the Helm release or rebuild the VMs for each chang
 | `distort-worker-1` | `192.168.56.11` | K3s agent | Virtual NVMe controller, two 1 GiB namespaces, SoftRoCE |
 | `distort-worker-2` | `192.168.56.12` | K3s agent | Virtual NVMe controller, two 1 GiB namespaces, SoftRoCE |
 
+The two namespaces per controller deliberately exercise multi-namespace
+discovery. DISTORT currently manages only namespace ID 1 under both kernel and
+SPDK backends. After its one-percent backend-metadata reserve and 4 MiB
+allocation alignment, each lab `NVMeDevice` advertises 1012 MiB. Namespace ID 2
+remains untouched and is not available to placement.
+
 The default low-resource profile gives the master 3 GiB RAM, each worker
 1.25 GiB RAM, two virtual CPUs per VM, and 256 MiB of hugepages per node. The
 first-time target builds the image while the VMs are stopped and caps SPDK and

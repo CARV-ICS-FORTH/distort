@@ -12,6 +12,8 @@ import (
 
 type SPDKLvolManager struct{}
 
+const mebibyteBytes int64 = 1024 * 1024
+
 type spdkLvstore struct {
 	UUID     string `json:"uuid"`
 	Name     string `json:"name"`
@@ -180,7 +182,7 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 		return VolumeIdentity{}, fmt.Errorf("multiple SPDK lvol bdevs use alias %q", alias)
 	}
 
-	sizeMB := allocatedBytes / capacity.AllocationUnitBytes
+	sizeMB := allocatedBytes / mebibyteBytes
 	var uuid string
 	if err := CallSPDKRPCContext(ctx, "bdev_lvol_create", &uuid, "-l", store.Name, volumeName, fmt.Sprintf("%d", sizeMB)); err != nil {
 		return VolumeIdentity{}, err

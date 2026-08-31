@@ -57,7 +57,9 @@ type NVMeDeviceSpec struct {
 	// +optional
 	Model string `json:"model,omitempty"`
 
-	// TotalCapacity is the total raw size of the device.
+	// TotalCapacity is the allocatable capacity of namespace ID 1 after reserving
+	// backend metadata space. DISTORT manages this namespace consistently under
+	// kernel and SPDK; other namespaces are not advertised or modified.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="totalCapacity must be positive"
 	TotalCapacity resource.Quantity `json:"totalCapacity"`

@@ -103,11 +103,13 @@ func newControllerTestServer(t *testing.T) (*ControllerServer, client.Client) {
 		Build()
 	readyClient := &immediatelyExportingClient{Client: baseClient}
 	return &ControllerServer{
-		k8sClient:                  readyClient,
-		partitionReadyPollInterval: time.Millisecond,
-		partitionReadyTimeout:      time.Second,
-		attachmentPollInterval:     time.Millisecond,
-		attachmentReadyTimeout:     time.Second,
+		k8sClient:                   readyClient,
+		partitionReadyPollInterval:  time.Millisecond,
+		partitionReadyTimeout:       time.Second,
+		attachmentPollInterval:      time.Millisecond,
+		attachmentReadyTimeout:      time.Second,
+		partitionDeletePollInterval: time.Millisecond,
+		partitionDeleteTimeout:      time.Second,
 	}, readyClient
 }
 
@@ -292,8 +294,8 @@ func TestCreateVolumeDefaultsMissingRangeAndReturnsRoundedCapacity(t *testing.T)
 		wantSize int64
 	}{
 		{name: "missing range", wantSize: defaultVolumeCapacityBytes},
-		{name: "sub MiB", range_: &csipb.CapacityRange{RequiredBytes: 1, LimitBytes: capacity.AllocationUnitBytes}, wantSize: capacity.AllocationUnitBytes},
-		{name: "one MiB plus one", range_: &csipb.CapacityRange{RequiredBytes: capacity.AllocationUnitBytes + 1}, wantSize: 2 * capacity.AllocationUnitBytes},
+		{name: "sub allocation unit", range_: &csipb.CapacityRange{RequiredBytes: 1, LimitBytes: capacity.AllocationUnitBytes}, wantSize: capacity.AllocationUnitBytes},
+		{name: "one allocation unit plus one", range_: &csipb.CapacityRange{RequiredBytes: capacity.AllocationUnitBytes + 1}, wantSize: 2 * capacity.AllocationUnitBytes},
 		{name: "limit only below default", range_: &csipb.CapacityRange{LimitBytes: 64 * capacity.AllocationUnitBytes}, wantSize: 64 * capacity.AllocationUnitBytes},
 		{name: "limit only rounds down", range_: &csipb.CapacityRange{LimitBytes: capacity.AllocationUnitBytes + 1}, wantSize: capacity.AllocationUnitBytes},
 		{name: "limit only above default", range_: &csipb.CapacityRange{LimitBytes: 2 * defaultVolumeCapacityBytes}, wantSize: defaultVolumeCapacityBytes},
@@ -672,6 +674,178 @@ func TestDeleteVolumeDoesNotDeleteRecreatedPartition(t *testing.T) {
 	}
 	if err := k8sClient.Get(context.Background(), key, &partition); err != nil {
 		t.Fatalf("old volume handle deleted the replacement: %v", err)
+	}
+}
+
+func TestDeleteVolumeWaitsForFinalizerCleanup(t *testing.T) {
+	server, k8sClient := newControllerTestServer(t)
+	created, err := server.CreateVolume(context.Background(), validCreateRequest("finalized", "team-a"))
+	if err != nil {
+		t.Fatalf("creating volume: %v", err)
+	}
+	reference, err := volumeidentity.ParseVolumeHandle(created.Volume.VolumeId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: reference.Name}
+	var partition storagev1alpha1.NVMePartition
+	if err := k8sClient.Get(context.Background(), key, &partition); err != nil {
+		t.Fatal(err)
+	}
+	partition.Finalizers = []string{"storage.distort.io/test-cleanup"}
+	if err := k8sClient.Update(context.Background(), &partition); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, deleteErr := server.DeleteVolume(context.Background(), &csipb.DeleteVolumeRequest{VolumeId: created.Volume.VolumeId})
+		result <- deleteErr
+	}()
+
+	for range 100 {
+		if err := k8sClient.Get(context.Background(), key, &partition); err == nil && !partition.DeletionTimestamp.IsZero() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if partition.DeletionTimestamp.IsZero() {
+		t.Fatal("partition did not enter terminating state")
+	}
+	partition.Finalizers = nil
+	if err := k8sClient.Update(context.Background(), &partition); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("completing finalizer cleanup: %v", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("DeleteVolume returned before successful finalization: %v", err)
+	}
+}
+
+func TestDeleteVolumeReturnsRetryableErrorWhileFinalizerIsStuck(t *testing.T) {
+	server, k8sClient := newControllerTestServer(t)
+	server.partitionDeleteTimeout = 20 * time.Millisecond
+	created, err := server.CreateVolume(context.Background(), validCreateRequest("stuck-finalizer", "team-a"))
+	if err != nil {
+		t.Fatalf("creating volume: %v", err)
+	}
+	reference, err := volumeidentity.ParseVolumeHandle(created.Volume.VolumeId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: reference.Name}
+	var partition storagev1alpha1.NVMePartition
+	if err := k8sClient.Get(context.Background(), key, &partition); err != nil {
+		t.Fatal(err)
+	}
+	partition.Finalizers = []string{"storage.distort.io/stuck-cleanup"}
+	if err := k8sClient.Update(context.Background(), &partition); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = server.DeleteVolume(context.Background(), &csipb.DeleteVolumeRequest{VolumeId: created.Volume.VolumeId})
+	requireCode(t, err, codes.DeadlineExceeded)
+	if err := k8sClient.Get(context.Background(), key, &partition); err != nil {
+		t.Fatalf("stuck partition disappeared: %v", err)
+	}
+	if partition.DeletionTimestamp.IsZero() {
+		t.Fatal("stuck partition was not left terminating for agent retry")
+	}
+}
+
+func TestDeleteVolumeWaitHonorsCancellation(t *testing.T) {
+	server, k8sClient := newControllerTestServer(t)
+	created, err := server.CreateVolume(context.Background(), validCreateRequest("cancel-finalizer-wait", "team-a"))
+	if err != nil {
+		t.Fatalf("creating volume: %v", err)
+	}
+	reference, err := volumeidentity.ParseVolumeHandle(created.Volume.VolumeId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: reference.Name}
+	var partition storagev1alpha1.NVMePartition
+	if err := k8sClient.Get(context.Background(), key, &partition); err != nil {
+		t.Fatal(err)
+	}
+	partition.Finalizers = []string{"storage.distort.io/test-cleanup"}
+	if err := k8sClient.Update(context.Background(), &partition); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, deleteErr := server.DeleteVolume(ctx, &csipb.DeleteVolumeRequest{VolumeId: created.Volume.VolumeId})
+		result <- deleteErr
+	}()
+	for range 100 {
+		if err := k8sClient.Get(context.Background(), key, &partition); err == nil && !partition.DeletionTimestamp.IsZero() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if partition.DeletionTimestamp.IsZero() {
+		t.Fatal("partition did not enter terminating state")
+	}
+	cancel()
+	requireCode(t, <-result, codes.Canceled)
+}
+
+func TestDeleteVolumeWaitIgnoresSameNameReplacement(t *testing.T) {
+	server, k8sClient := newControllerTestServer(t)
+	server.partitionDeletePollInterval = 50 * time.Millisecond
+	created, err := server.CreateVolume(context.Background(), validCreateRequest("replacement-during-delete", "team-a"))
+	if err != nil {
+		t.Fatalf("creating volume: %v", err)
+	}
+	reference, err := volumeidentity.ParseVolumeHandle(created.Volume.VolumeId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: reference.Namespace, Name: reference.Name}
+	var original storagev1alpha1.NVMePartition
+	if err := k8sClient.Get(context.Background(), key, &original); err != nil {
+		t.Fatal(err)
+	}
+	original.Finalizers = []string{"storage.distort.io/test-cleanup"}
+	if err := k8sClient.Update(context.Background(), &original); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, deleteErr := server.DeleteVolume(context.Background(), &csipb.DeleteVolumeRequest{VolumeId: created.Volume.VolumeId})
+		result <- deleteErr
+	}()
+	for range 100 {
+		if err := k8sClient.Get(context.Background(), key, &original); err == nil && !original.DeletionTimestamp.IsZero() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if original.DeletionTimestamp.IsZero() {
+		t.Fatal("original partition did not enter terminating state")
+	}
+	original.Finalizers = nil
+	if err := k8sClient.Update(context.Background(), &original); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("finalizing original partition: %v", err)
+	}
+	replacement := &storagev1alpha1.NVMePartition{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: uuid.NewUUID()},
+		Spec:       storagev1alpha1.NVMePartitionSpec{Size: resource.MustParse("64Mi")},
+	}
+	if err := k8sClient.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("creating replacement partition: %v", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("deleting old handle while replacement exists: %v", err)
+	}
+	var retained storagev1alpha1.NVMePartition
+	if err := k8sClient.Get(context.Background(), key, &retained); err != nil {
+		t.Fatalf("replacement was deleted: %v", err)
+	}
+	if retained.UID != replacement.UID {
+		t.Fatalf("retained UID = %s, want replacement UID %s", retained.UID, replacement.UID)
 	}
 }
 

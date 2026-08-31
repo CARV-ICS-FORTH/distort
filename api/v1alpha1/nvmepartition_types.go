@@ -44,7 +44,7 @@ const (
 type NVMePartitionSpec struct {
 	// Size is the requested capacity for the volume.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036853727232')) <= 0",message="size must be positive and safely roundable to a 1 MiB allocation unit"
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036850581504')) <= 0",message="size must be positive and safely roundable to a 4 MiB allocation unit"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="size is immutable"
 	Size resource.Quantity `json:"size"`
 

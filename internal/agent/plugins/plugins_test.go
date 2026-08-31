@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"distort/internal/capacity"
 	"distort/internal/volumeidentity"
 )
 
@@ -575,8 +576,8 @@ func TestPartedRoundsCapacityUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume returned error: %v", err)
 	}
-	if identity.CapacityBytes != 2*1024*1024 {
-		t.Fatalf("allocated capacity = %d, want 2 MiB", identity.CapacityBytes)
+	if identity.CapacityBytes != capacity.AllocationUnitBytes {
+		t.Fatalf("allocated capacity = %d, want %d", identity.CapacityBytes, capacity.AllocationUnitBytes)
 	}
 }
 
@@ -1233,7 +1234,7 @@ case "$1" in
   bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"lvs_device","base_bdev":"device"}]\n' ;;
   bdev_get_bdevs)
     if [ -f %q ]; then
-      printf '[{"name":"uuid-1","uuid":"uuid-1","aliases":["lvs_device/volume"],"block_size":4096,"num_blocks":512,"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
+      printf '[{"name":"uuid-1","uuid":"uuid-1","aliases":["lvs_device/volume"],"block_size":4096,"num_blocks":1024,"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
     else
       printf '[]\n'
     fi ;;
@@ -1254,10 +1255,10 @@ esac`, capture, capture)
 		t.Fatal(err)
 	}
 	lines := strings.Fields(string(arguments))
-	if len(lines) == 0 || lines[len(lines)-1] != "2" {
-		t.Fatalf("SPDK lvol size was not rounded upward to 2 MiB:\n%s", arguments)
+	if len(lines) == 0 || lines[len(lines)-1] != "4" {
+		t.Fatalf("SPDK lvol size was not rounded upward to 4 MiB:\n%s", arguments)
 	}
-	if identity.CapacityBytes != 2*1024*1024 {
-		t.Fatalf("allocated capacity = %d, want 2 MiB", identity.CapacityBytes)
+	if identity.CapacityBytes != capacity.AllocationUnitBytes {
+		t.Fatalf("allocated capacity = %d, want %d", identity.CapacityBytes, capacity.AllocationUnitBytes)
 	}
 }

@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -28,11 +29,13 @@ import (
 // It translates CreateVolume calls into NVMePartition CRDs.
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
-	k8sClient                  client.Client
-	partitionReadyPollInterval time.Duration
-	partitionReadyTimeout      time.Duration
-	attachmentPollInterval     time.Duration
-	attachmentReadyTimeout     time.Duration
+	k8sClient                   client.Client
+	partitionReadyPollInterval  time.Duration
+	partitionReadyTimeout       time.Duration
+	attachmentPollInterval      time.Duration
+	attachmentReadyTimeout      time.Duration
+	partitionDeletePollInterval time.Duration
+	partitionDeleteTimeout      time.Duration
 }
 
 const (
@@ -41,6 +44,8 @@ const (
 	kernelTargetBackend              = "kernel"
 	partitionVolumeManager           = "partition"
 )
+
+var errPartitionDeletionTimeout = errors.New("timed out waiting for NVMePartition deletion")
 
 func normalizeCapacityRange(capacityRange *csi.CapacityRange) (int64, int64, error) {
 	if capacityRange == nil {
@@ -380,20 +385,75 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		// replacement object which happens to reuse its namespace and name.
 		return &csi.DeleteVolumeResponse{}, nil
 	}
+	if err := cs.deletePartitionAndWait(ctx, partition); err != nil {
+		return nil, err
+	}
+	return &csi.DeleteVolumeResponse{}, nil
+}
+
+func (cs *ControllerServer) deletePartitionAndWait(ctx context.Context, partition *storagev1alpha1.NVMePartition) error {
+	key := client.ObjectKeyFromObject(partition)
 	var attachment storagev1alpha1.NVMeVolumeAttachment
 	attachmentKey := types.NamespacedName{Namespace: partition.Namespace, Name: attachmentidentity.Name(partition.UID)}
 	if err := cs.k8sClient.Get(ctx, attachmentKey, &attachment); err == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "volume is still attached to node %q", attachment.Spec.NodeID)
+		return status.Errorf(codes.FailedPrecondition, "volume is still attached to node %q", attachment.Spec.NodeID)
 	} else if !apierrors.IsNotFound(err) {
-		return nil, status.Errorf(codes.Internal, "failed to check volume attachment: %v", err)
+		return status.Errorf(codes.Internal, "failed to check volume attachment: %v", err)
 	}
 	if err := cs.k8sClient.Delete(ctx, partition); err != nil && client.IgnoreNotFound(err) != nil {
 		klog.ErrorS(err, "Failed to delete NVMePartition", "partition", key)
-		return nil, status.Errorf(codes.Internal, "failed to delete partition: %v", err)
+		return status.Errorf(codes.Internal, "failed to delete partition: %v", err)
+	}
+	if err := cs.waitForPartitionDeleted(ctx, key, partition.UID); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return status.FromContextError(err).Err()
+		case errors.Is(err, errPartitionDeletionTimeout):
+			return status.Errorf(codes.DeadlineExceeded, "%v", err)
+		default:
+			return status.Errorf(codes.Internal, "failed to verify partition deletion: %v", err)
+		}
+	}
+	return nil
+}
+
+func (cs *ControllerServer) waitForPartitionDeleted(ctx context.Context, key types.NamespacedName, uid types.UID) error {
+	pollInterval := cs.partitionDeletePollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+	deleteTimeout := cs.partitionDeleteTimeout
+	if deleteTimeout <= 0 {
+		deleteTimeout = 2 * time.Minute
 	}
 
-	// Note: We might want to wait for actual deletion if we use finalizers in the Agent
-	return &csi.DeleteVolumeResponse{}, nil
+	timeout := time.NewTimer(deleteTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		var current storagev1alpha1.NVMePartition
+		err := cs.k8sClient.Get(ctx, key, &current)
+		switch {
+		case apierrors.IsNotFound(err):
+			return nil
+		case err != nil:
+			return err
+		case current.UID != uid:
+			// The exact volume is gone. A same-name replacement belongs to a
+			// different handle and must neither block nor be deleted.
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return fmt.Errorf("%w %s/%s UID %s", errPartitionDeletionTimeout, key.Namespace, key.Name, uid)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (cs *ControllerServer) deleteLegacyVolume(ctx context.Context, volumeID string) (*csi.DeleteVolumeResponse, error) {
@@ -426,8 +486,8 @@ func (cs *ControllerServer) deleteLegacyVolume(ctx context.Context, volumeID str
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"legacy volume ID %q matches multiple partitions; refusing ambiguous deletion", volumeID)
 	}
-	if err := cs.k8sClient.Delete(ctx, matches[0]); err != nil && client.IgnoreNotFound(err) != nil {
-		return nil, status.Errorf(codes.Internal, "failed to delete legacy partition: %v", err)
+	if err := cs.deletePartitionAndWait(ctx, matches[0]); err != nil {
+		return nil, err
 	}
 	return &csi.DeleteVolumeResponse{}, nil
 }

@@ -29,7 +29,7 @@ func init() {
 func main() {
 	var endpoint string
 	var nodeId string
-	flag.StringVar(&endpoint, "endpoint", "unix://tmp/csi.sock", "CSI endpoint")
+	flag.StringVar(&endpoint, "endpoint", csi.DefaultEndpoint, "CSI endpoint")
 	flag.StringVar(&nodeId, "nodeid", "", "node id")
 
 	opts := zap.Options{
