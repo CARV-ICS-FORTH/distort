@@ -48,14 +48,15 @@ func (r *RDMAStorageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err := r.Get(ctx, req.NamespacedName, &node); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	now := time.Now()
 	condition := meta.FindStatusCondition(node.Status.Conditions, rdmahealth.ReadyCondition)
 	if condition != nil && condition.Status == metav1.ConditionTrue &&
-		(time.Since(node.Status.LastHeartbeatTime.Time) > rdmahealth.FreshnessWindow || node.Status.LastHeartbeatTime.IsZero()) {
+		!rdmahealth.HeartbeatIsFresh(node.Status.LastHeartbeatTime, now) {
 		base := node.DeepCopy()
 		meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
 			Type: rdmahealth.ReadyCondition, Status: metav1.ConditionFalse,
 			ObservedGeneration: node.Generation, Reason: "StaleHeartbeat",
-			Message: "The RDMA reporter heartbeat is stale",
+			Message: "The RDMA reporter heartbeat is stale or outside the allowed clock skew",
 		})
 		if err := r.Status().Patch(ctx, &node, client.MergeFrom(base)); err != nil {
 			logger.Error(err, "Failed to expire RDMAStorageNode readiness", "node", node.Name)

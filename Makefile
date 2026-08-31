@@ -84,6 +84,7 @@ test-suite: test test-static lint ## Run the complete green host-side suite and 
 .PHONY: test-static
 test-static: ## Run repository contracts and validate Helm and Hugo artifacts.
 	go test ./test/contracts -count=1
+	diff -qr config/crd/bases deploy/charts/distort/crds
 	helm lint ./deploy/charts/distort --set-string image.repository=registry.example.com/distort
 	helm template distort ./deploy/charts/distort --namespace distort-system --set-string image.repository=registry.example.com/distort >/dev/null
 	hugo --source docs --destination /tmp/distort-docs-test --minify
@@ -168,11 +169,10 @@ test-env-reset: test-env-guard ## Clean test resources and storage state without
 	KUBECONFIG="$(LOCAL_KUBECONFIG)" $(KUBECTL) rollout status -n distort-system daemonset/distort-agent --timeout=180s
 
 .PHONY: test-env-deploy
-test-env-deploy: test-env-guard manifests ## Build/load the image and Helm-upgrade the persistent Vagrant lab.
+test-env-deploy: test-env-guard sync-chart-crds ## Build/load the image and Helm-upgrade the persistent Vagrant lab.
 	@if [ "$(TEST_ENV_SKIP_IMAGE_BUILD)" != "1" ]; then \
 		$(MAKE) test-env-image; \
 	fi
-	/bin/cp -f config/crd/bases/* deploy/charts/distort/crds/
 	$(CONTAINER_TOOL) save "$(TEST_ENV_IMG)" -o vagrant/distort-img.tar
 	@for node in $(VAGRANT_NODES); do \
 		echo "Loading $(TEST_ENV_IMG) into $$node"; \
@@ -250,6 +250,10 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+.PHONY: sync-chart-crds
+sync-chart-crds: manifests ## Synchronize generated CRDs into the Helm chart.
+	/bin/cp -f config/crd/bases/* deploy/charts/distort/crds/
 
 ##@ Build
 

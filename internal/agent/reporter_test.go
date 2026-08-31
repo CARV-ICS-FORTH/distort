@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,10 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "distort/api/v1alpha1"
-	"distort/internal/rdmahealth"
 )
-
-const loopbackAddress = "127.0.0.1"
 
 func newReporterTestClient(t *testing.T, objects ...runtime.Object) *Reporter {
 	t.Helper()
@@ -162,19 +160,26 @@ func TestReporterDoesNotMarkHardwareMissingWhenDiscoveryFails(t *testing.T) {
 	}
 }
 
-func TestReporterDoesNotAdvertiseLoopbackWithoutANodeIP(t *testing.T) {
+func TestReporterPostponesNodeUntilInitialRDMADiscoverySucceeds(t *testing.T) {
 	reporter := newReporterTestClient(t)
 	reporter.discoverRDMA = func() (RDMAEndpoint, error) { return RDMAEndpoint{}, errors.New("no RDMA interface") }
 	reporter.reportNode(context.Background(), 0, 0, errors.New("inventory unavailable"))
 
 	var actual storagev1alpha1.RDMAStorageNode
 	err := reporter.Get(context.Background(), types.NamespacedName{Name: "distort-worker-1"}, &actual)
-	if err == nil && actual.Spec.RDMAIP == loopbackAddress {
-		t.Fatalf("missing Kubernetes Node was advertised as a usable loopback RDMA endpoint: %#v", actual)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("initial discovery failure created RDMAStorageNode %#v: %v", actual, err)
 	}
-	condition := meta.FindStatusCondition(actual.Status.Conditions, rdmahealth.ReadyCondition)
-	if condition == nil || condition.Status != metav1.ConditionFalse {
-		t.Fatalf("RDMA readiness = %#v, want False", condition)
+
+	reporter.discoverRDMA = func() (RDMAEndpoint, error) {
+		return RDMAEndpoint{Interface: "rdma0", IP: "192.168.56.11", Transport: storagev1alpha1.RDMATransportRoCEv2}, nil
+	}
+	reporter.reportNode(context.Background(), 0, 0, nil)
+	if err := reporter.Get(context.Background(), types.NamespacedName{Name: "distort-worker-1"}, &actual); err != nil {
+		t.Fatalf("successful rediscovery did not create RDMAStorageNode: %v", err)
+	}
+	if actual.Spec.RDMAIP != "192.168.56.11" || actual.Spec.Transport != storagev1alpha1.RDMATransportRoCEv2 {
+		t.Fatalf("successful rediscovery created unexpected endpoint: %#v", actual.Spec)
 	}
 }
 

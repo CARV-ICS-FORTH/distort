@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/placementauth"
 	"distort/internal/rdmahealth"
 )
 
@@ -227,6 +228,7 @@ var _ = Describe("NVMePartition placement", func() {
 		Expect(actual.Spec.ClaimRef).To(Equal(&storagev1alpha1.NVMeDeviceClaimReference{
 			Namespace: namespace, Name: claim.Name, UID: claim.UID,
 		}))
+		Expect(placementauth.IsAuthorized(&actual)).To(BeTrue())
 	})
 
 	It("requeues without mutating when no claimed device has enough capacity", func() {
@@ -249,6 +251,22 @@ var _ = Describe("NVMePartition placement", func() {
 		var rdmaNode storagev1alpha1.RDMAStorageNode
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "node-stale-rdma"}, &rdmaNode)).To(Succeed())
 		rdmaNode.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(-2 * rdmahealth.FreshnessWindow))
+		Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
+		createPartition("placement-request", "1Gi", "spdk")
+
+		result, err := reconcilePartition("placement-request")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero())
+		var actual storagev1alpha1.NVMePartition
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
+		Expect(actual.Spec.NodeName).To(BeEmpty())
+	})
+
+	It("does not place storage on a node with a materially future RDMA heartbeat", func() {
+		createDevice("placement-future-rdma", "node-future-rdma", "serial-future-rdma", "10Gi", "", storagev1alpha1.NVMeDeviceStateClaimed)
+		var rdmaNode storagev1alpha1.RDMAStorageNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "node-future-rdma"}, &rdmaNode)).To(Succeed())
+		rdmaNode.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(time.Hour))
 		Expect(k8sClient.Status().Update(ctx, &rdmaNode)).To(Succeed())
 		createPartition("placement-request", "1Gi", "spdk")
 
@@ -471,6 +489,7 @@ var _ = Describe("NVMePartition placement", func() {
 		var actual storagev1alpha1.NVMePartition
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "placement-request", Namespace: namespace}, &actual)).To(Succeed())
 		Expect(actual.Spec.ParentDeviceSerialNumber).To(Equal("serial-conflict"))
+		Expect(placementauth.IsAuthorized(&actual)).To(BeTrue())
 	})
 
 	It("keeps terminating partitions reserved until cleanup completes", func() {

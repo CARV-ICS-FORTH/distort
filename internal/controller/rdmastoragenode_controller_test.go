@@ -88,6 +88,32 @@ var _ = Describe("RDMAStorageNode Controller", func() {
 		Expect(condition.Reason).To(Equal("StaleHeartbeat"))
 	})
 
+	It("expires a materially future-dated reporter heartbeat", func() {
+		ctx := context.Background()
+		key := types.NamespacedName{Name: "future-rdma-node"}
+		resource := &storagev1alpha1.RDMAStorageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name},
+			Spec: storagev1alpha1.RDMAStorageNodeSpec{
+				NodeName: "test-node", RDMAIP: "192.0.2.10", Transport: storagev1alpha1.RDMATransportRoCEv2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, resource) })
+		resource.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(time.Hour))
+		meta.SetStatusCondition(&resource.Status.Conditions, metav1.Condition{
+			Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, Reason: "ReporterReady", Message: "ready",
+		})
+		Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		condition := meta.FindStatusCondition(resource.Status.Conditions, rdmahealth.ReadyCondition)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+		Expect(condition.Reason).To(Equal("StaleHeartbeat"))
+	})
+
 	It("treats a deleted reporter-owned node as an idempotent no-op", func() {
 		result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "missing-rdma-node"},

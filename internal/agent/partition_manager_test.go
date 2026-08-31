@@ -21,6 +21,7 @@ import (
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/agent/plugins"
 	attachmentidentity "distort/internal/attachment"
+	"distort/internal/placementauth"
 	"distort/internal/rdmahealth"
 )
 
@@ -43,6 +44,23 @@ func (b *countingBackend) ReconcileHostAccess(context.Context, string, string) e
 
 type transientSetupBackend struct {
 	setupCalls atomic.Int32
+}
+
+type unavailableExportBackend struct{}
+
+func (b *unavailableExportBackend) Name() string { return "unavailable-export-backend" }
+func (b *unavailableExportBackend) SetupDevice(context.Context, string, string, map[string]string) error {
+	return nil
+}
+func (b *unavailableExportBackend) ExportVolume(context.Context, string, string, string, int, map[string]string) (string, error) {
+	return "", errors.New("unexpected export mutation")
+}
+func (b *unavailableExportBackend) UnexportVolume(context.Context, string) error { return nil }
+func (b *unavailableExportBackend) ReconcileHostAccess(context.Context, string, string) error {
+	return nil
+}
+func (b *unavailableExportBackend) CheckExport(context.Context, string, string, string, int, map[string]string) error {
+	return &plugins.ExportObservationError{Err: errors.New("temporary SPDK timeout")}
 }
 
 func (b *transientSetupBackend) Name() string { return "transient-setup-backend" }
@@ -190,6 +208,25 @@ func newPartitionManagerClient(t *testing.T, objects ...client.Object) client.Cl
 		WithObjects(objects...).Build()
 }
 
+func authorizeTestPlacement(partition *storagev1alpha1.NVMePartition) {
+	if partition.UID == "" {
+		partition.UID = types.UID("test-" + partition.Name + "-uid")
+	}
+	partition.Status.PlacementFingerprint = placementauth.Fingerprint(
+		partition.UID,
+		partition.Spec.NodeName,
+		partition.Spec.ParentDeviceSerialNumber,
+		partition.Spec.ClaimRef,
+	)
+	meta.SetStatusCondition(&partition.Status.Conditions, metav1.Condition{
+		Type:               placementauth.ConditionType,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: partition.Generation,
+		Reason:             "TestManagerSelectedPlacement",
+		Message:            "Test placement authorization",
+	})
+}
+
 type recordingHostAccessBackend struct{ hosts []string }
 
 func (b *recordingHostAccessBackend) Name() string { return "host-access-test" }
@@ -301,8 +338,8 @@ func TestPartitionManagerRejectsUnclaimedDeviceBeforePluginCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(actual.Status.Conditions, claimAuthorizationCondition)
-	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "ClaimOwnershipInvalid" {
-		t.Fatalf("authorization condition = %#v, want False/ClaimOwnershipInvalid", condition)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != placementNotAuthorizedReason {
+		t.Fatalf("authorization condition = %#v, want False/PlacementNotAuthorized", condition)
 	}
 }
 
@@ -354,6 +391,7 @@ func TestPartitionManagerRejectsMismatchedClaimUIDBeforePluginCalls(t *testing.T
 			VolumeManager: manager.Name(),
 		},
 	}
+	authorizeTestPlacement(partition)
 	testClient := newPartitionManagerClient(t, claim, device, partition)
 	reconciler := &PartitionManager{Client: testClient, NodeName: "node-a"}
 	_, _ = reconciler.Reconcile(context.Background(), reconcile.Request{
@@ -368,7 +406,7 @@ func TestPartitionManagerRejectsMismatchedClaimUIDBeforePluginCalls(t *testing.T
 	}
 }
 
-func TestPartitionManagerAcceptsHashedDeviceNameFromMatchingLiveClaim(t *testing.T) {
+func TestPartitionManagerRequiresManagerAuthorizationForMatchingLiveClaim(t *testing.T) {
 	backend := &countingBackend{}
 	manager := &countingVolumeManager{}
 	plugins.RegisterTargetBackend(backend)
@@ -402,7 +440,7 @@ func TestPartitionManagerAcceptsHashedDeviceNameFromMatchingLiveClaim(t *testing
 		},
 	}
 	partition := &storagev1alpha1.NVMePartition{
-		ObjectMeta: metav1.ObjectMeta{Name: "authorized-volume", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "authorized-volume", Namespace: "default", UID: types.UID("authorized-volume-uid")},
 		Spec: storagev1alpha1.NVMePartitionSpec{
 			Size:                     resource.MustParse("100Mi"),
 			NodeName:                 "node-a",
@@ -422,14 +460,32 @@ func TestPartitionManagerAcceptsHashedDeviceNameFromMatchingLiveClaim(t *testing
 		NamespacedName: types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace},
 	})
 
-	if calls := backend.setupCalls.Load(); calls != 1 {
-		t.Fatalf("backend SetupDevice was called %d times with valid ownership, want 1", calls)
+	if calls := backend.setupCalls.Load(); calls != 0 {
+		t.Fatalf("backend SetupDevice was called %d times without manager placement authorization", calls)
 	}
 	var actual storagev1alpha1.NVMePartition
 	if err := testClient.Get(context.Background(), types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace}, &actual); err != nil {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(actual.Status.Conditions, claimAuthorizationCondition)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != placementNotAuthorizedReason {
+		t.Fatalf("authorization condition = %#v, want False/PlacementNotAuthorized", condition)
+	}
+
+	authorizeTestPlacement(&actual)
+	if err := testClient.Status().Update(context.Background(), &actual); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace},
+	})
+	if calls := backend.setupCalls.Load(); calls != 1 {
+		t.Fatalf("backend SetupDevice was called %d times after manager authorization, want 1", calls)
+	}
+	if err := testClient.Get(context.Background(), types.NamespacedName{Name: partition.Name, Namespace: partition.Namespace}, &actual); err != nil {
+		t.Fatal(err)
+	}
+	condition = meta.FindStatusCondition(actual.Status.Conditions, claimAuthorizationCondition)
 	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "ClaimOwnershipVerified" {
 		t.Fatalf("authorization condition = %#v, want True/ClaimOwnershipVerified", condition)
 	}
@@ -520,6 +576,12 @@ func TestInvalidPluginConfigurationBecomesTerminalStatus(t *testing.T) {
 }
 
 func TestRetryablePartitionFailureIsAttemptedAgain(t *testing.T) {
+	oldDiscover := discoverProvisioningNVMe
+	discoverProvisioningNVMe = func() ([]HardwareNVMe, error) {
+		return nil, errors.New("temporary device rediscovery failure")
+	}
+	t.Cleanup(func() { discoverProvisioningNVMe = oldDiscover })
+
 	backend := &transientSetupBackend{}
 	manager := &countingVolumeManager{}
 	plugins.RegisterTargetBackend(backend)
@@ -547,6 +609,7 @@ func TestRetryablePartitionFailureIsAttemptedAgain(t *testing.T) {
 			ClaimRef: claimRef, TargetBackend: backend.Name(), VolumeManager: manager.Name(),
 		},
 	}
+	authorizeTestPlacement(partition)
 	testClient := newPartitionManagerClient(t, claim, device, partition)
 	reconciler := &PartitionManager{Client: testClient, NodeName: "node-a"}
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(partition)}
@@ -564,6 +627,36 @@ func TestRetryablePartitionFailureIsAttemptedAgain(t *testing.T) {
 	_, _ = reconciler.Reconcile(context.Background(), request)
 	if calls := backend.setupCalls.Load(); calls != 2 {
 		t.Fatalf("SetupDevice calls = %d, want retry after transient failure", calls)
+	}
+	var actualDevice storagev1alpha1.NVMeDevice
+	if err := testClient.Get(context.Background(), client.ObjectKeyFromObject(device), &actualDevice); err != nil {
+		t.Fatal(err)
+	}
+	if actualDevice.Status.ActiveBackend != "" {
+		t.Fatalf("active backend = %q after device rediscovery failure, want empty", actualDevice.Status.ActiveBackend)
+	}
+	if calls := manager.setupCalls.Load(); calls != 0 {
+		t.Fatalf("volume SetupStorage calls = %d after rediscovery failure, want 0", calls)
+	}
+}
+
+func TestExportObservationFailureRequeuesWithoutReprovisioning(t *testing.T) {
+	partition := &storagev1alpha1.NVMePartition{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing-export", Namespace: "default"},
+		Status: storagev1alpha1.NVMePartitionStatus{
+			State:           storagev1alpha1.NVMePartitionStateExported,
+			NQN:             testNQN,
+			BackendVolumeID: "store/volume-id",
+			PortalPort:      4420,
+		},
+	}
+	reconciler := &PartitionManager{Client: newPartitionManagerClient(t, partition), NodeName: "node-a"}
+	handled, result, err := reconciler.reconcileExportedPartition(context.Background(), partition, &unavailableExportBackend{})
+	if err != nil || !handled {
+		t.Fatalf("observation failure returned handled=%t result=%#v err=%v", handled, result, err)
+	}
+	if result.RequeueAfter != 5*time.Second {
+		t.Fatalf("requeue = %s, want 5s non-mutating retry", result.RequeueAfter)
 	}
 }
 

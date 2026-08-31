@@ -37,3 +37,17 @@ func TestValidateRejectsLocalMulticastAndUnsupportedEndpoints(t *testing.T) {
 		t.Fatal("unsupported TCP transport was accepted")
 	}
 }
+
+func TestValidateRejectsMateriallyFutureHeartbeat(t *testing.T) {
+	now := time.Now()
+	node := readyNode("192.0.2.10", storagev1alpha1.RDMATransportRoCEv2)
+	node.Status.LastHeartbeatTime = metav1.NewTime(now.Add(time.Hour))
+	if err := Validate(node, now); err == nil {
+		t.Fatal("one-hour future heartbeat was accepted")
+	}
+
+	node.Status.LastHeartbeatTime = metav1.NewTime(now.Add(MaxFutureSkew))
+	if err := Validate(node, now); err != nil {
+		t.Fatalf("heartbeat at allowed future-skew boundary was rejected: %v", err)
+	}
+}

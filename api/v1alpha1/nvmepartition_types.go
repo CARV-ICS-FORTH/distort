@@ -108,6 +108,12 @@ type NVMePartitionSpec struct {
 
 // NVMePartitionStatus defines the observed state of NVMePartition.
 type NVMePartitionStatus struct {
+	// PlacementFingerprint binds the manager-authorized node, device, and claim
+	// selection to this exact NVMePartition UID.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +optional
+	PlacementFingerprint string `json:"placementFingerprint,omitempty"`
+
 	// State is the current status of the partition creation/export.
 	// +kubebuilder:validation:Enum=Pending;Creating;Exported;Failed
 	// +kubebuilder:default=Pending

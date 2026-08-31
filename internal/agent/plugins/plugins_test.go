@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -349,6 +350,10 @@ type fakePartedDisk struct {
 	initialized            bool
 	partitions             []partedPartition
 	wipeCalls              int
+	mklabelCalls           int
+	printErr               error
+	printOutput            []byte
+	wipeErr                error
 	createdStartAdjustment int64
 	mkpartErr              error
 }
@@ -364,7 +369,7 @@ func installFakePartedDisk(t *testing.T) *fakePartedDisk {
 	executeParted = disk.runParted
 	executeWipefs = func(context.Context, string) ([]byte, error) {
 		disk.wipeCalls++
-		return nil, nil
+		return []byte("simulated wipefs output"), disk.wipeErr
 	}
 	partitionPathStat = func(string) (os.FileInfo, error) { return nil, nil }
 	partitionPollCount = 1
@@ -383,11 +388,15 @@ func (d *fakePartedDisk) runParted(_ context.Context, args ...string) ([]byte, e
 	for index, arg := range args {
 		switch arg {
 		case "print":
+			if d.printErr != nil {
+				return d.printOutput, d.printErr
+			}
 			if !d.initialized {
-				return nil, fmt.Errorf("unrecognized disk label")
+				return []byte("Error: unrecognised disk label"), &exec.ExitError{}
 			}
 			return []byte(d.table(index+1 < len(args) && args[index+1] == "free")), nil
 		case "mklabel":
+			d.mklabelCalls++
 			d.initialized = true
 			d.partitions = nil
 			return nil, nil
@@ -423,6 +432,46 @@ func (d *fakePartedDisk) runParted(_ context.Context, args ...string) ([]byte, e
 		}
 	}
 	return nil, fmt.Errorf("unsupported parted arguments: %v", args)
+}
+
+func TestPartedSetupStorageFailsClosedOnInspectionAndWipeErrors(t *testing.T) {
+	t.Run("inspection error", func(t *testing.T) {
+		disk := installFakePartedDisk(t)
+		disk.initialized = true
+		disk.printErr = syscall.EIO
+		disk.printOutput = []byte("input/output error")
+
+		err := (&PartedVolumeManager{}).SetupStorage(context.Background(), disk.devicePath, "nvme0")
+		if err == nil || !strings.Contains(err.Error(), "input/output error") {
+			t.Fatalf("SetupStorage error = %v, want inspection failure", err)
+		}
+		if disk.wipeCalls != 0 || disk.mklabelCalls != 0 {
+			t.Fatalf("inspection failure caused mutation: wipe=%d mklabel=%d", disk.wipeCalls, disk.mklabelCalls)
+		}
+	})
+
+	t.Run("wipe error", func(t *testing.T) {
+		disk := installFakePartedDisk(t)
+		disk.wipeErr = syscall.EACCES
+
+		err := (&PartedVolumeManager{}).SetupStorage(context.Background(), disk.devicePath, "nvme0")
+		if err == nil || !strings.Contains(err.Error(), "permission denied") {
+			t.Fatalf("SetupStorage error = %v, want wipe failure", err)
+		}
+		if disk.wipeCalls != 1 || disk.mklabelCalls != 0 {
+			t.Fatalf("wipe failure caused unexpected mutation: wipe=%d mklabel=%d", disk.wipeCalls, disk.mklabelCalls)
+		}
+	})
+
+	t.Run("unlabelled device", func(t *testing.T) {
+		disk := installFakePartedDisk(t)
+		if err := (&PartedVolumeManager{}).SetupStorage(context.Background(), disk.devicePath, "nvme0"); err != nil {
+			t.Fatal(err)
+		}
+		if disk.wipeCalls != 1 || disk.mklabelCalls != 1 || !disk.initialized {
+			t.Fatalf("initialization calls: wipe=%d mklabel=%d initialized=%t", disk.wipeCalls, disk.mklabelCalls, disk.initialized)
+		}
+	})
 }
 
 func (d *fakePartedDisk) table(includeFree bool) string {
@@ -869,6 +918,117 @@ esac`)
 	}
 }
 
+func TestSPDKExportObservationFailureDoesNotReplaceLiveSubsystem(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeTestExecutable(t, fakeBin, "pidof", "exit 0")
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	firstInspection := filepath.Join(t.TempDir(), "first-inspection")
+	mutations := filepath.Join(t.TempDir(), "mutations")
+	volumeName := "observation-safe"
+	nqn := volumeidentity.NQN(volumeName)
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  rpc_get_methods) printf '[]\n' ;;
+  nvmf_get_subsystems) printf '[{"nqn":%q,"namespaces":[{"bdev_name":"lvol-uuid"}],"listen_addresses":[{"trtype":"RDMA","traddr":"192.0.2.10","trsvcid":"4420"}]}]\n' ;;
+  bdev_get_bdevs)
+    if [ ! -f %q ]; then
+      touch %q
+      printf 'temporary inspection failure\n' >&2
+      exit 9
+    fi
+    printf '[{"name":"lvol-uuid","uuid":"lvol-uuid","aliases":["lvs/volume"]}]\n' ;;
+  nvmf_delete_subsystem|nvmf_create_subsystem|nvmf_subsystem_add_ns|nvmf_subsystem_add_listener)
+    printf '%%s\n' "$*" >> %q
+    printf 'true\n' ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, nqn, firstInspection, firstInspection, mutations)
+	rpc := writeTestExecutable(t, fakeBin, "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	oldInspect := inspectSPDKProcess
+	spdkRPCExecutable = rpc
+	inspectSPDKProcess = func() (spdkProcessState, error) {
+		return spdkProcessState{running: true, coreMask: "0x1"}, nil
+	}
+	t.Cleanup(func() {
+		spdkRPCExecutable = oldExecutable
+		inspectSPDKProcess = oldInspect
+	})
+
+	backend := &SPDKBackend{}
+	if _, err := backend.ExportVolume(context.Background(), volumeName, "lvs/volume", "192.0.2.10", 4420, nil); !IsExportObservationError(err) {
+		t.Fatalf("first ExportVolume error = %v, want observation error", err)
+	}
+	if _, err := os.Stat(mutations); !os.IsNotExist(err) {
+		t.Fatalf("observation failure mutated live subsystem; stat error=%v", err)
+	}
+	if got, err := backend.ExportVolume(context.Background(), volumeName, "lvs/volume", "192.0.2.10", 4420, nil); err != nil || got != nqn {
+		t.Fatalf("healthy retry returned nqn=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(mutations); !os.IsNotExist(err) {
+		t.Fatalf("healthy retry mutated exact subsystem; stat error=%v", err)
+	}
+}
+
+func TestSPDKExportRepairsConfirmedMismatch(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeTestExecutable(t, fakeBin, "pidof", "exit 0")
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	callsPath := filepath.Join(t.TempDir(), "mutation-calls")
+	volumeName := "confirmed-mismatch"
+	nqn := volumeidentity.NQN(volumeName)
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  rpc_get_methods) printf '[]\n' ;;
+  nvmf_get_subsystems) printf '[{"nqn":%q,"namespaces":[{"bdev_name":"lvol-uuid"}],"listen_addresses":[{"trtype":"RDMA","traddr":"192.0.2.99","trsvcid":"4420"}]}]\n' ;;
+  bdev_get_bdevs) printf '[{"name":"lvol-uuid","aliases":["lvs/volume"]}]\n' ;;
+  nvmf_get_transports) printf '[{"trtype":"RDMA"}]\n' ;;
+  nvmf_delete_subsystem|nvmf_create_subsystem|nvmf_subsystem_add_ns|nvmf_subsystem_add_listener)
+    printf '%%s\n' "$*" >> %q
+    printf 'true\n' ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, nqn, callsPath)
+	rpc := writeTestExecutable(t, fakeBin, "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	oldInspect := inspectSPDKProcess
+	spdkRPCExecutable = rpc
+	inspectSPDKProcess = func() (spdkProcessState, error) {
+		return spdkProcessState{running: true, coreMask: "0x1"}, nil
+	}
+	t.Cleanup(func() {
+		spdkRPCExecutable = oldExecutable
+		inspectSPDKProcess = oldInspect
+	})
+
+	got, err := (&SPDKBackend{}).ExportVolume(context.Background(), volumeName, "lvs/volume", "192.0.2.10", 4420, nil)
+	if err != nil || got != nqn {
+		t.Fatalf("confirmed mismatch repair returned nqn=%q err=%v", got, err)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"nvmf_delete_subsystem " + nqn,
+		"nvmf_create_subsystem " + nqn + " -s distort",
+		"nvmf_subsystem_add_ns " + nqn + " lvs/volume",
+		"nvmf_subsystem_add_listener " + nqn + " -t RDMA -a 192.0.2.10 -s 4420",
+	}
+	if gotCalls := strings.FieldsFunc(strings.TrimSpace(string(calls)), func(r rune) bool { return r == '\n' }); !slices.Equal(gotCalls, want) {
+		t.Fatalf("repair calls = %#v, want %#v", gotCalls, want)
+	}
+}
+
+func TestKernelSetupDeviceReturnsSPDKResetFailure(t *testing.T) {
+	oldReset := resetSPDKDevice
+	resetSPDKDevice = func(context.Context, string) error { return syscall.EIO }
+	t.Cleanup(func() { resetSPDKDevice = oldReset })
+
+	err := (&KernelBackend{}).SetupDevice(context.Background(), "0000:01:00.0", "nvme0", nil)
+	if err == nil || !strings.Contains(err.Error(), "input/output error") {
+		t.Fatalf("SetupDevice error = %v, want reset failure", err)
+	}
+}
+
 func TestSPDKLvolPersistsAndDeletesExactCreatedIdentity(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "lvol-exists")
 	deleted := filepath.Join(t.TempDir(), "deleted-uuid")
@@ -877,7 +1037,7 @@ case "$1" in
   bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"lvs_base-n1","base_bdev":"base-n1"}]\n' ;;
   bdev_get_bdevs)
     if [ -f %q ]; then
-      printf '[{"name":"lvol-uuid","uuid":"lvol-uuid","aliases":["lvs_base-n1/volume-id"],"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
+      printf '[{"name":"lvol-uuid","uuid":"lvol-uuid","aliases":["lvs_base-n1/volume-id"],"block_size":4096,"num_blocks":16384,"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
     else
       printf '[]\n'
     fi ;;
@@ -976,6 +1136,65 @@ esac`
 	}
 }
 
+func TestSPDKLvolRetryRequiresExactBackendCapacity(t *testing.T) {
+	rpcBody := `
+case "$1" in
+  bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"store","base_bdev":"base-n1"}]\n' ;;
+  bdev_get_bdevs) printf '[{"name":"lvol-uuid","uuid":"lvol-uuid","aliases":["store/volume-id"],"block_size":4096,"num_blocks":16384}]\n' ;;
+  bdev_lvol_create) printf 'unsafe create called\n' >&2; exit 99 ;;
+  *) printf 'unexpected method %s\n' "$1" >&2; exit 8 ;;
+esac`
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	manager := &SPDKLvolManager{}
+	identity, err := manager.CreateVolume(context.Background(), "base-n1", "base-n1", "volume-id", 64*1024*1024)
+	if err != nil || identity.CapacityBytes != 64*1024*1024 {
+		t.Fatalf("exact retry returned identity=%#v err=%v", identity, err)
+	}
+	if _, err := manager.CreateVolume(context.Background(), "base-n1", "base-n1", "volume-id", 128*1024*1024); err == nil || !strings.Contains(err.Error(), "has capacity") {
+		t.Fatalf("mismatched retry error = %v, want exact-capacity rejection", err)
+	}
+}
+
+func TestSPDKLvolOperationsHonorCanceledContext(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "rpc-calls")
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", `printf '%s\n' "$*" >> "$RPC_LOG"; printf '[]\n'`)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Setenv("RPC_LOG", logPath)
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager := &SPDKLvolManager{}
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "setup", run: func() error { return manager.SetupStorage(ctx, "base-n1", "base-n1") }},
+		{name: "create", run: func() error {
+			_, err := manager.CreateVolume(ctx, "base-n1", "base-n1", "volume-id", 64*1024*1024)
+			return err
+		}},
+		{name: "delete", run: func() error {
+			return manager.DeleteVolume(ctx, "base-n1", "base-n1", "volume-id", VolumeIdentity{BackendVolumeID: "store/volume-id"})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.run(); !errors.Is(err, context.Canceled) {
+				t.Fatalf("operation error = %v, want context.Canceled", err)
+			}
+		})
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("canceled operations executed SPDK RPC; stat error=%v", err)
+	}
+}
+
 func TestSPDKUnexportVerifiesSubsystemAbsentAfterLostDeleteResponse(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "subsystem-exists")
 	if err := os.WriteFile(state, nil, 0o600); err != nil {
@@ -1014,7 +1233,7 @@ case "$1" in
   bdev_lvol_get_lvstores) printf '[{"uuid":"store-uuid","name":"lvs_device","base_bdev":"device"}]\n' ;;
   bdev_get_bdevs)
     if [ -f %q ]; then
-      printf '[{"name":"uuid-1","uuid":"uuid-1","aliases":["lvs_device/volume"],"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
+      printf '[{"name":"uuid-1","uuid":"uuid-1","aliases":["lvs_device/volume"],"block_size":4096,"num_blocks":512,"driver_specific":{"lvol":{"lvol_store_uuid":"store-uuid"}}}]\n'
     else
       printf '[]\n'
     fi ;;

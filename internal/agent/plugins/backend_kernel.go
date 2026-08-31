@@ -19,6 +19,8 @@ import (
 
 type KernelBackend struct{}
 
+var resetSPDKDevice = ResetSPDKDevice
+
 func init() {
 	RegisterTargetBackend(&KernelBackend{})
 }
@@ -32,8 +34,8 @@ func (k *KernelBackend) SetupDevice(ctx context.Context, pciAddress string, devi
 		return err
 	}
 	klog.InfoS("Ensuring device is bound to kernel NVMe driver", "device", deviceName, "pciAddress", pciAddress)
-	if err := ResetSPDKDevice(pciAddress); err != nil {
-		klog.ErrorS(err, "SPDK device reset returned a warning")
+	if err := resetSPDKDevice(ctx, pciAddress); err != nil {
+		return fmt.Errorf("bind device %s to kernel NVMe driver: %w", deviceName, err)
 	}
 	return nil
 }

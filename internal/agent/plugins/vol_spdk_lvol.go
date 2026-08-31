@@ -3,6 +3,7 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -25,6 +26,8 @@ type spdkBdev struct {
 	Name           string   `json:"name"`
 	UUID           string   `json:"uuid"`
 	Aliases        []string `json:"aliases"`
+	BlockSize      uint64   `json:"block_size"`
+	NumBlocks      uint64   `json:"num_blocks"`
 	DriverSpecific struct {
 		Lvol *spdkLvolDetails `json:"lvol,omitempty"`
 	} `json:"driver_specific"`
@@ -38,17 +41,17 @@ func (s *SPDKLvolManager) Name() string {
 	return "spdk-lvol"
 }
 
-func listSPDKLvstores() ([]spdkLvstore, error) {
+func listSPDKLvstores(ctx context.Context) ([]spdkLvstore, error) {
 	var stores []spdkLvstore
-	if err := CallSPDKRPC("bdev_lvol_get_lvstores", &stores); err != nil {
+	if err := CallSPDKRPCContext(ctx, "bdev_lvol_get_lvstores", &stores); err != nil {
 		return nil, fmt.Errorf("failed to list SPDK logical volume stores: %w", err)
 	}
 	return stores, nil
 }
 
-func listSPDKBdevs() ([]spdkBdev, error) {
+func listSPDKBdevs(ctx context.Context) ([]spdkBdev, error) {
 	var bdevs []spdkBdev
-	if err := CallSPDKRPC("bdev_get_bdevs", &bdevs); err != nil {
+	if err := CallSPDKRPCContext(ctx, "bdev_get_bdevs", &bdevs); err != nil {
 		return nil, fmt.Errorf("failed to list SPDK bdevs: %w", err)
 	}
 	return bdevs, nil
@@ -67,8 +70,8 @@ func lvstoreForBaseBdev(stores []spdkLvstore, baseBdev string) (spdkLvstore, err
 	return matches[0], nil
 }
 
-func GetLvstoreName(deviceName string) (string, error) {
-	stores, err := listSPDKLvstores()
+func GetLvstoreName(ctx context.Context, deviceName string) (string, error) {
+	stores, err := listSPDKLvstores(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -80,7 +83,7 @@ func GetLvstoreName(deviceName string) (string, error) {
 }
 
 func (s *SPDKLvolManager) SetupStorage(ctx context.Context, devicePath string, deviceName string) error {
-	stores, err := listSPDKLvstores()
+	stores, err := listSPDKLvstores(ctx)
 	if err != nil {
 		return err
 	}
@@ -90,7 +93,7 @@ func (s *SPDKLvolManager) SetupStorage(ctx context.Context, devicePath string, d
 		}
 	}
 	storeName := "lvs_" + deviceName
-	return CallSPDKRPC("bdev_lvol_create_lvstore", nil, deviceName, storeName)
+	return CallSPDKRPCContext(ctx, "bdev_lvol_create_lvstore", nil, deviceName, storeName)
 }
 
 func matchingBdevs(bdevs []spdkBdev, match func(spdkBdev) bool) []int {
@@ -120,6 +123,16 @@ func lvolIdentity(bdev spdkBdev, store spdkLvstore, volumeName string, capacityB
 	}
 }
 
+func spdkBdevCapacity(bdev spdkBdev) (int64, error) {
+	if bdev.BlockSize == 0 || bdev.NumBlocks == 0 {
+		return 0, fmt.Errorf("SPDK bdev %q has incomplete capacity metadata", bdev.Name)
+	}
+	if bdev.NumBlocks > math.MaxInt64/bdev.BlockSize {
+		return 0, fmt.Errorf("SPDK bdev %q capacity overflows int64", bdev.Name)
+	}
+	return int64(bdev.BlockSize * bdev.NumBlocks), nil
+}
+
 func findCreatedLvol(bdevs []spdkBdev, alias, uuid string) (spdkBdev, error) {
 	matches := matchingBdevs(bdevs, func(bdev spdkBdev) bool {
 		matchesUUID := uuid != "" && (bdev.Name == uuid || bdev.UUID == uuid)
@@ -136,7 +149,7 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 	if err != nil {
 		return VolumeIdentity{}, err
 	}
-	stores, err := listSPDKLvstores()
+	stores, err := listSPDKLvstores(ctx)
 	if err != nil {
 		return VolumeIdentity{}, err
 	}
@@ -146,13 +159,20 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 	}
 	alias := store.Name + "/" + volumeName
 
-	bdevs, err := listSPDKBdevs()
+	bdevs, err := listSPDKBdevs(ctx)
 	if err != nil {
 		return VolumeIdentity{}, fmt.Errorf("list SPDK bdevs before creating %q: %w", alias, err)
 	}
 	existing, err := findCreatedLvol(bdevs, alias, "")
 	if err == nil {
-		return lvolIdentity(existing, store, volumeName, allocatedBytes), nil
+		actualBytes, capacityErr := spdkBdevCapacity(existing)
+		if capacityErr != nil {
+			return VolumeIdentity{}, capacityErr
+		}
+		if actualBytes != allocatedBytes {
+			return VolumeIdentity{}, fmt.Errorf("existing SPDK lvol %q has capacity %d bytes, want %d", alias, actualBytes, allocatedBytes)
+		}
+		return lvolIdentity(existing, store, volumeName, actualBytes), nil
 	}
 	if matches := matchingBdevs(bdevs, func(bdev spdkBdev) bool {
 		return bdev.Name == alias || slices.Contains(bdev.Aliases, alias)
@@ -162,11 +182,11 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 
 	sizeMB := allocatedBytes / capacity.AllocationUnitBytes
 	var uuid string
-	if err := CallSPDKRPC("bdev_lvol_create", &uuid, "-l", store.Name, volumeName, fmt.Sprintf("%d", sizeMB)); err != nil {
+	if err := CallSPDKRPCContext(ctx, "bdev_lvol_create", &uuid, "-l", store.Name, volumeName, fmt.Sprintf("%d", sizeMB)); err != nil {
 		return VolumeIdentity{}, err
 	}
 
-	bdevs, err = listSPDKBdevs()
+	bdevs, err = listSPDKBdevs(ctx)
 	if err != nil {
 		return VolumeIdentity{}, fmt.Errorf("verify SPDK lvol %q after creation: %w", alias, err)
 	}
@@ -174,7 +194,14 @@ func (s *SPDKLvolManager) CreateVolume(ctx context.Context, devicePath string, d
 	if err != nil {
 		return VolumeIdentity{}, err
 	}
-	identity := lvolIdentity(created, store, volumeName, allocatedBytes)
+	actualBytes, err := spdkBdevCapacity(created)
+	if err != nil {
+		return VolumeIdentity{}, err
+	}
+	if actualBytes != allocatedBytes {
+		return VolumeIdentity{}, fmt.Errorf("created SPDK lvol %q has capacity %d bytes, want %d", alias, actualBytes, allocatedBytes)
+	}
+	identity := lvolIdentity(created, store, volumeName, actualBytes)
 	if uuid != "" {
 		identity.VolumeUUID = uuid
 	}
@@ -286,11 +313,11 @@ func validateLvolOwnership(candidate spdkBdev, stores []spdkLvstore, identity Vo
 }
 
 func (s *SPDKLvolManager) DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, identity VolumeIdentity) error {
-	stores, err := listSPDKLvstores()
+	stores, err := listSPDKLvstores(ctx)
 	if err != nil {
 		return err
 	}
-	bdevs, err := listSPDKBdevs()
+	bdevs, err := listSPDKBdevs(ctx)
 	if err != nil {
 		return fmt.Errorf("list SPDK bdevs before deleting %q: %w", volumeName, err)
 	}
@@ -305,8 +332,8 @@ func (s *SPDKLvolManager) DeleteVolume(ctx context.Context, devicePath string, d
 		return err
 	}
 
-	deleteErr := CallSPDKRPC("bdev_lvol_delete", nil, candidate.Name)
-	bdevs, verifyErr := listSPDKBdevs()
+	deleteErr := CallSPDKRPCContext(ctx, "bdev_lvol_delete", nil, candidate.Name)
+	bdevs, verifyErr := listSPDKBdevs(ctx)
 	if verifyErr != nil {
 		return fmt.Errorf("verify SPDK lvol absence after deletion: %w", verifyErr)
 	}

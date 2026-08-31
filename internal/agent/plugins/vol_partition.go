@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -58,12 +59,33 @@ func devicePartitionLock(devicePath string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
+type partedCommandError struct {
+	args   []string
+	output string
+	err    error
+}
+
+func (e *partedCommandError) Error() string {
+	return fmt.Sprintf("parted %s failed: %v; output: %s", strings.Join(e.args, " "), e.err, e.output)
+}
+
+func (e *partedCommandError) Unwrap() error { return e.err }
+
 func runParted(ctx context.Context, args ...string) ([]byte, error) {
 	out, err := executeParted(ctx, args...)
 	if err != nil {
-		return out, fmt.Errorf("parted %s failed: %w; output: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return out, &partedCommandError{args: append([]string(nil), args...), output: strings.TrimSpace(string(out)), err: err}
 	}
 	return out, nil
+}
+
+func isUnrecognizedDiskLabel(err error) bool {
+	var commandErr *partedCommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	detail := strings.ToLower(commandErr.output + " " + commandErr.err.Error())
+	return strings.Contains(detail, "unrecognised disk label") || strings.Contains(detail, "unrecognized disk label")
 }
 
 func parseByteField(value string) (int64, error) {
@@ -204,14 +226,19 @@ func (pv *PartedVolumeManager) SetupStorage(ctx context.Context, devicePath stri
 	if _, _, err := readPartedTable(ctx, devicePath, false); err == nil {
 		klog.InfoS("Storage already has a partition table", "devicePath", devicePath)
 		return nil
+	} else if !isUnrecognizedDiskLabel(err) {
+		return fmt.Errorf("inspect partition table on %s: %w", devicePath, err)
 	}
 
 	klog.InfoS("Wiping device and initializing GPT label", "devicePath", devicePath)
 	if out, err := executeWipefs(ctx, devicePath); err != nil {
-		klog.ErrorS(err, "Ignored wipefs error", "output", string(out))
+		return fmt.Errorf("wipe signatures from %s: %w; output: %s", devicePath, err, strings.TrimSpace(string(out)))
 	}
 	if _, err := runParted(ctx, "-s", devicePath, "mklabel", "gpt"); err != nil {
 		return err
+	}
+	if _, _, err := readPartedTable(ctx, devicePath, false); err != nil {
+		return fmt.Errorf("verify GPT label on %s: %w", devicePath, err)
 	}
 	return nil
 }

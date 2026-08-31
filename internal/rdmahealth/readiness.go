@@ -14,7 +14,18 @@ import (
 const (
 	ReadyCondition  = "Ready"
 	FreshnessWindow = 45 * time.Second
+	MaxFutureSkew   = 5 * time.Second
 )
+
+// HeartbeatIsFresh accepts a small forward skew while rejecting corrupt or
+// materially future-dated observations that would otherwise remain healthy.
+func HeartbeatIsFresh(lastHeartbeat metav1.Time, now time.Time) bool {
+	if lastHeartbeat.IsZero() {
+		return false
+	}
+	age := now.Sub(lastHeartbeat.Time)
+	return age <= FreshnessWindow && age >= -MaxFutureSkew
+}
 
 // ParseUsableIP accepts only unicast addresses that can be used as a remote
 // NVMe-oF endpoint. Link-local addresses are excluded because the persisted
@@ -33,7 +44,7 @@ func Validate(node *storagev1alpha1.RDMAStorageNode, now time.Time) error {
 	if condition == nil || condition.Status != metav1.ConditionTrue {
 		return fmt.Errorf("RDMAStorageNode %s is not Ready", node.Name)
 	}
-	if node.Status.LastHeartbeatTime.IsZero() || now.Sub(node.Status.LastHeartbeatTime.Time) > FreshnessWindow {
+	if !HeartbeatIsFresh(node.Status.LastHeartbeatTime, now) {
 		return fmt.Errorf("RDMAStorageNode %s heartbeat is stale", node.Name)
 	}
 	if _, err := ParseUsableIP(node.Spec.RDMAIP); err != nil {

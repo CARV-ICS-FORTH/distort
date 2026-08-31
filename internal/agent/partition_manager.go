@@ -22,6 +22,7 @@ import (
 	"distort/internal/agent/plugins"
 	attachmentidentity "distort/internal/attachment"
 	"distort/internal/capacity"
+	"distort/internal/placementauth"
 	"distort/internal/rdmahealth"
 	"distort/internal/storageoptions"
 	"distort/internal/volumeidentity"
@@ -31,11 +32,15 @@ const partitionFinalizer = "storage.distort.io/partition-cleanup"
 
 const claimAuthorizationCondition = "ClaimAuthorized"
 
+const placementNotAuthorizedReason = "PlacementNotAuthorized"
+
 const partitionProvisioningCondition = "ProvisioningReady"
 
 const spdkTargetBackend = "spdk"
 
 const exportedHealthInterval = 15 * time.Second
+
+const partitionRetryInterval = 5 * time.Second
 
 func partitionHasTerminalFailure(partition *storagev1alpha1.NVMePartition) bool {
 	condition := meta.FindStatusCondition(partition.Status.Conditions, partitionProvisioningCondition)
@@ -216,6 +221,9 @@ func claimReferencesEqual(a, b *storagev1alpha1.NVMeDeviceClaimReference) bool {
 
 func (p *PartitionManager) verifyProvisioningAuthorization(ctx context.Context, partition *storagev1alpha1.NVMePartition) (*storagev1alpha1.NVMeDevice, error) {
 	recoveringExistingAllocation := partition.Status.ExternalID != "" || partition.Status.BackendVolumeID != ""
+	if !recoveringExistingAllocation && !placementauth.IsAuthorized(partition) {
+		return nil, fmt.Errorf("NVMePartition %s placement was not authorized by the management controller", partition.Name)
+	}
 	claimRef := partition.Spec.ClaimRef
 	if claimRef == nil || claimRef.Namespace == "" || claimRef.Name == "" || claimRef.UID == "" {
 		return nil, fmt.Errorf("NVMePartition %s has no complete owning claim reference", partition.Name)
@@ -284,12 +292,16 @@ func (p *PartitionManager) rejectUnauthorizedProvisioning(
 	err error,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Error(err, "Refused to provision NVMePartition without a valid owning claim", "partition", partition.Name)
-	if statusErr := p.setClaimAuthorizationCondition(ctx, partition, metav1.ConditionFalse, "ClaimOwnershipInvalid", err.Error()); statusErr != nil {
+	reason := "ClaimOwnershipInvalid"
+	if partition.Status.ExternalID == "" && partition.Status.BackendVolumeID == "" && !placementauth.IsAuthorized(partition) {
+		reason = placementNotAuthorizedReason
+	}
+	logger.Error(err, "Refused to provision unauthorized NVMePartition", "partition", partition.Name, "reason", reason)
+	if statusErr := p.setClaimAuthorizationCondition(ctx, partition, metav1.ConditionFalse, reason, err.Error()); statusErr != nil {
 		logger.Error(statusErr, "Failed to record NVMePartition claim authorization", "partition", partition.Name)
 		return ctrl.Result{}, statusErr
 	}
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: partitionRetryInterval}, nil
 }
 
 func (p *PartitionManager) recordProvisioningFailure(
@@ -549,6 +561,10 @@ func (p *PartitionManager) reconcileExportedPartition(
 		err := checker.CheckExport(ctx, partition.Status.NQN, partition.Status.BackendVolumeID,
 			portalIP, partition.Status.PortalPort, partition.Spec.TargetOptions)
 		if err != nil {
+			if plugins.IsExportObservationError(err) {
+				log.FromContext(ctx).Error(err, "Export health could not be observed; retrying without mutation", "nqn", partition.Status.NQN)
+				return true, ctrl.Result{RequeueAfter: partitionRetryInterval}, nil
+			}
 			log.FromContext(ctx).Error(err, "Export health check failed; re-provisioning", "nqn", partition.Status.NQN)
 			return false, ctrl.Result{}, nil
 		}
@@ -560,8 +576,10 @@ func (p *PartitionManager) reconcileExportedPartition(
 	return true, ctrl.Result{RequeueAfter: exportedHealthInterval}, nil
 }
 
+var discoverProvisioningNVMe = DiscoverNVMe
+
 func findProvisioningDevice(partition *storagev1alpha1.NVMePartition, targetBackendName string) (string, string, string, error) {
-	devices, err := DiscoverNVMe()
+	devices, err := discoverProvisioningNVMe()
 	if err != nil {
 		return "", "", "DiscoveryFailed", fmt.Errorf("discover NVMe devices: %w", err)
 	}
@@ -634,6 +652,14 @@ func (p *PartitionManager) provisionPartition(
 		logger.Error(err, "Failed to setup physical device driver for backend")
 		return p.retryableProvisioningFailure(ctx, partition, "DeviceSetupFailed", err)
 	}
+	devicePath, deviceName, failureReason, err := findProvisioningDevice(partition, resolved.targetBackendName)
+	if err != nil {
+		logger.Error(err, "Failed to locate parent NVMe device")
+		return p.retryableProvisioningFailure(ctx, partition, failureReason, err)
+	}
+	if _, err := p.verifyProvisioningAuthorization(ctx, partition); err != nil {
+		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
+	}
 	if device.Status.ActiveBackend == "" {
 		err := p.updateDeviceStatus(ctx, types.NamespacedName{Name: device.Name}, func(status *storagev1alpha1.NVMeDeviceStatus) {
 			status.ActiveBackend = resolved.targetBackendName
@@ -642,15 +668,6 @@ func (p *PartitionManager) provisionPartition(
 			logger.Error(err, "Failed to update NVMeDevice active backend status")
 			return p.retryableProvisioningFailure(ctx, partition, "DeviceStatusUpdateFailed", err)
 		}
-	}
-
-	devicePath, deviceName, failureReason, err := findProvisioningDevice(partition, resolved.targetBackendName)
-	if err != nil {
-		logger.Error(err, "Failed to locate parent NVMe device")
-		return p.retryableProvisioningFailure(ctx, partition, failureReason, err)
-	}
-	if _, err := p.verifyProvisioningAuthorization(ctx, partition); err != nil {
-		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
 	}
 	if err := resolved.volumeManager.SetupStorage(ctx, devicePath, deviceName); err != nil {
 		logger.Error(err, "Failed to configure storage slicing")

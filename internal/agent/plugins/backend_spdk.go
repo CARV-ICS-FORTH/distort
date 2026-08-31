@@ -387,17 +387,17 @@ type spdkSubsystem struct {
 	} `json:"listen_addresses"`
 }
 
-func spdkBdevIdentities(ctx context.Context, blockPath string) (map[string]struct{}, error) {
+func spdkBdevIdentities(ctx context.Context, blockPath string) (map[string]struct{}, bool, error) {
 	var bdevs []struct {
 		Name    string   `json:"name"`
 		UUID    string   `json:"uuid"`
 		Aliases []string `json:"aliases"`
 	}
 	if err := CallSPDKRPCContext(ctx, "bdev_get_bdevs", &bdevs, "-b", blockPath); err != nil {
-		return nil, fmt.Errorf("resolve SPDK backing bdev %s: %w", blockPath, err)
+		return nil, false, fmt.Errorf("resolve SPDK backing bdev %s: %w", blockPath, err)
 	}
 	if len(bdevs) == 0 {
-		return nil, fmt.Errorf("SPDK backing bdev %s is missing", blockPath)
+		return nil, false, nil
 	}
 	identities := map[string]struct{}{blockPath: {}}
 	for _, bdev := range bdevs {
@@ -408,7 +408,7 @@ func spdkBdevIdentities(ctx context.Context, blockPath string) (map[string]struc
 		}
 	}
 	delete(identities, "")
-	return identities, nil
+	return identities, true, nil
 }
 
 func (s *SPDKBackend) findSubsystem(ctx context.Context, nqn string) (*spdkSubsystem, error) {
@@ -424,22 +424,37 @@ func (s *SPDKBackend) findSubsystem(ctx context.Context, nqn string) (*spdkSubsy
 	return nil, nil
 }
 
-// CheckExport restores the supervised target if necessary and verifies the
-// subsystem namespace, listener address, port, and backing bdev.
-func (s *SPDKBackend) CheckExport(ctx context.Context, nqn, blockPath, portalIP string, portalPort int, options map[string]string) error {
+type spdkExportState uint8
+
+const (
+	spdkExportHealthy spdkExportState = iota
+	spdkExportMissing
+	spdkExportMismatch
+	spdkExportObservationUnavailable
+)
+
+type spdkExportInspection struct {
+	state  spdkExportState
+	detail error
+}
+
+func (s *SPDKBackend) inspectExport(ctx context.Context, nqn, blockPath, portalIP string, portalPort int, options map[string]string) spdkExportInspection {
 	if err := EnsureSPDKRunning(ctx, options[storageoptions.SPDKCoreMaskOption]); err != nil {
-		return err
+		return spdkExportInspection{state: spdkExportObservationUnavailable, detail: err}
 	}
 	subsystem, err := s.findSubsystem(ctx, nqn)
 	if err != nil {
-		return fmt.Errorf("list SPDK subsystems: %w", err)
+		return spdkExportInspection{state: spdkExportObservationUnavailable, detail: fmt.Errorf("list SPDK subsystems: %w", err)}
 	}
 	if subsystem == nil {
-		return fmt.Errorf("SPDK subsystem %s is missing", nqn)
+		return spdkExportInspection{state: spdkExportMissing, detail: fmt.Errorf("SPDK subsystem %s is missing", nqn)}
 	}
-	bdevIdentities, err := spdkBdevIdentities(ctx, blockPath)
+	bdevIdentities, found, err := spdkBdevIdentities(ctx, blockPath)
 	if err != nil {
-		return err
+		return spdkExportInspection{state: spdkExportObservationUnavailable, detail: err}
+	}
+	if !found {
+		return spdkExportInspection{state: spdkExportMismatch, detail: fmt.Errorf("SPDK backing bdev %s is missing", blockPath)}
 	}
 	namespaceMatches := false
 	for _, namespace := range subsystem.Namespaces {
@@ -451,7 +466,7 @@ func (s *SPDKBackend) CheckExport(ctx context.Context, nqn, blockPath, portalIP 
 		}
 	}
 	if !namespaceMatches {
-		return fmt.Errorf("SPDK subsystem %s does not use backing bdev %s", nqn, blockPath)
+		return spdkExportInspection{state: spdkExportMismatch, detail: fmt.Errorf("SPDK subsystem %s does not use backing bdev %s", nqn, blockPath)}
 	}
 	listenerMatches := false
 	for _, listener := range subsystem.ListenAddresses {
@@ -461,21 +476,36 @@ func (s *SPDKBackend) CheckExport(ctx context.Context, nqn, blockPath, portalIP 
 		}
 	}
 	if !listenerMatches {
-		return fmt.Errorf("SPDK subsystem %s has no RDMA listener on %s:%d", nqn, portalIP, portalPort)
+		return spdkExportInspection{state: spdkExportMismatch, detail: fmt.Errorf("SPDK subsystem %s has no RDMA listener on %s:%d", nqn, portalIP, portalPort)}
 	}
-	return nil
+	return spdkExportInspection{state: spdkExportHealthy}
+}
+
+// CheckExport verifies the subsystem namespace, listener, and backing bdev.
+// Observation failures are typed so reconciliation can retry without mutation.
+func (s *SPDKBackend) CheckExport(ctx context.Context, nqn, blockPath, portalIP string, portalPort int, options map[string]string) error {
+	inspection := s.inspectExport(ctx, nqn, blockPath, portalIP, portalPort, options)
+	if inspection.state == spdkExportHealthy {
+		return nil
+	}
+	if inspection.state == spdkExportObservationUnavailable {
+		return &ExportObservationError{Err: inspection.detail}
+	}
+	return inspection.detail
 }
 
 func (s *SPDKBackend) ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error) {
 	nqn := volumeidentity.NQN(volumeName)
 	klog.InfoS("Exporting SPDK NVMe-oF target", "blockPath", blockPath, "nqn", nqn, "portalIP", portalIP, "portalPort", portalPort)
 
-	if err := s.CheckExport(ctx, nqn, blockPath, portalIP, portalPort, options); err == nil {
+	inspection := s.inspectExport(ctx, nqn, blockPath, portalIP, portalPort, options)
+	if inspection.state == spdkExportHealthy {
 		return nqn, nil
 	}
-	if existing, err := s.findSubsystem(ctx, nqn); err != nil {
-		return "", fmt.Errorf("inspect existing SPDK subsystem %s: %w", nqn, err)
-	} else if existing != nil {
+	if inspection.state == spdkExportObservationUnavailable {
+		return "", &ExportObservationError{Err: inspection.detail}
+	}
+	if inspection.state == spdkExportMismatch {
 		if err := CallSPDKRPCContext(ctx, "nvmf_delete_subsystem", nil, nqn); err != nil {
 			return "", fmt.Errorf("replace unhealthy SPDK subsystem %s: %w", nqn, err)
 		}
@@ -603,12 +633,12 @@ func (s *SPDKBackend) UnexportVolume(ctx context.Context, nqn string) error {
 }
 
 // ResetSPDKDevice unbinds the SPDK driver from the PCI device and binds it back to the kernel.
-func ResetSPDKDevice(pciAddress string) error {
+func ResetSPDKDevice(ctx context.Context, pciAddress string) error {
 	deviceSetupMu.Lock()
 	defer deviceSetupMu.Unlock()
 
 	klog.InfoS("Resetting device to kernel NVMe driver", "pciAddress", pciAddress)
-	setupCmd := exec.Command("/opt/spdk/scripts/setup.sh", "reset")
+	setupCmd := exec.CommandContext(ctx, "/opt/spdk/scripts/setup.sh", "reset")
 	setupCmd.Env = append(setupCmd.Environ(), "FORCE=1", "PCI_ALLOWED="+pciAddress)
 	if out, err := setupCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("spdk_setup.sh reset failed: %v, output: %s", err, string(out))

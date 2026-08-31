@@ -2,9 +2,24 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
+
+// ExportObservationError reports that export state could not be observed
+// reliably. Reconcilers must retry without changing an existing export.
+type ExportObservationError struct {
+	Err error
+}
+
+func (e *ExportObservationError) Error() string { return e.Err.Error() }
+func (e *ExportObservationError) Unwrap() error { return e.Err }
+
+func IsExportObservationError(err error) bool {
+	var observationErr *ExportObservationError
+	return errors.As(err, &observationErr)
+}
 
 // TargetBackend defines the interface that all target export plugins must implement.
 type TargetBackend interface {

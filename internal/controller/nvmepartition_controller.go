@@ -35,6 +35,7 @@ import (
 
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/capacity"
+	"distort/internal/placementauth"
 	"distort/internal/rdmahealth"
 )
 
@@ -238,6 +239,34 @@ func (r *NVMePartitionReconciler) reserveCandidate(
 			return nil
 		}
 
+		partition.Spec.NodeName = device.Spec.NodeName
+		partition.Spec.ParentDeviceSerialNumber = device.Spec.SerialNumber
+		partition.Spec.ClaimRef = &storagev1alpha1.NVMeDeviceClaimReference{
+			Namespace: device.Status.ClaimRef.Namespace,
+			Name:      device.Status.ClaimRef.Name,
+			UID:       device.Status.ClaimRef.UID,
+		}
+		fingerprint := placementauth.Fingerprint(
+			partition.UID,
+			partition.Spec.NodeName,
+			partition.Spec.ParentDeviceSerialNumber,
+			partition.Spec.ClaimRef,
+		)
+		statusBase := partition.DeepCopy()
+		partition.Status.PlacementFingerprint = fingerprint
+		meta.SetStatusCondition(&partition.Status.Conditions, metav1.Condition{
+			Type:               placementauth.ConditionType,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: partition.Generation + 1,
+			Reason:             "ManagerSelectedPlacement",
+			Message:            "The management controller authorized this exact node, device, and claim placement",
+		})
+		if err := r.Status().Patch(ctx, &partition, client.MergeFrom(statusBase)); err != nil {
+			return err
+		}
+		// A status-subresource response contains the server's still-unassigned
+		// spec. Restore the authorized selection before the spec update while
+		// retaining the resource version returned by the status patch.
 		partition.Spec.NodeName = device.Spec.NodeName
 		partition.Spec.ParentDeviceSerialNumber = device.Spec.SerialNumber
 		partition.Spec.ClaimRef = &storagev1alpha1.NVMeDeviceClaimReference{

@@ -117,13 +117,14 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 	}
 
 	if !exists {
+		if discoveryErr != nil {
+			logger.Error(discoveryErr, "RDMA endpoint discovery failed; postponing RDMAStorageNode creation", "node", r.NodeName)
+			return
+		}
 		nodeCR.Name = r.NodeName
 		nodeCR.Spec.NodeName = r.NodeName
 		nodeCR.Spec.RDMAIP = endpoint.IP
 		nodeCR.Spec.Transport = endpoint.Transport
-		if nodeCR.Spec.Transport == "" {
-			nodeCR.Spec.Transport = storagev1alpha1.RDMATransportRoCEv2
-		}
 		nodeCR.Spec.LinkSpeed = endpoint.LinkSpeed
 		if err := r.Create(ctx, nodeCR); err != nil {
 			logger.Error(err, "Failed to create RDMAStorageNode")
