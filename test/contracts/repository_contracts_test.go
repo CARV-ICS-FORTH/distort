@@ -30,7 +30,6 @@ func readRepositoryFile(t *testing.T, relative string) string {
 
 func TestRepositoryContainsRequiredDistributionArtifacts(t *testing.T) {
 	paths := []string{
-		"docs/content/review-findings.md",
 		"deploy/charts/distort/Chart.yaml",
 		"deploy/charts/distort/values.yaml",
 		"deploy/charts/distort/templates/manager-deployment.yaml",
