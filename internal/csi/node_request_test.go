@@ -429,7 +429,14 @@ func TestNodeStageCancellationDuringUdevWaitUsesIndependentRollbackContext(t *te
 
 func TestNVMeConnectHonorsContextCancellation(t *testing.T) {
 	fakeBin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(fakeBin, "nvme"), []byte("#!/usr/bin/env bash\nexec sleep 10\n"), 0755); err != nil {
+	script := `#!/usr/bin/env bash
+if [ "$1" = "list-subsys" ]; then
+  printf '%s\n' '[{"Subsystems":[]}]'
+  exit 0
+fi
+exec sleep 10
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "nvme"), []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))

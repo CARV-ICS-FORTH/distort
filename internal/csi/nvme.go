@@ -51,6 +51,20 @@ type NVMEHostList []struct {
 func ConnectRDMA(ctx context.Context, nqn, portalIP, portalPort, hostNQN string) (bool, error) {
 	klog.InfoS("Connecting NVMe target", "transport", "rdma", "portalIP", portalIP, "portalPort", portalPort, "nqn", nqn)
 
+	// NodeStageVolume is idempotent. A rapid Pod recreation can stage the same
+	// volume while its node-level NVMe controller is still live, and some
+	// nvme-cli/kernel combinations report a duplicate connect as EINVAL instead
+	// of the more recognizable "already connected" message. Observe the durable
+	// kernel state before issuing another connect rather than relying on CLI
+	// error text.
+	if devicePath, err := GetDeviceByNQN(ctx, nqn); err == nil {
+		klog.InfoS("NVMe target is already connected", "nqn", nqn, "devicePath", devicePath)
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("inspect existing NVMe connection: %w", err)
+	}
+
 	cmd := exec.CommandContext(ctx, "nvme", "connect", "-t", "rdma", "-a", portalIP, "-s", portalPort, "-n", nqn, "--hostnqn", hostNQN)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -61,6 +75,14 @@ func ConnectRDMA(ctx context.Context, nqn, portalIP, portalPort, hostNQN string)
 		}
 		if strings.Contains(string(out), "already connected") {
 			klog.InfoS("NVMe target is already connected", "nqn", nqn)
+			return false, nil
+		}
+		// A concurrent stage may have connected the controller after the
+		// observation above. Prefer the resulting live kernel state over
+		// version-specific nvme-cli error wording and leave that connection owned
+		// by the successful staging operation.
+		if devicePath, observationErr := GetDeviceByNQN(ctx, nqn); observationErr == nil {
+			klog.InfoS("NVMe target became connected concurrently", "nqn", nqn, "devicePath", devicePath)
 			return false, nil
 		}
 		return true, fmt.Errorf("nvme connect failed: %v, output: %s", err, string(out))
