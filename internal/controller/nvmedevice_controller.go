@@ -78,7 +78,7 @@ func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Calculate free capacity by iterating over NVMePartitions assigned to this device
 	var partitionList storagev1alpha1.NVMePartitionList
 	if err := r.List(ctx, &partitionList); err != nil {
-		logger.Error(err, "unable to list NVMePartitions for free capacity calculation")
+		logger.Error(err, "Unable to list NVMePartitions for free capacity calculation")
 		return ctrl.Result{}, err
 	}
 

@@ -153,7 +153,7 @@ kubectl get nvmedeviceclaims
 
 Once hardware claims are active, developers can request volume allocations using standard Kubernetes StorageClasses and PVCs.
 
-DISTORT rounds each requested volume upward to a 4 MiB allocation unit shared by
+DISTORT rounds each requested volume upward to a 1 MiB allocation unit shared by
 the kernel and SPDK backends. Device capacity already excludes a conservative
 metadata reserve, so capacity accepted before a backend transition remains
 allocatable afterward. A CSI request with `limitBytes` is rejected if this

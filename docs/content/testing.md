@@ -114,15 +114,15 @@ The E2E suite refuses to run unless the active kubeconfig server is `https://192
 | F8 (resolved) | Command/udev failures, cancellation, insufficient space, and incorrect partition boundaries fail creation | Plugin unit |
 | F9 (resolved) | CreateVolume retries compare a persisted fingerprint of capacity bounds, manager, filesystem, capability, and options | CSI unit + generated CRD schema |
 | F10 (resolved) | Unsupported capabilities and mount flags are rejected; read-only publish uses bind-remount semantics | CSI controller/node unit |
-| F11 | Validation precedes connection and failed staging disconnects the target | CSI node failure-injection unit |
-| F12 | Existing stage/publish mounts must match the expected source | CSI node unit |
-| F13 | Missing hardware requeues and active claims follow device movement | Envtest |
-| F14 | Deleting an old claim cannot release a replacement claim's device | Envtest |
+| F11 (resolved) | Validation precedes connection and failed staging disconnects the target | CSI node failure-injection unit |
+| F12 (resolved) | Existing stage/publish mounts must match the expected source | CSI node unit |
+| F13 (resolved) | Missing hardware requeues and active claims follow device movement | Envtest |
+| F14 (resolved) | Deleting an old claim cannot release a replacement claim's device | Envtest |
 | F15 (resolved) | Exact allow/exclude semantics, mounted devices, failed mount inspection, and the explicit unsafe override | Agent fake-sysfs unit |
 | F16 (resolved) | Live RDMA interface/IP/transport discovery, fresh readiness, no loopback fallback, and active export count | Agent/controller unit + Vagrant smoke |
 | F17 (resolved) | Bounded RPC and exact export health checks; SPDK process crash restores the exported target | Plugin/agent unit + Vagrant recovery E2E |
 | F18 (resolved) | Separate chart identities plus required/forbidden permission matrix | Repository contract + E2E RBAC |
-| F19 | Permanent plugin errors become terminal rather than hot-looping | Agent unit |
+| F19 (resolved) | Permanent plugin errors become terminal rather than hot-looping | Agent unit |
 | F20 (resolved) | Unimplemented LVM is rejected by CSI, CRD, and admission | CSI + repository contract + E2E admission |
 | F21 (resolved) | Every sample is concrete, schema-valid, and server-side dry-run tested; agent-owned examples are not applied by default | Envtest + repository contract |
 | F22 (resolved) | Behavior-focused controller, CSI, agent, plugin, contract, and E2E suites | Entire suite |

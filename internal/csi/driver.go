@@ -2,11 +2,13 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -52,13 +54,18 @@ func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
 	return d
 }
 
-func (d *Driver) Run() error {
+const gracefulStopTimeout = 10 * time.Second
+
+// Run serves CSI requests until the context is cancelled or the server fails.
+// Cancellation stops accepting new RPCs and gives in-flight requests a bounded
+// window to finish before the server is forced down.
+func (d *Driver) Run(ctx context.Context) error {
 	listener, err := listenEndpoint(d.endpoint)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := listener.Close(); err != nil {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			klog.ErrorS(err, "Failed to close CSI listener")
 		}
 	}()
@@ -69,8 +76,32 @@ func (d *Driver) Run() error {
 	csi.RegisterNodeServer(server, d.ns)
 
 	klog.InfoS("Starting CSI GRPC server", "endpoint", d.endpoint)
-	if err := server.Serve(listener); err != nil {
-		return fmt.Errorf("serve CSI GRPC endpoint: %w", err)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			return fmt.Errorf("serve CSI GRPC endpoint: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		klog.InfoS("Stopping CSI GRPC server")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(gracefulStopTimeout):
+		klog.InfoS("Forcing CSI GRPC server shutdown after grace period", "timeout", gracefulStopTimeout)
+		server.Stop()
 	}
 	return nil
 }

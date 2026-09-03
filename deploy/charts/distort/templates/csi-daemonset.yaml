@@ -30,6 +30,15 @@ spec:
               mountPath: /csi
             - name: registration-dir
               mountPath: /registration
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+          args:
+            - --csi-address=/csi/csi.sock
+            # The node Pod uses host networking, so use a project-specific port.
+            - --health-port=19808
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
         - name: csi-driver
           image: {{ include "distort.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -45,6 +54,18 @@ spec:
                   fieldPath: spec.nodeName
           securityContext:
             privileged: true
+          ports:
+            - name: healthz
+              containerPort: 19808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
           volumeMounts:
             - name: dev
               mountPath: /dev

@@ -30,6 +30,7 @@ func readRepositoryFile(t *testing.T, relative string) string {
 
 func TestRepositoryContainsRequiredDistributionArtifacts(t *testing.T) {
 	paths := []string{
+		"docs/content/review-findings.md",
 		"deploy/charts/distort/Chart.yaml",
 		"deploy/charts/distort/values.yaml",
 		"deploy/charts/distort/templates/manager-deployment.yaml",
@@ -71,6 +72,41 @@ func TestChartEnablesControllerAttachmentFencing(t *testing.T) {
 	for _, resource := range resources {
 		if !strings.Contains(rbac, `"`+resource+`"`) {
 			t.Errorf("chart RBAC does not include %s", resource)
+		}
+	}
+}
+
+func TestChartWiresWorkloadHealthChecks(t *testing.T) {
+	manager := readRepositoryFile(t, "deploy/charts/distort/templates/manager-deployment.yaml")
+	for _, requiredText := range []string{"livenessProbe:", "readinessProbe:", "path: /healthz", "path: /readyz"} {
+		if !strings.Contains(manager, requiredText) {
+			t.Errorf("manager deployment is missing %q", requiredText)
+		}
+	}
+
+	agent := readRepositoryFile(t, "deploy/charts/distort/templates/agent-daemonset.yaml")
+	for _, requiredText := range []string{
+		"--metrics-bind-address=0", "--health-probe-bind-address=:18081",
+		"livenessProbe:", "readinessProbe:", "path: /healthz", "path: /readyz",
+	} {
+		if !strings.Contains(agent, requiredText) {
+			t.Errorf("agent DaemonSet is missing %q", requiredText)
+		}
+	}
+
+	for _, workload := range []string{
+		"deploy/charts/distort/templates/csi-controller.yaml",
+		"deploy/charts/distort/templates/csi-daemonset.yaml",
+	} {
+		manifest := readRepositoryFile(t, workload)
+		requiredTexts := []string{
+			"name: liveness-probe", "sig-storage/livenessprobe:",
+			"livenessProbe:", "path: /healthz",
+		}
+		for _, requiredText := range requiredTexts {
+			if !strings.Contains(manifest, requiredText) {
+				t.Errorf("%s is missing %q", workload, requiredText)
+			}
 		}
 	}
 }

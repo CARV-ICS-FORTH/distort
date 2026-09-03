@@ -26,6 +26,19 @@ spec:
             - /usr/local/bin/distort-manager
           args:
             - --leader-elect
+            - --health-probe-bind-address=:8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
           resources:
             {{- toYaml .Values.manager.resources | nindent 12 }}
       {{- include "distort.scheduling" (list . .Values.manager) | nindent 6 }}

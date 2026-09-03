@@ -36,6 +36,11 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - /usr/local/bin/distort-agent
+          args:
+            # The agent uses host networking. Keep its local listeners away
+            # from common host ports and disable unused metrics by default.
+            - --metrics-bind-address=0
+            - --health-probe-bind-address=:18081
           {{- if ne (empty .Values.agent.spdk.iobufSmallPoolCount) (empty .Values.agent.spdk.iobufLargePoolCount) }}
           {{- fail "agent.spdk.iobufSmallPoolCount and agent.spdk.iobufLargePoolCount must be configured together" }}
           {{- end }}
@@ -63,6 +68,18 @@ spec:
             {{- end }}
           securityContext:
             privileged: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 18081
+            initialDelaySeconds: 5
+            periodSeconds: 10
           volumeMounts:
             - name: dev
               mountPath: /dev

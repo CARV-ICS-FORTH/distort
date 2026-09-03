@@ -28,9 +28,9 @@ func init() {
 
 func main() {
 	var endpoint string
-	var nodeId string
+	var nodeID string
 	flag.StringVar(&endpoint, "endpoint", csi.DefaultEndpoint, "CSI endpoint")
-	flag.StringVar(&nodeId, "nodeid", "", "node id")
+	flag.StringVar(&nodeID, "nodeid", "", "Kubernetes node ID")
 
 	opts := zap.Options{
 		Development: true,
@@ -40,29 +40,29 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if nodeId == "" {
-		setupLog.Error(nil, "nodeid is required")
+	if nodeID == "" {
+		setupLog.Error(nil, "Node ID is required")
 		os.Exit(1)
 	}
 
-	setupLog.Info("Starting Distort CSI Driver", "nodeID", nodeId, "endpoint", endpoint)
+	setupLog.Info("Starting DISTORT CSI driver", "nodeID", nodeID, "endpoint", endpoint)
 
 	// Initialize K8s Client
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
-		setupLog.Error(err, "unable to get kubeconfig")
+		setupLog.Error(err, "Unable to get Kubernetes configuration")
 		os.Exit(1)
 	}
 
 	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
-		setupLog.Error(err, "unable to create kubernetes client")
+		setupLog.Error(err, "Unable to create Kubernetes client")
 		os.Exit(1)
 	}
 
 	// Initialize CSI Driver (Identity, Controller, Node servers)
-	driver := csi.NewDriver(nodeId, endpoint, k8sClient)
-	if err := driver.Run(); err != nil {
+	driver := csi.NewDriver(nodeID, endpoint, k8sClient)
+	if err := driver.Run(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "CSI driver stopped")
 		os.Exit(1)
 	}

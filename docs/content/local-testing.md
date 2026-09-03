@@ -22,7 +22,7 @@ There is no need to uninstall the Helm release or rebuild the VMs for each chang
 
 The two namespaces per controller deliberately exercise multi-namespace
 discovery. DISTORT currently manages only namespace ID 1 under both kernel and
-SPDK backends. After its one-percent backend-metadata reserve and 4 MiB
+SPDK backends. After its one-percent backend-metadata reserve and 1 MiB
 allocation alignment, each lab `NVMeDevice` advertises 1012 MiB. Namespace ID 2
 remains untouched and is not available to placement.
 

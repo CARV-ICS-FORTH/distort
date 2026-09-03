@@ -1,18 +1,55 @@
 package csi
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDriverRunRejectsMalformedEndpoint(t *testing.T) {
 	driver := NewDriver("test-node", "missing-scheme", nil)
-	err := driver.Run()
+	err := driver.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "invalid endpoint format") {
 		t.Fatalf("Run() error = %v, want invalid endpoint format", err)
+	}
+}
+
+func TestDriverRunStopsWhenContextIsCancelled(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "csi.sock")
+	driver := NewDriver("test-node", "unix://"+socketPath, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- driver.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		info, err := os.Lstat(socketPath)
+		if err == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("inspect CSI socket: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CSI socket was not created before timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned an error during graceful shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not stop after context cancellation")
 	}
 }
 

@@ -30,7 +30,7 @@ type TargetBackend interface {
 	SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error
 
 	// ExportVolume exports a block device or volume as an NVMe-oF target.
-	// Returns NQN, Portal IP, Portal Port, and error
+	// Returns the exported subsystem NQN and an error.
 	ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error)
 
 	// UnexportVolume removes the NVMe-oF target export for the given volume.

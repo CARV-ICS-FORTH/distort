@@ -287,7 +287,12 @@ The current reporter is polling-based. It does not receive a hardware event dire
 - the observed generation;
 - the last transition time.
 
-The DISTORT API types contain condition fields, but most current code uses simpler fields such as `State`, `Active`, and `ActiveBackend` and does not yet populate conditions consistently. Production diagnostics would benefit from using conditions for transient failures and readiness.
+DISTORT retains compact state fields such as `State`, `Active`, and
+`ActiveBackend` for convenient display. Controllers also publish conditions for
+claim ownership, provisioning, attachment access, RDMA readiness, hardware
+availability, and per-source inventory health. New reconciliation paths should
+use conditions for actionable reasons while keeping state fields backward
+compatible.
 
 ## 3. CSI and gRPC
 
@@ -352,14 +357,18 @@ The Controller service runs in the CSI controller Deployment. DISTORT implements
 1. validates the CSI request;
 2. reads capacity and StorageClass parameters, accepting either a required
    capacity or a limit-only range, and rounds the allocation to the shared
-   4 MiB kernel/SPDK allocation unit;
+   1 MiB kernel/SPDK allocation unit;
 3. creates an `NVMePartition`;
 4. waits for its status to become `Exported`;
 5. returns a CSI volume containing the NQN, portal IP, and portal port in `VolumeContext`.
 
-The method currently polls the `NVMePartition` every five seconds with a two-minute internal timeout.
+The method polls the `NVMePartition` until it is exported or the CSI request
+deadline is cancelled.
 
-`CreateVolume` must be idempotent because the external provisioner may repeat it with the same name. The code handles `AlreadyExists` by fetching the existing partition and checking at least its target backend before continuing.
+`CreateVolume` must be idempotent because the external provisioner may repeat it
+with the same name. The code persists a request fingerprint covering capacity,
+backend, volume manager, filesystem, capability, and target options. An
+`AlreadyExists` retry continues only when that immutable fingerprint matches.
 
 `ValidateVolumeCapabilities` resolves the exact namespace/name/UID-bearing
 volume handle before confirming it. When supplied, volume context and creation
@@ -688,7 +697,7 @@ volume manager cannot address. A controller without namespace ID 1 is degraded
 rather than guessed.
 
 Discovery reserves one percent of namespace ID 1 and rounds the remainder down
-to the 4 MiB allocation unit before publishing capacity. This conservative
+to the 1 MiB allocation unit before publishing capacity. This conservative
 control-plane calculation covers GPT boundaries and SPDK blobstore metadata
 without an extra command or RPC, ensuring that a request accepted before driver
 rebinding remains allocatable afterward.
@@ -986,13 +995,15 @@ The current code has several areas that should be understood as engineering work
 - Exported partitions are checked periodically. SPDK validation verifies the
   exact namespace backing bdev and RDMA listener; kernel validation verifies and
   repairs its exact configfs namespace, listener, and port link.
-- The child `nvmf_tgt` exit is logged, but there is no dedicated supervisor loop.
-- Several external commands do not consistently use the reconciliation context, so cancellation and command timeouts are incomplete.
-- CSI `CreateVolume` uses polling and an internal timeout rather than a watch.
-- CSI `DeleteVolume` does not wait for finalizer-driven cleanup.
+- The managed `nvmf_tgt` process is observed and restarted during export
+  reconciliation rather than by a separate long-running process supervisor.
+- CSI `CreateVolume` uses context-bounded polling rather than a watch.
+- CSI `DeleteVolume` waits for finalizer-driven cleanup within the caller's RPC
+  deadline; a timeout is returned as retryable incomplete cleanup.
 - `GetDeviceByNQN` assumes namespace 1 and constructs `<controller>n1`.
 - Formatting supports ext4 and XFS, preserves an existing matching filesystem, and rejects a mismatch. Custom format flags and StorageClass mount options remain unsupported.
-- Access modes are not comprehensively enforced.
+- Only `SINGLE_NODE_WRITER` mounted volumes are admitted; additional access
+  modes and raw block volumes are not implemented.
 - Controller-side attachment fencing is implemented, but the corrected forced
   takeover path still requires final two-node hardware verification that the old
   consumer can no longer perform I/O.
