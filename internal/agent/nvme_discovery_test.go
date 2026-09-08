@@ -1,0 +1,262 @@
+package agent
+
+import (
+	"math"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+const testNamespaceBlocks = int64(2 * 1024 * 1024)
+
+func writeDiscoveryFile(t *testing.T, path, value string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(value), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setupDiscoveryFixture(t *testing.T) string {
+	t.Helper()
+	oldNVMe, oldBlock := sysClassNVMe, sysClassBlock
+	root := t.TempDir()
+	sysClassNVMe = filepath.Join(root, "nvme")
+	sysClassBlock = filepath.Join(root, "block")
+	t.Cleanup(func() {
+		sysClassNVMe = oldNVMe
+		sysClassBlock = oldBlock
+	})
+
+	controller := filepath.Join(sysClassNVMe, "nvme0")
+	writeDiscoveryFile(t, filepath.Join(controller, "transport"), "pcie\n")
+	writeDiscoveryFile(t, filepath.Join(controller, "model"), "Virtual NVMe\n")
+	writeDiscoveryFile(t, filepath.Join(controller, "serial"), "SERIAL-1\n")
+	writeDiscoveryFile(t, filepath.Join(controller, "numa_node"), "2\n")
+	if err := os.Symlink("../../../devices/pci0000:00/0000:01:00.0", filepath.Join(controller, "device")); err != nil {
+		t.Fatal(err)
+	}
+	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n1", "size"), "2097152\n")
+
+	fakeBin := t.TempDir()
+	lsblk := filepath.Join(fakeBin, "lsblk")
+	script := "#!/usr/bin/env bash\nif [[ ${LSBLK_FAIL:-0} == 1 ]]; then exit 9; fi\nprintf '%s\\n' \"${LSBLK_OUTPUT:-}\"\n"
+	if err := os.WriteFile(lsblk, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("NVME_ALLOWED_DEVICES", "")
+	t.Setenv("NVME_EXCLUDE_DEVICES", "")
+	t.Setenv("LSBLK_FAIL", "0")
+	t.Setenv("LSBLK_OUTPUT", "")
+	t.Setenv(unsafeMountInspectionEnv, "false")
+	return "0000:01:00.0"
+}
+
+func TestDiscoverKernelNVMeReadsHardwareAndCapacity(t *testing.T) {
+	pciAddress := setupDiscoveryFixture(t)
+	devices, err := discoverKernelNVMe()
+	if err != nil {
+		t.Fatalf("discoverKernelNVMe returned error: %v", err)
+	}
+	if len(devices) != 1 {
+		t.Fatalf("discovered %d devices, want 1: %#v", len(devices), devices)
+	}
+	device := devices[0]
+	if device.PCIAddress != pciAddress || device.SerialNumber != "SERIAL-1" || device.Model != "Virtual NVMe" || device.NUMANode != 2 {
+		t.Fatalf("unexpected discovered metadata: %#v", device)
+	}
+	wantCapacity := int64(1012 * 1024 * 1024)
+	if device.TotalBytes != wantCapacity {
+		t.Fatalf("TotalBytes = %d, want %d", device.TotalBytes, wantCapacity)
+	}
+}
+
+func spdkNamespaceBdev(name string, nsid, numBlocks int64) SpdkBdev {
+	return SpdkBdev{
+		Name: name, NumBlocks: numBlocks, BlockSize: 512,
+		DriverSpecific: &spdkDriverSpecific{NVMe: []spdkNVMeNamespace{{
+			PCIAddress: "0000:01:00.0", NSData: spdkNVMeNamespaceData{ID: nsid},
+			CtrlrData: spdkNVMeControllerData{ModelNumber: "Virtual NVMe", SerialNumber: "SERIAL-1"},
+		}}},
+	}
+}
+
+func TestMultiNamespaceCapacityIsStableAcrossKernelAndSPDK(t *testing.T) {
+	setupDiscoveryFixture(t)
+	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n2", "size"), "4194304\n")
+
+	kernelDevices, err := discoverKernelNVMe()
+	if err != nil || len(kernelDevices) != 1 {
+		t.Fatalf("kernel discovery returned devices=%#v err=%v", kernelDevices, err)
+	}
+	spdkDevices, err := hardwareFromSPDKBdevs([]SpdkBdev{
+		spdkNamespaceBdev("Nvme0n2", 2, 2*testNamespaceBlocks),
+		spdkNamespaceBdev("Nvme0n1", 1, testNamespaceBlocks),
+	}, discoveryPolicy{})
+	if err != nil || len(spdkDevices) != 1 {
+		t.Fatalf("SPDK discovery returned devices=%#v err=%v", spdkDevices, err)
+	}
+
+	kernel, spdk := kernelDevices[0], spdkDevices[0]
+	if kernel.TotalBytes != 1012*1024*1024 || spdk.TotalBytes != kernel.TotalBytes {
+		t.Fatalf("managed capacity changed across backends: kernel=%d SPDK=%d", kernel.TotalBytes, spdk.TotalBytes)
+	}
+	if kernel.SerialNumber != spdk.SerialNumber || kernel.PCIAddress != spdk.PCIAddress {
+		t.Fatalf("managed identity changed across backends: kernel=%#v SPDK=%#v", kernel, spdk)
+	}
+	if spdk.Name != "Nvme0n1" {
+		t.Fatalf("SPDK selected bdev %q, want namespace 1", spdk.Name)
+	}
+}
+
+func TestDiscoveryRejectsMissingPrimaryNamespaceAndUnsafeCapacity(t *testing.T) {
+	setupDiscoveryFixture(t)
+	if err := os.RemoveAll(filepath.Join(sysClassBlock, "nvme0n1")); err != nil {
+		t.Fatal(err)
+	}
+	writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n2", "size"), "4096\n")
+	if devices, err := discoverKernelNVMe(); err == nil || len(devices) != 0 {
+		t.Fatalf("kernel discovery without namespace 1 returned devices=%#v err=%v", devices, err)
+	}
+
+	missingNSID := spdkNamespaceBdev("Nvme0n1", 0, 4096)
+	if devices, err := hardwareFromSPDKBdevs([]SpdkBdev{missingNSID}, discoveryPolicy{}); err == nil || len(devices) != 0 {
+		t.Fatalf("SPDK discovery without NSID returned devices=%#v err=%v", devices, err)
+	}
+
+	overflow := spdkNamespaceBdev("Nvme0n1", 1, math.MaxInt64)
+	if devices, err := hardwareFromSPDKBdevs([]SpdkBdev{overflow}, discoveryPolicy{}); err == nil || len(devices) != 0 {
+		t.Fatalf("overflowing SPDK capacity returned devices=%#v err=%v", devices, err)
+	}
+
+	tooSmall := spdkNamespaceBdev("Nvme0n1", 1, 1)
+	if devices, err := hardwareFromSPDKBdevs([]SpdkBdev{tooSmall}, discoveryPolicy{}); err == nil || len(devices) != 0 {
+		t.Fatalf("sub-allocation-unit SPDK capacity returned devices=%#v err=%v", devices, err)
+	}
+}
+
+func TestDiscoverKernelNVMeSkipsMountedNamespaces(t *testing.T) {
+	setupDiscoveryFixture(t)
+	t.Setenv("LSBLK_OUTPUT", "/var/lib/data")
+	devices, err := discoverKernelNVMe()
+	if err != nil {
+		t.Fatalf("discoverKernelNVMe returned error: %v", err)
+	}
+	if len(devices) != 0 {
+		t.Fatalf("mounted device was discovered: %#v", devices)
+	}
+}
+
+func TestDiscoveryFiltersUseExactCommaSeparatedPCIAddresses(t *testing.T) {
+	pciAddress := setupDiscoveryFixture(t)
+	t.Setenv("NVME_ALLOWED_DEVICES", "prefix-"+pciAddress+"-suffix")
+	devices, err := discoverKernelNVMe()
+	if err == nil && len(devices) != 0 {
+		t.Fatalf("substring allow-list entry incorrectly admitted %s", pciAddress)
+	}
+}
+
+func TestDiscoveryFailsSafeWhenMountInspectionFails(t *testing.T) {
+	setupDiscoveryFixture(t)
+	t.Setenv("LSBLK_FAIL", "1")
+	devices, err := discoverKernelNVMe()
+	if err == nil && len(devices) != 0 {
+		t.Fatalf("device was admitted after lsblk failed: %#v", devices)
+	}
+}
+
+func TestDiscoveryNormalizesAndDeduplicatesPCIAddressLists(t *testing.T) {
+	pciAddress := setupDiscoveryFixture(t)
+	t.Setenv("NVME_ALLOWED_DEVICES", " 0000:01:00.0,0000:01:00.0 ")
+	devices, err := discoverKernelNVMe()
+	if err != nil || len(devices) != 1 || devices[0].PCIAddress != pciAddress {
+		t.Fatalf("normalized allow list returned devices=%#v err=%v", devices, err)
+	}
+	t.Setenv("NVME_EXCLUDE_DEVICES", " 0000:01:00.0 ")
+	devices, err = discoverKernelNVMe()
+	if err != nil || len(devices) != 0 {
+		t.Fatalf("exact exclusion returned devices=%#v err=%v", devices, err)
+	}
+}
+
+func TestDiscoveryRejectsMalformedPCIAddressLists(t *testing.T) {
+	setupDiscoveryFixture(t)
+	for _, value := range []string{"0000:01:00.0,", "not-a-pci-address", "0000:01:00.8"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("NVME_ALLOWED_DEVICES", value)
+			if _, err := discoverKernelNVMe(); err == nil {
+				t.Fatalf("malformed allow list %q was accepted", value)
+			}
+		})
+	}
+}
+
+func TestUnsafeMountInspectionOverrideIsExplicit(t *testing.T) {
+	setupDiscoveryFixture(t)
+	t.Setenv("LSBLK_FAIL", "1")
+	t.Setenv(unsafeMountInspectionEnv, "true")
+	devices, err := discoverKernelNVMe()
+	if err != nil || len(devices) != 1 {
+		t.Fatalf("unsafe override returned devices=%#v err=%v", devices, err)
+	}
+}
+
+func TestDiscoveryRejectsIncompleteKernelMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T)
+	}{
+		{
+			name: "empty serial",
+			mutate: func(t *testing.T) {
+				writeDiscoveryFile(t, filepath.Join(sysClassNVMe, "nvme0", "serial"), "\n")
+			},
+		},
+		{
+			name: "missing PCI identity",
+			mutate: func(t *testing.T) {
+				if err := os.Remove(filepath.Join(sysClassNVMe, "nvme0", "device")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "zero capacity",
+			mutate: func(t *testing.T) {
+				writeDiscoveryFile(t, filepath.Join(sysClassBlock, "nvme0n1", "size"), "0\n")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupDiscoveryFixture(t)
+			test.mutate(t)
+			devices, err := discoverKernelNVMe()
+			if err == nil {
+				t.Fatal("unsafe metadata did not degrade discovery")
+			}
+			if len(devices) != 0 {
+				t.Fatalf("unsafe metadata produced devices: %#v", devices)
+			}
+		})
+	}
+}
+
+func TestDiscoveryReturnsSafePartialKernelResults(t *testing.T) {
+	setupDiscoveryFixture(t)
+	invalid := filepath.Join(sysClassNVMe, "nvme1")
+	writeDiscoveryFile(t, filepath.Join(invalid, "transport"), "pcie\n")
+	writeDiscoveryFile(t, filepath.Join(invalid, "serial"), "\n")
+
+	devices, err := discoverKernelNVMe()
+	if err == nil {
+		t.Fatal("partial kernel scan did not report its invalid controller")
+	}
+	if len(devices) != 1 || devices[0].SerialNumber != "SERIAL-1" {
+		t.Fatalf("safe partial result = %#v, want the valid controller", devices)
+	}
+}

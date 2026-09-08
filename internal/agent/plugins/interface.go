@@ -2,9 +2,24 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
+
+// ExportObservationError reports that export state could not be observed
+// reliably. Reconcilers must retry without changing an existing export.
+type ExportObservationError struct {
+	Err error
+}
+
+func (e *ExportObservationError) Error() string { return e.Err.Error() }
+func (e *ExportObservationError) Unwrap() error { return e.Err }
+
+func IsExportObservationError(err error) bool {
+	var observationErr *ExportObservationError
+	return errors.As(err, &observationErr)
+}
 
 // TargetBackend defines the interface that all target export plugins must implement.
 type TargetBackend interface {
@@ -15,11 +30,36 @@ type TargetBackend interface {
 	SetupDevice(ctx context.Context, pciAddress string, deviceName string, options map[string]string) error
 
 	// ExportVolume exports a block device or volume as an NVMe-oF target.
-	// Returns NQN, Portal IP, Portal Port, and error
+	// Returns the exported subsystem NQN and an error.
 	ExportVolume(ctx context.Context, volumeName string, blockPath string, portalIP string, portalPort int, options map[string]string) (string, error)
 
 	// UnexportVolume removes the NVMe-oF target export for the given volume.
 	UnexportVolume(ctx context.Context, nqn string) error
+
+	// ReconcileHostAccess makes hostNQN the only host authorized for the
+	// subsystem. An empty hostNQN revokes all access. Implementations must revoke
+	// old connections before authorizing a replacement host.
+	ReconcileHostAccess(ctx context.Context, nqn string, hostNQN string) error
+}
+
+// ExportHealthChecker verifies the complete persisted export identity. Backends
+// implementing it may also restore their supervised target process before the
+// check; a failed check causes idempotent reprovisioning.
+type ExportHealthChecker interface {
+	CheckExport(ctx context.Context, nqn, blockPath, portalIP string, portalPort int, options map[string]string) error
+}
+
+// VolumeIdentity contains the stable backend identifiers needed to address one
+// carved volume exactly. Managers that do not expose structured identities only
+// need to set BackendVolumeID.
+type VolumeIdentity struct {
+	BackendVolumeID string
+	CapacityBytes   int64
+	BaseBdev        string
+	VolumeStoreName string
+	VolumeStoreUUID string
+	VolumeName      string
+	VolumeUUID      string
 }
 
 // VolumeManager defines the interface that all volume carving/management plugins must implement.
@@ -31,11 +71,11 @@ type VolumeManager interface {
 	SetupStorage(ctx context.Context, devicePath string, deviceName string) error
 
 	// CreateVolume carves out a volume of the specified size (in bytes)
-	// Returns the path to the resulting block device/volume and error
-	CreateVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, sizeBytes int64) (string, error)
+	// Returns the stable identity of the resulting block device/volume and error.
+	CreateVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, sizeBytes int64) (VolumeIdentity, error)
 
-	// DeleteVolume deletes the carved volume
-	DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string) error
+	// DeleteVolume deletes the exact carved volume returned by CreateVolume.
+	DeleteVolume(ctx context.Context, devicePath string, deviceName string, volumeName string, identity VolumeIdentity) error
 }
 
 var (

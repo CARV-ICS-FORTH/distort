@@ -6,4 +6,5 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: nvmedeviceclaim-sample
 spec:
-  # TODO(user): Add fields here
+  # Replace this value with an exact serial from `kubectl get nvmedevices`.
+  serialNumber: REPLACE-WITH-A-DISCOVERED-SERIAL

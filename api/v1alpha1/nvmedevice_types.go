@@ -29,6 +29,8 @@ const (
 	NVMeDeviceStateAvailable NVMeDeviceState = "Available"
 	// NVMeDeviceStateClaimed means the device has been claimed by an admin.
 	NVMeDeviceStateClaimed NVMeDeviceState = "Claimed"
+	// NVMeDeviceStateUnavailable means the device is no longer visible to its reporting agent.
+	NVMeDeviceStateUnavailable NVMeDeviceState = "Unavailable"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -38,22 +40,28 @@ const (
 type NVMeDeviceSpec struct {
 	// NodeName is the name of the Kubernetes node where the device is attached.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	NodeName string `json:"nodeName"`
 
 	// PCIAddress is the PCIe address of the NVMe controller (e.g., "0000:01:00.0").
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern="^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$"
 	PCIAddress string `json:"pciAddress"`
 
 	// SerialNumber is the device's hardware serial number. Used for claim matching.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	SerialNumber string `json:"serialNumber"`
 
 	// Model is the model name/number of the NVMe device.
 	// +optional
 	Model string `json:"model,omitempty"`
 
-	// TotalCapacity is the total raw size of the device.
+	// TotalCapacity is the allocatable capacity of namespace ID 1 after reserving
+	// backend metadata space. DISTORT manages this namespace consistently under
+	// kernel and SPDK; other namespaces are not advertised or modified.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="totalCapacity must be positive"
 	TotalCapacity resource.Quantity `json:"totalCapacity"`
 
 	// NUMANode indicates the NUMA topology node the device is connected to.
@@ -64,9 +72,13 @@ type NVMeDeviceSpec struct {
 // NVMeDeviceStatus defines the observed state of NVMeDevice.
 type NVMeDeviceStatus struct {
 	// State represents the current lifecycle state of the device.
-	// +kubebuilder:validation:Enum=Available;Claimed
+	// +kubebuilder:validation:Enum=Available;Claimed;Unavailable
 	// +kubebuilder:default=Available
 	State NVMeDeviceState `json:"state,omitempty"`
+
+	// ClaimRef identifies the exact active claim that owns this device.
+	// +optional
+	ClaimRef *NVMeDeviceClaimReference `json:"claimRef,omitempty"`
 
 	// FreeCapacity is the remaining unallocated capacity on the device.
 	FreeCapacity resource.Quantity `json:"freeCapacity,omitempty"`

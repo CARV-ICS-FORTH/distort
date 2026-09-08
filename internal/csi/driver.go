@@ -2,10 +2,13 @@ package csi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -16,8 +19,9 @@ import (
 )
 
 const (
-	DriverName    = "storage.distort.io"
-	VendorVersion = "0.1.0"
+	DriverName      = "storage.distort.io"
+	VendorVersion   = "0.5.0"
+	DefaultEndpoint = "unix:///tmp/csi.sock"
 )
 
 type Driver struct {
@@ -34,7 +38,7 @@ type Driver struct {
 }
 
 func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
-	klog.Infof("Creating new CSI driver: name=%s nodeID=%s endpoint=%s", DriverName, nodeID, endpoint)
+	klog.InfoS("Creating CSI driver", "name", DriverName, "nodeID", nodeID, "endpoint", endpoint)
 
 	d := &Driver{
 		name:      DriverName,
@@ -50,49 +54,92 @@ func NewDriver(nodeID, endpoint string, k8sClient client.Client) *Driver {
 	return d
 }
 
-func (d *Driver) Run() {
-	var wg sync.WaitGroup
-	wg.Add(1)
+const gracefulStopTimeout = 10 * time.Second
 
-	go func() {
-		defer wg.Done()
-
-		// Parse endpoint
-		var protocol, addr string
-		parts := strings.SplitN(d.endpoint, "://", 2)
-		if len(parts) == 2 {
-			protocol = parts[0]
-			addr = parts[1]
-		} else {
-			klog.Fatalf("Invalid endpoint format: %s", d.endpoint)
-		}
-
-		if protocol == "unix" {
-			klog.Infof("Removing existing socket: %s", addr)
-			if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
-				klog.Fatalf("Failed to remove existing socket %s: %v", addr, err)
-			}
-		}
-
-		listener, err := net.Listen(protocol, addr)
-		if err != nil {
-			klog.Fatalf("Failed to listen on %s: %v", addr, err)
-		}
-
-		server := grpc.NewServer()
-
-		// Register CSI Services
-		csi.RegisterIdentityServer(server, d.ids)
-		csi.RegisterControllerServer(server, d.cs)
-		csi.RegisterNodeServer(server, d.ns)
-
-		klog.Infof("Starting CSI GRPC server on %s", d.endpoint)
-		if err := server.Serve(listener); err != nil {
-			klog.Fatalf("GRPC server failed: %v", err)
+// Run serves CSI requests until the context is cancelled or the server fails.
+// Cancellation stops accepting new RPCs and gives in-flight requests a bounded
+// window to finish before the server is forced down.
+func (d *Driver) Run(ctx context.Context) error {
+	listener, err := listenEndpoint(d.endpoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			klog.ErrorS(err, "Failed to close CSI listener")
 		}
 	}()
 
-	wg.Wait()
+	server := grpc.NewServer()
+	csi.RegisterIdentityServer(server, d.ids)
+	csi.RegisterControllerServer(server, d.cs)
+	csi.RegisterNodeServer(server, d.ns)
+
+	klog.InfoS("Starting CSI GRPC server", "endpoint", d.endpoint)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			return fmt.Errorf("serve CSI GRPC endpoint: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		klog.InfoS("Stopping CSI GRPC server")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(gracefulStopTimeout):
+		klog.InfoS("Forcing CSI GRPC server shutdown after grace period", "timeout", gracefulStopTimeout)
+		server.Stop()
+	}
+	return nil
+}
+
+func listenEndpoint(endpoint string) (net.Listener, error) {
+	parts := strings.SplitN(endpoint, "://", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid endpoint format %q", endpoint)
+	}
+	protocol, addr := parts[0], parts[1]
+
+	if protocol == "unix" {
+		if !filepath.IsAbs(addr) {
+			return nil, fmt.Errorf("unix endpoint path must be absolute: %q", addr)
+		}
+		if err := os.MkdirAll(filepath.Dir(addr), 0o750); err != nil {
+			return nil, fmt.Errorf("create unix socket directory %s: %w", filepath.Dir(addr), err)
+		}
+		info, err := os.Lstat(addr)
+		switch {
+		case os.IsNotExist(err):
+		case err != nil:
+			return nil, fmt.Errorf("inspect existing socket %s: %w", addr, err)
+		case info.Mode()&os.ModeSocket == 0:
+			return nil, fmt.Errorf("refusing to remove non-socket path %s", addr)
+		default:
+			klog.InfoS("Removing stale socket", "path", addr)
+			if err := os.Remove(addr); err != nil {
+				return nil, fmt.Errorf("remove existing socket %s: %w", addr, err)
+			}
+		}
+	}
+
+	listener, err := net.Listen(protocol, addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	return listener, nil
 }
 
 // ==========================================
@@ -106,7 +153,7 @@ type IdentityServer struct {
 }
 
 func (ids *IdentityServer) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
-	klog.V(5).Infof("Using default GetPluginInfo")
+	klog.V(5).InfoS("Using default GetPluginInfo")
 	if ids.name == "" {
 		return nil, status.Error(codes.Unavailable, "Driver name not configured")
 	}

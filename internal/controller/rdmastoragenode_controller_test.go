@@ -18,71 +18,107 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/rdmahealth"
 )
 
 var _ = Describe("RDMAStorageNode Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+	var reconciler *RDMAStorageNodeReconciler
 
+	BeforeEach(func() {
+		reconciler = &RDMAStorageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	})
+
+	It("leaves reporter-owned node data unchanged", func() {
 		ctx := context.Background()
-
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+		key := types.NamespacedName{Name: "reporter-owned-node"}
+		resource := &storagev1alpha1.RDMAStorageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name},
+			Spec: storagev1alpha1.RDMAStorageNodeSpec{
+				NodeName:  "test-node",
+				RDMAIP:    "192.0.2.10",
+				Transport: storagev1alpha1.RDMATransportRoCEv2,
+			},
 		}
-		rdmastoragenode := &storagev1alpha1.RDMAStorageNode{}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, resource) })
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind RDMAStorageNode")
-			err := k8sClient.Get(ctx, typeNamespacedName, rdmastoragenode)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &storagev1alpha1.RDMAStorageNode{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					Spec: storagev1alpha1.RDMAStorageNodeSpec{
-						NodeName:  "test-node",
-						RDMAIP:    "127.0.0.1",
-						Transport: storagev1alpha1.RDMATransportRoCEv2,
-					},
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(rdmahealth.FreshnessWindow / 2))
+
+		actual := &storagev1alpha1.RDMAStorageNode{}
+		Expect(k8sClient.Get(ctx, key, actual)).To(Succeed())
+		Expect(actual.Spec).To(Equal(resource.Spec))
+	})
+
+	It("expires a stale reporter heartbeat", func() {
+		ctx := context.Background()
+		key := types.NamespacedName{Name: "stale-rdma-node"}
+		resource := &storagev1alpha1.RDMAStorageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name},
+			Spec: storagev1alpha1.RDMAStorageNodeSpec{
+				NodeName: "test-node", RDMAIP: "192.0.2.10", Transport: storagev1alpha1.RDMATransportRoCEv2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, resource) })
+		resource.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(-2 * rdmahealth.FreshnessWindow))
+		meta.SetStatusCondition(&resource.Status.Conditions, metav1.Condition{
+			Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, Reason: "ReporterReady", Message: "ready",
 		})
+		Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &storagev1alpha1.RDMAStorageNode{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		condition := meta.FindStatusCondition(resource.Status.Conditions, rdmahealth.ReadyCondition)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+		Expect(condition.Reason).To(Equal("StaleHeartbeat"))
+	})
 
-			By("Cleanup the specific resource instance RDMAStorageNode")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	It("expires a materially future-dated reporter heartbeat", func() {
+		ctx := context.Background()
+		key := types.NamespacedName{Name: "future-rdma-node"}
+		resource := &storagev1alpha1.RDMAStorageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name},
+			Spec: storagev1alpha1.RDMAStorageNodeSpec{
+				NodeName: "test-node", RDMAIP: "192.0.2.10", Transport: storagev1alpha1.RDMATransportRoCEv2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, resource) })
+		resource.Status.LastHeartbeatTime = metav1.NewTime(time.Now().Add(time.Hour))
+		meta.SetStatusCondition(&resource.Status.Conditions, metav1.Condition{
+			Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, Reason: "ReporterReady", Message: "ready",
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &RDMAStorageNodeReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+		Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		condition := meta.FindStatusCondition(resource.Status.Conditions, rdmahealth.ReadyCondition)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+		Expect(condition.Reason).To(Equal("StaleHeartbeat"))
+	})
+
+	It("treats a deleted reporter-owned node as an idempotent no-op", func() {
+		result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "missing-rdma-node"},
 		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
 	})
 })

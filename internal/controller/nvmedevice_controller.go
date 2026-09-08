@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"math"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,7 +31,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "distort/api/v1alpha1"
+	"distort/internal/capacity"
 )
+
+func allocatedCapacityForDevice(partitions []storagev1alpha1.NVMePartition, serialNumber string) (int64, error) {
+	usedCapacity := int64(0)
+	for i := range partitions {
+		partition := &partitions[i]
+		if partition.Spec.ParentDeviceSerialNumber != serialNumber {
+			continue
+		}
+		allocatedBytes, err := capacity.RoundUp(partition.Spec.Size.Value())
+		if err != nil {
+			return 0, fmt.Errorf("NVMePartition %s/%s has invalid capacity %q: %w",
+				partition.Namespace, partition.Name, partition.Spec.Size.String(), err)
+		}
+		if usedCapacity > math.MaxInt64-allocatedBytes {
+			return 0, fmt.Errorf("allocated capacity overflow for device serial %s", serialNumber)
+		}
+		usedCapacity += allocatedBytes
+	}
+	return usedCapacity, nil
+}
 
 // NVMeDeviceReconciler reconciles a NVMeDevice object
 type NVMeDeviceReconciler struct {
@@ -41,6 +64,7 @@ type NVMeDeviceReconciler struct {
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedevices/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmedevices/finalizers,verbs=update
 // +kubebuilder:rbac:groups=storage.distort.io,resources=nvmepartitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile recalculates FreeCapacity on the NVMeDevice by deducting assigned NVMePartitions.
 func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -54,30 +78,27 @@ func (r *NVMeDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Calculate free capacity by iterating over NVMePartitions assigned to this device
 	var partitionList storagev1alpha1.NVMePartitionList
 	if err := r.List(ctx, &partitionList); err != nil {
-		logger.Error(err, "unable to list NVMePartitions for free capacity calculation")
+		logger.Error(err, "Unable to list NVMePartitions for free capacity calculation")
 		return ctrl.Result{}, err
 	}
 
 	totalCapacity := device.Spec.TotalCapacity.Value()
-	usedCapacity := int64(0)
-
-	for i := range partitionList.Items {
-		p := &partitionList.Items[i]
-		if p.Spec.ParentDeviceSerialNumber == device.Spec.SerialNumber {
-			usedCapacity += p.Spec.Size.Value()
-		}
+	usedCapacity, err := allocatedCapacityForDevice(partitionList.Items, device.Spec.SerialNumber)
+	if err != nil {
+		logger.Error(err, "Could not calculate NVMeDevice free capacity", "device", device.Name)
+		return ctrl.Result{}, err
 	}
 
-	freeCapacity := totalCapacity - usedCapacity
-	if freeCapacity < 0 {
-		freeCapacity = 0 // Should not happen if scheduling is correct
-	}
+	freeCapacity := max(totalCapacity-usedCapacity,
+		// Should not happen if scheduling is correct
+		0)
 
 	// Update the device status only if it changed
 	newFreeCapacity := *resource.NewQuantity(freeCapacity, resource.BinarySI)
 	if device.Status.FreeCapacity.Cmp(newFreeCapacity) != 0 {
+		base := device.DeepCopy()
 		device.Status.FreeCapacity = newFreeCapacity
-		if err := r.Status().Update(ctx, &device); err != nil {
+		if err := r.Status().Patch(ctx, &device, client.MergeFrom(base)); err != nil {
 			logger.Error(err, "Failed to update NVMeDevice Status with FreeCapacity")
 			return ctrl.Result{}, err
 		}

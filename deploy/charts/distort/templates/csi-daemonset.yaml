@@ -17,20 +17,30 @@ spec:
         app.kubernetes.io/component: csi-node
     spec:
       hostNetwork: true
-      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      # The node-driver-registrar and node CSI driver share this Pod identity.
+      serviceAccountName: {{ include "distort.csiNodeServiceAccountName" . }}
       containers:
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.1
           args:
             - --csi-address=/csi/csi.sock
-            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi.distort.io/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/storage.distort.io/csi.sock
           volumeMounts:
             - name: plugin-dir
               mountPath: /csi
             - name: registration-dir
               mountPath: /registration
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+          args:
+            - --csi-address=/csi/csi.sock
+            # The node Pod uses host networking, so use a project-specific port.
+            - --health-port=19808
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
         - name: csi-driver
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "distort.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - /usr/local/bin/distort-csi
@@ -44,13 +54,25 @@ spec:
                   fieldPath: spec.nodeName
           securityContext:
             privileged: true
+          ports:
+            - name: healthz
+              containerPort: 19808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
           volumeMounts:
             - name: dev
               mountPath: /dev
             - name: plugin-dir
               mountPath: /csi
-            - name: pods-mount-dir
-              mountPath: /var/lib/kubelet/pods
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
               mountPropagation: "Bidirectional"
           resources:
             {{- toYaml .Values.csi.resources | nindent 12 }}
@@ -61,25 +83,14 @@ spec:
             type: Directory
         - name: plugin-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/csi.distort.io/
+            path: /var/lib/kubelet/plugins/storage.distort.io/
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:
             path: /var/lib/kubelet/plugins_registry/
             type: Directory
-        - name: pods-mount-dir
+        - name: kubelet-dir
           hostPath:
-            path: /var/lib/kubelet/pods
+            path: /var/lib/kubelet
             type: DirectoryOrCreate
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "distort.scheduling" (list . .Values.csiNode) | nindent 6 }}

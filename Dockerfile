@@ -2,6 +2,7 @@
 # Stage 1: SPDK Builder (Rocky 9)
 #############################################
 FROM rockylinux:9 AS spdk-builder
+ARG SPDK_BUILD_JOBS=2
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -47,7 +48,7 @@ RUN dnf -y install dnf-plugins-core && \
 #############################################
 WORKDIR /src
 
-RUN git clone https://github.com/CARV-ICS-FORTH/nvmeof-bxi.git /src/spdk
+RUN git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone https://github.com/CARV-ICS-FORTH/nvmeof-bxi.git /src/spdk
 
 
 #############################################
@@ -102,7 +103,7 @@ RUN gcc /tmp/test_ioctl.c -o /tmp/test_ioctl && \
 
 WORKDIR /src/spdk
 
-RUN git -c safe.directory="*" submodule update --init
+RUN git -c safe.directory="*" -c submodule.fetchJobs=1 -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 submodule update --init
 
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
@@ -142,7 +143,7 @@ RUN ./configure \
     --disable-unit-tests
 
 
-RUN make -j$(nproc)
+RUN make -j${SPDK_BUILD_JOBS}
 
 
 
@@ -151,6 +152,10 @@ RUN make -j$(nproc)
 #############################################
 
 FROM golang:1.25 AS go-builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG GO_BUILD_PROCS=2
+ENV GOMAXPROCS=${GO_BUILD_PROCS}
 
 
 WORKDIR /workspace
@@ -164,13 +169,13 @@ RUN go mod download
 COPY . .
 
 
-RUN CGO_ENABLED=0 go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -o bin/distort-manager \
     cmd/distort-manager/main.go && \
-    CGO_ENABLED=0 go build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -o bin/distort-agent \
     cmd/distort-agent/main.go && \
-    CGO_ENABLED=0 go build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -o bin/distort-csi \
     cmd/distort-csi/main.go
 
@@ -234,7 +239,11 @@ COPY --from=go-builder \
 
 COPY --from=spdk-builder \
     /src/spdk \
-    /spdk
+    /opt/spdk
+
+COPY --from=spdk-builder \
+    /src/spdk/build/bin/nvmf_tgt \
+    /usr/local/bin/nvmf_tgt
 
 
 
@@ -271,15 +280,9 @@ RUN echo "/opt/spdk/lib" > /etc/ld.so.conf.d/spdk.conf && \
 # Environment
 #############################################
 
-ENV PYTHONPATH=/spdk/python
-
-# Root of the SPDK tree copied above (/src/spdk -> /spdk). The agent derives
-# scripts/rpc.py, scripts/setup.sh and build/bin/nvmf_tgt from this.
-ENV SPDK_DIR=/spdk
+ENV PYTHONPATH=/opt/spdk/python
 
 ENV LD_LIBRARY_PATH=/opt/spdk/lib/rdma_provider:/opt/spdk/lib:/lib64
 
-
-RUN md5sum /lib64/libportals-bxi3.so
 
 ENTRYPOINT ["/usr/local/bin/distort-manager"]

@@ -38,49 +38,126 @@ const (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// NVMePartitionSpec defines the desired state of NVMePartition
+// NVMePartitionSpec defines the desired state of NVMePartition.
+// +kubebuilder:validation:XValidation:rule="(!has(self.nodeName) && !has(self.parentDeviceSerialNumber) && !has(self.claimRef)) || (has(self.nodeName) && has(self.parentDeviceSerialNumber) && has(self.claimRef))",message="nodeName, parentDeviceSerialNumber, and claimRef must either all be omitted or all be set by the scheduler"
+// +kubebuilder:validation:XValidation:rule="!has(self.targetOptions) || !('spdk-core-mask' in self.targetOptions) || !has(self.targetBackend) || self.targetBackend in ['spdk', 'bxi']",message="spdk-core-mask is supported only by the spdk and bxi backends"
+// +kubebuilder:validation:XValidation:rule="!has(self.targetOptions) || !self.targetOptions.exists(k, k in ['bxi-nid', 'port', 'rdma-port', 'portals-pid']) || self.targetBackend == 'bxi'",message="BXI target options are supported only by the bxi backend"
 type NVMePartitionSpec struct {
 	// Size is the requested capacity for the volume.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036850581504')) <= 0",message="size must be positive and safely roundable to a 4 MiB allocation unit"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="size is immutable"
 	Size resource.Quantity `json:"size"`
 
 	// NodeName is the node where this partition should be created.
 	// Often left empty by the CSI provisioner and populated by the mutating scheduler.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="nodeName is immutable after assignment"
 	// +optional
 	NodeName string `json:"nodeName,omitempty"`
 
 	// ParentDeviceSerialNumber is the serial number of the NVMeDevice this partition is allocated from.
 	// Populated by the mutating scheduler (Mgmt Controller).
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="parentDeviceSerialNumber is immutable after assignment"
 	// +optional
 	ParentDeviceSerialNumber string `json:"parentDeviceSerialNumber,omitempty"`
 
+	// ClaimRef identifies the exact live claim that authorized this allocation.
+	// Populated by the management controller together with placement fields.
+	// +optional
+	ClaimRef *NVMeDeviceClaimReference `json:"claimRef,omitempty"`
+
 	// AccessMode indicates the PVC access mode (e.g., ReadWriteOnce, ReadOnlyMany).
+	// +kubebuilder:validation:Enum=SINGLE_NODE_WRITER
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="accessMode is immutable"
 	// +optional
 	AccessMode string `json:"accessMode,omitempty"`
+
+	// Filesystem is the canonical filesystem selected by the CSI request.
+	// +kubebuilder:validation:Enum=ext4;xfs
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="filesystem is immutable"
+	// +optional
+	Filesystem string `json:"filesystem,omitempty"`
+
+	// RequestFingerprint identifies all immutable CSI CreateVolume properties.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="requestFingerprint is immutable"
+	// +optional
+	RequestFingerprint string `json:"requestFingerprint,omitempty"`
 
 	// TargetBackend specifies the export technology (e.g., "spdk", "kernel", or "bxi").
 	// +kubebuilder:validation:Enum=spdk;kernel;bxi
 	// +kubebuilder:default=spdk
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="targetBackend is immutable"
 	// +optional
 	TargetBackend string `json:"targetBackend,omitempty"`
 
-	// VolumeManager specifies the volume manager (e.g., "partition", "lvm", or "spdk").
-	// +kubebuilder:validation:Enum=partition;lvm;spdk
+	// VolumeManager specifies the supported volume-carving strategy.
+	// +kubebuilder:validation:Enum=partition
 	// +kubebuilder:default=partition
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="volumeManager is immutable"
 	// +optional
 	VolumeManager string `json:"volumeManager,omitempty"`
 
-	// TargetOptions provides backend-specific customization flags (e.g., spdk core masks).
+	// TargetOptions provides backend-specific customization flags.
+	// +kubebuilder:validation:MaxProperties=3
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['spdk-core-mask', 'bxi-nid', 'port', 'rdma-port', 'portals-pid'])",message="targetOptions contains an unsupported backend option"
+	// +kubebuilder:validation:XValidation:rule="(['port', 'rdma-port', 'portals-pid'].filter(k, k in self).size()) <= 1",message="port, rdma-port, and portals-pid are aliases; set only one"
+	// +kubebuilder:validation:XValidation:rule="!('spdk-core-mask' in self) || (size(self['spdk-core-mask']) <= 258 && self['spdk-core-mask'].matches('^0x[0-9A-Fa-f]*[1-9A-Fa-f][0-9A-Fa-f]*$'))",message="spdk-core-mask must be at most 258 characters, match 0x followed by hexadecimal digits, and select at least one CPU"
+	// +kubebuilder:validation:XValidation:rule="!('bxi-nid' in self) || self['bxi-nid'].matches('^[A-Za-z0-9][A-Za-z0-9._:%-]{0,254}$')",message="bxi-nid must be a non-empty BXI address without whitespace or shell syntax"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, !(k in ['port', 'rdma-port', 'portals-pid']) || self[k].matches('^[0-9]{1,5}$'))",message="BXI port values must contain between one and five decimal digits"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="targetOptions is immutable"
 	// +optional
 	TargetOptions map[string]string `json:"targetOptions,omitempty"`
 }
 
 // NVMePartitionStatus defines the observed state of NVMePartition.
 type NVMePartitionStatus struct {
+	// PlacementFingerprint binds the manager-authorized node, device, and claim
+	// selection to this exact NVMePartition UID.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +optional
+	PlacementFingerprint string `json:"placementFingerprint,omitempty"`
+
 	// State is the current status of the partition creation/export.
 	// +kubebuilder:validation:Enum=Pending;Creating;Exported;Failed
 	// +kubebuilder:default=Pending
 	State NVMePartitionState `json:"state,omitempty"`
+
+	// ExternalID is the immutable, globally unique identifier used for backend resources.
+	// +optional
+	ExternalID string `json:"externalID,omitempty"`
+
+	// VolumeID is the opaque CSI handle identifying this exact namespaced object and UID.
+	// +optional
+	VolumeID string `json:"volumeID,omitempty"`
+
+	// BackendVolumeID is the block path or logical-volume identity returned by the volume manager.
+	// +optional
+	BackendVolumeID string `json:"backendVolumeID,omitempty"`
+
+	// AllocatedCapacity is the actual backend capacity after allocation-unit rounding.
+	// +optional
+	AllocatedCapacity resource.Quantity `json:"allocatedCapacity,omitempty"`
+
+	// SPDKBaseBdev is the exact SPDK namespace bdev backing the logical volume.
+	// +optional
+	SPDKBaseBdev string `json:"spdkBaseBdev,omitempty"`
+
+	// SPDKLvstoreName is the logical volume store name used during provisioning.
+	// +optional
+	SPDKLvstoreName string `json:"spdkLvstoreName,omitempty"`
+
+	// SPDKLvstoreUUID is the immutable UUID of the logical volume store.
+	// +optional
+	SPDKLvstoreUUID string `json:"spdkLvstoreUUID,omitempty"`
+
+	// SPDKLvolName is the logical volume name within its store.
+	// +optional
+	SPDKLvolName string `json:"spdkLvolName,omitempty"`
+
+	// SPDKLvolUUID is the immutable UUID of the logical volume bdev.
+	// +optional
+	SPDKLvolUUID string `json:"spdkLvolUUID,omitempty"`
 
 	// NQN is the NVMe Qualified Name generated by the agent upon successful export.
 	// +optional

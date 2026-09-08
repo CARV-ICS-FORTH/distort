@@ -65,6 +65,7 @@ spec:
               nodeName:
                 description: NodeName is the name of the Kubernetes node where the
                   device is attached.
+                minLength: 1
                 type: string
               numaNode:
                 description: NUMANode indicates the NUMA topology node the device
@@ -73,18 +74,26 @@ spec:
               pciAddress:
                 description: PCIAddress is the PCIe address of the NVMe controller
                   (e.g., "0000:01:00.0").
+                pattern: ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$
                 type: string
               serialNumber:
                 description: SerialNumber is the device's hardware serial number.
                   Used for claim matching.
+                minLength: 1
                 type: string
               totalCapacity:
                 anyOf:
                 - type: integer
                 - type: string
-                description: TotalCapacity is the total raw size of the device.
+                description: |-
+                  TotalCapacity is the allocatable capacity of namespace ID 1 after reserving
+                  backend metadata space. DISTORT manages this namespace consistently under
+                  kernel and SPDK; other namespaces are not advertised or modified.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: totalCapacity must be positive
+                  rule: quantity(string(self)).isGreaterThan(quantity('0'))
             required:
             - nodeName
             - pciAddress
@@ -98,6 +107,31 @@ spec:
                 description: ActiveBackend tracks which target technology currently
                   owns this controller ("spdk", "kernel", or "none").
                 type: string
+              claimRef:
+                description: ClaimRef identifies the exact active claim that owns
+                  this device.
+                properties:
+                  name:
+                    description: Name is the name of the claim.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace is the namespace containing the claim.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the immutable Kubernetes UID of the claim.
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: claimRef is immutable
+                  rule: self == oldSelf
+                - message: claimRef UID must not be empty
+                  rule: size(self.uid) > 0
               conditions:
                 description: Conditions represent the current state of the NVMeDevice
                   resource.
@@ -173,6 +207,7 @@ spec:
                 enum:
                 - Available
                 - Claimed
+                - Unavailable
                 type: string
             type: object
         required:

@@ -9,9 +9,11 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	storagev1alpha1 "distort/api/v1alpha1"
 	"distort/internal/agent"
@@ -39,19 +41,24 @@ func main() {
 	opts := zap.Options{
 		Development: true,
 	}
+	klog.InitFlags(nil) // Must be called before flag.Parse
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	logger := zap.New(zap.UseFlagOptions(&opts))
+	ctrl.SetLogger(logger)
+	// Fully bridge klog → logr/zap so all klog.Info/Infof calls appear in pod logs
+	klog.SetLoggerWithOptions(logger, klog.ContextualLogger(true))
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "agent.storage.distort.io",
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLog.Error(err, "Unable to start manager")
 		os.Exit(1)
 	}
 
@@ -61,7 +68,7 @@ func main() {
 		setupLog.Info("NODE_NAME environment variable not set, using hostname")
 		hostname, err := os.Hostname()
 		if err != nil {
-			setupLog.Error(err, "unable to get hostname")
+			setupLog.Error(err, "Unable to get hostname")
 			os.Exit(1)
 		}
 		nodeName = hostname
@@ -71,7 +78,7 @@ func main() {
 		Client:   mgr.GetClient(),
 		NodeName: nodeName,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "PartitionManager")
+		setupLog.Error(err, "Unable to create controller", "controller", "PartitionManager")
 		os.Exit(1)
 	}
 
@@ -81,22 +88,22 @@ func main() {
 		Interval: 30 * time.Second, // run every 30s
 	}
 	if err := mgr.Add(reporter); err != nil {
-		setupLog.Error(err, "unable to set up hardware reporter")
+		setupLog.Error(err, "Unable to set up hardware reporter")
 		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+		setupLog.Error(err, "Unable to set up health check")
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+		setupLog.Error(err, "Unable to set up ready check")
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting agent manager")
+	setupLog.Info("Starting agent manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+		setupLog.Error(err, "Failed to run agent manager")
 		os.Exit(1)
 	}
 }

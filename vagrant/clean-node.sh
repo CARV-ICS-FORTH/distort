@@ -1,5 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -x
+
+# Stop any SPDK target left by an interrupted test before rebinding controllers.
+pkill -TERM -x nvmf_tgt 2>/dev/null || true
+for attempt in $(seq 1 20); do
+  pgrep -x nvmf_tgt >/dev/null 2>&1 || break
+  sleep 0.25
+done
+pkill -KILL -x nvmf_tgt 2>/dev/null || true
+
+# Disconnect initiator sessions before removing exports or wiping their backing media.
+nvme disconnect-all 2>/dev/null || true
 
 # 1. Reset any NVMe devices bound to user-space drivers (uio_pci_generic/vfio-pci) back to kernel nvme driver
 for class_file in /sys/bus/pci/devices/*/class; do

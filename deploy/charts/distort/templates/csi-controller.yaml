@@ -17,8 +17,20 @@ spec:
         {{- include "distort.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: csi-controller
     spec:
-      serviceAccountName: {{ include "distort.serviceAccountName" . }}
+      # The external-provisioner and external-attacher share this Pod identity.
+      serviceAccountName: {{ include "distort.csiControllerServiceAccountName" . }}
       containers:
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=5"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
         - name: csi-provisioner
           image: registry.k8s.io/sig-storage/csi-provisioner:v3.5.0
           args:
@@ -32,8 +44,16 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
         - name: csi-driver
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "distort.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - /usr/local/bin/distort-csi
@@ -45,9 +65,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          ports:
+            - name: healthz
+              containerPort: 9808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
       volumes:
         - name: socket-dir
           emptyDir: {}
+      {{- include "distort.scheduling" (list . .Values.csiController) | nindent 6 }}

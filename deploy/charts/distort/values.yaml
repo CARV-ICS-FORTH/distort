@@ -1,8 +1,12 @@
 image:
-  repository: distort
+  # A fully qualified repository is required because DISTORT does not yet
+  # publish a default image. Example: ghcr.io/example/distort
+  repository: ""
   pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: "latest"
+  # Defaults to the chart appVersion (0.5.0).
+  tag: ""
+  # Optional immutable sha256 digest. When set, digest takes precedence over tag.
+  digest: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -17,17 +21,36 @@ manager:
     requests:
       cpu: 10m
       memory: 64Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 agent:
+  spdk:
+    # Leave both empty to use SPDK defaults. Set both when a deployment needs
+    # explicit iobuf sizing for its workload and hugepage budget.
+    iobufSmallPoolCount: ""
+    iobufLargePoolCount: ""
+    # Leave empty to use SPDK's default RDMA shared receive queue depth. A
+    # smaller positive value reduces DMA memory at the cost of queue capacity.
+    maxSrqDepth: ""
+    # Set when hugepages are provisioned by the host administrator. This keeps
+    # SPDK setup.sh from replacing that reservation with its 2 GiB default.
+    skipHugepageSetup: false
   resources:
     limits:
-      cpu: 1000m
       memory: 1Gi
       hugepages-2Mi: 1Gi
     requests:
-      cpu: 10m
+      # Reserve capacity for SPDK polling reactors and agent control-plane work.
+      # Do not apply a CPU limit: CFS quota throttling severely reduces SPDK IOPS.
+      cpu: "2"
       memory: 1Gi
       hugepages-2Mi: 1Gi
+  # Schedule the privileged storage agent only on NVMe/RDMA provider nodes.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 csi:
   resources:
@@ -38,21 +61,36 @@ csi:
       cpu: 10m
       memory: 64Mi
 
+csiController:
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+csiNode:
+  # Select every node on which application Pods may consume DISTORT volumes.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 serviceAccount:
-  # Specifies whether a service account should be created
+  # Specifies whether component service accounts should be created.
   create: true
-  # Annotations to add to the service account
+  # Annotations added to every component service account.
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
-  name: "distort"
+  # Optional component-specific names. Empty values use <release>-distort-<component>
+  # when create is true. All four names are required and must be distinct when false.
+  names:
+    manager: ""
+    agent: ""
+    csiController: ""
+    csiNode: ""
 
 rbac:
   # Specifies whether RBAC resources should be created
   create: true
 
+# Deprecated scheduling fallback retained for existing installations. A
+# non-empty component-specific value above takes precedence.
 nodeSelector: {}
-
 tolerations: []
-
 affinity: {}

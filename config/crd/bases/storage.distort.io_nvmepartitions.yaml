@@ -66,17 +66,72 @@ spec:
               accessMode:
                 description: AccessMode indicates the PVC access mode (e.g., ReadWriteOnce,
                   ReadOnlyMany).
+                enum:
+                - SINGLE_NODE_WRITER
                 type: string
+                x-kubernetes-validations:
+                - message: accessMode is immutable
+                  rule: self == oldSelf
+              claimRef:
+                description: |-
+                  ClaimRef identifies the exact live claim that authorized this allocation.
+                  Populated by the management controller together with placement fields.
+                properties:
+                  name:
+                    description: Name is the name of the claim.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace is the namespace containing the claim.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the immutable Kubernetes UID of the claim.
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: claimRef is immutable
+                  rule: self == oldSelf
+                - message: claimRef UID must not be empty
+                  rule: size(self.uid) > 0
+              filesystem:
+                description: Filesystem is the canonical filesystem selected by the
+                  CSI request.
+                enum:
+                - ext4
+                - xfs
+                type: string
+                x-kubernetes-validations:
+                - message: filesystem is immutable
+                  rule: self == oldSelf
               nodeName:
                 description: |-
                   NodeName is the node where this partition should be created.
                   Often left empty by the CSI provisioner and populated by the mutating scheduler.
                 type: string
+                x-kubernetes-validations:
+                - message: nodeName is immutable after assignment
+                  rule: self == oldSelf
               parentDeviceSerialNumber:
                 description: |-
                   ParentDeviceSerialNumber is the serial number of the NVMeDevice this partition is allocated from.
                   Populated by the mutating scheduler (Mgmt Controller).
                 type: string
+                x-kubernetes-validations:
+                - message: parentDeviceSerialNumber is immutable after assignment
+                  rule: self == oldSelf
+              requestFingerprint:
+                description: RequestFingerprint identifies all immutable CSI CreateVolume
+                  properties.
+                pattern: ^[a-f0-9]{64}$
+                type: string
+                x-kubernetes-validations:
+                - message: requestFingerprint is immutable
+                  rule: self == oldSelf
               size:
                 anyOf:
                 - type: integer
@@ -84,6 +139,13 @@ spec:
                 description: Size is the requested capacity for the volume.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: size must be positive and safely roundable to a 4 MiB allocation
+                    unit
+                  rule: quantity(string(self)).isGreaterThan(quantity('0')) && quantity(string(self)).compareTo(quantity('9223372036850581504'))
+                    <= 0
+                - message: size is immutable
+                  rule: self == oldSelf
               targetBackend:
                 default: spdk
                 description: TargetBackend specifies the export technology (e.g.,
@@ -93,27 +155,78 @@ spec:
                 - kernel
                 - bxi
                 type: string
+                x-kubernetes-validations:
+                - message: targetBackend is immutable
+                  rule: self == oldSelf
               targetOptions:
                 additionalProperties:
                   type: string
                 description: TargetOptions provides backend-specific customization
-                  flags (e.g., spdk core masks).
+                  flags.
+                maxProperties: 3
                 type: object
+                x-kubernetes-validations:
+                - message: targetOptions contains an unsupported backend option
+                  rule: self.all(k, k in ['spdk-core-mask', 'bxi-nid', 'port', 'rdma-port',
+                    'portals-pid'])
+                - message: port, rdma-port, and portals-pid are aliases; set only
+                    one
+                  rule: (['port', 'rdma-port', 'portals-pid'].filter(k, k in self).size())
+                    <= 1
+                - message: spdk-core-mask must be at most 258 characters, match 0x
+                    followed by hexadecimal digits, and select at least one CPU
+                  rule: '!(''spdk-core-mask'' in self) || (size(self[''spdk-core-mask''])
+                    <= 258 && self[''spdk-core-mask''].matches(''^0x[0-9A-Fa-f]*[1-9A-Fa-f][0-9A-Fa-f]*$''))'
+                - message: bxi-nid must be a non-empty BXI address without whitespace
+                    or shell syntax
+                  rule: '!(''bxi-nid'' in self) || self[''bxi-nid''].matches(''^[A-Za-z0-9][A-Za-z0-9._:%-]{0,254}$'')'
+                - message: BXI port values must contain between one and five decimal
+                    digits
+                  rule: self.all(k, !(k in ['port', 'rdma-port', 'portals-pid']) ||
+                    self[k].matches('^[0-9]{1,5}$'))
+                - message: targetOptions is immutable
+                  rule: self == oldSelf
               volumeManager:
                 default: partition
-                description: VolumeManager specifies the volume manager (e.g., "partition",
-                  "lvm", or "spdk").
+                description: VolumeManager specifies the supported volume-carving
+                  strategy.
                 enum:
                 - partition
-                - lvm
-                - spdk
                 type: string
+                x-kubernetes-validations:
+                - message: volumeManager is immutable
+                  rule: self == oldSelf
             required:
             - size
             type: object
+            x-kubernetes-validations:
+            - message: nodeName, parentDeviceSerialNumber, and claimRef must either
+                all be omitted or all be set by the scheduler
+              rule: (!has(self.nodeName) && !has(self.parentDeviceSerialNumber) &&
+                !has(self.claimRef)) || (has(self.nodeName) && has(self.parentDeviceSerialNumber)
+                && has(self.claimRef))
+            - message: spdk-core-mask is supported only by the spdk and bxi backends
+              rule: '!has(self.targetOptions) || !(''spdk-core-mask'' in self.targetOptions)
+                || !has(self.targetBackend) || self.targetBackend in [''spdk'', ''bxi'']'
+            - message: BXI target options are supported only by the bxi backend
+              rule: '!has(self.targetOptions) || !self.targetOptions.exists(k, k in
+                [''bxi-nid'', ''port'', ''rdma-port'', ''portals-pid'']) || self.targetBackend
+                == ''bxi'''
           status:
             description: status defines the observed state of NVMePartition
             properties:
+              allocatedCapacity:
+                anyOf:
+                - type: integer
+                - type: string
+                description: AllocatedCapacity is the actual backend capacity after
+                  allocation-unit rounding.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              backendVolumeID:
+                description: BackendVolumeID is the block path or logical-volume identity
+                  returned by the volume manager.
+                type: string
               conditions:
                 description: Conditions represent the current state of the NVMePartition
                   resource.
@@ -175,9 +288,19 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              externalID:
+                description: ExternalID is the immutable, globally unique identifier
+                  used for backend resources.
+                type: string
               nqn:
                 description: NQN is the NVMe Qualified Name generated by the agent
                   upon successful export.
+                type: string
+              placementFingerprint:
+                description: |-
+                  PlacementFingerprint binds the manager-authorized node, device, and claim
+                  selection to this exact NVMePartition UID.
+                pattern: ^[a-f0-9]{64}$
                 type: string
               portalIP:
                 description: PortalIP is the RDMA IP address for the CSI node side
@@ -186,6 +309,25 @@ spec:
               portalPort:
                 description: 'PortalPort is the RDMA port (default: 4420).'
                 type: integer
+              spdkBaseBdev:
+                description: SPDKBaseBdev is the exact SPDK namespace bdev backing
+                  the logical volume.
+                type: string
+              spdkLvolName:
+                description: SPDKLvolName is the logical volume name within its store.
+                type: string
+              spdkLvolUUID:
+                description: SPDKLvolUUID is the immutable UUID of the logical volume
+                  bdev.
+                type: string
+              spdkLvstoreName:
+                description: SPDKLvstoreName is the logical volume store name used
+                  during provisioning.
+                type: string
+              spdkLvstoreUUID:
+                description: SPDKLvstoreUUID is the immutable UUID of the logical
+                  volume store.
+                type: string
               state:
                 default: Pending
                 description: State is the current status of the partition creation/export.
@@ -194,6 +336,10 @@ spec:
                 - Creating
                 - Exported
                 - Failed
+                type: string
+              volumeID:
+                description: VolumeID is the opaque CSI handle identifying this exact
+                  namespaced object and UID.
                 type: string
             type: object
         required:
