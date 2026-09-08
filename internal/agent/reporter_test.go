@@ -37,6 +37,7 @@ func newReporterTestClient(t *testing.T, objects ...runtime.Object) *Reporter {
 		discoverRDMA: func() (RDMAEndpoint, error) {
 			return RDMAEndpoint{Interface: "rdma0", IP: "192.168.56.11", Transport: storagev1alpha1.RDMATransportRoCEv2, LinkSpeed: "100 Gb/sec"}, nil
 		},
+		discoverBXI: func() ([]int32, error) { return nil, nil },
 	}
 }
 
@@ -58,6 +59,7 @@ func TestReporterPublishesNodeInternalIPAndCapacity(t *testing.T) {
 		}},
 	}
 	reporter := newReporterTestClient(t, node)
+	reporter.discoverBXI = func() ([]int32, error) { return []int32{3, 4}, nil }
 	reporter.reportNode(context.Background(), 4*1024*1024, 3*1024*1024, nil)
 
 	var actual storagev1alpha1.RDMAStorageNode
@@ -70,6 +72,9 @@ func TestReporterPublishesNodeInternalIPAndCapacity(t *testing.T) {
 	if actual.Status.TotalCapacity.Cmp(*resource.NewQuantity(4*1024*1024, resource.BinarySI)) != 0 ||
 		actual.Status.FreeCapacity.Cmp(*resource.NewQuantity(3*1024*1024, resource.BinarySI)) != 0 {
 		t.Fatalf("unexpected reported capacity: %#v", actual.Status)
+	}
+	if len(actual.Status.BXINIDs) != 2 || actual.Status.BXINIDs[0] != 3 || actual.Status.BXINIDs[1] != 4 {
+		t.Fatalf("reported BXI NIDs = %#v, want [3 4]", actual.Status.BXINIDs)
 	}
 }
 

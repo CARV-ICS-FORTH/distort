@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -210,13 +211,31 @@ func (p *PartitionManager) updateDeviceStatus(ctx context.Context, key types.Nam
 	return p.Status().Patch(ctx, &latest, client.MergeFrom(base))
 }
 
-func (p *PartitionManager) rdmaEndpoint(ctx context.Context) (string, error) {
+func (p *PartitionManager) targetEndpoint(ctx context.Context, targetBackend string, options map[string]string) (string, error) {
 	var node storagev1alpha1.RDMAStorageNode
 	if err := p.Get(ctx, types.NamespacedName{Name: p.NodeName}, &node); err != nil {
 		return "", fmt.Errorf("resolve RDMAStorageNode %s: %w", p.NodeName, err)
 	}
 	if err := rdmahealth.Validate(&node, time.Now()); err != nil {
 		return "", err
+	}
+	if targetBackend == bxiTargetBackend {
+		if configured := options[storageoptions.BXINIDOption]; configured != "" {
+			return configured, nil
+		}
+		if len(node.Status.BXINIDs) == 0 {
+			return "", fmt.Errorf("RDMAStorageNode %s does not advertise a Portals/BXI NID", node.Name)
+		}
+		nid := node.Status.BXINIDs[0]
+		for _, candidate := range node.Status.BXINIDs[1:] {
+			if candidate < nid {
+				nid = candidate
+			}
+		}
+		if nid < 0 || nid > 255 {
+			return "", fmt.Errorf("RDMAStorageNode %s advertises invalid Portals/BXI NID %d", node.Name, nid)
+		}
+		return "192.168.123." + strconv.FormatInt(int64(nid), 10), nil
 	}
 	return node.Spec.RDMAIP, nil
 }
@@ -560,7 +579,7 @@ func (p *PartitionManager) reconcileExportedPartition(
 	if partition.Status.State != storagev1alpha1.NVMePartitionStateExported {
 		return false, ctrl.Result{}, nil
 	}
-	portalIP, err := p.rdmaEndpoint(ctx)
+	portalIP, err := p.targetEndpoint(ctx, backend.Name(), partition.Spec.TargetOptions)
 	if err != nil {
 		return true, ctrl.Result{}, err
 	}
@@ -647,7 +666,7 @@ func (p *PartitionManager) provisionPartition(
 	if err != nil {
 		return p.rejectUnauthorizedProvisioning(ctx, partition, err)
 	}
-	if _, err := p.rdmaEndpoint(ctx); err != nil {
+	if _, err := p.targetEndpoint(ctx, resolved.targetBackendName, partition.Spec.TargetOptions); err != nil {
 		return p.retryableProvisioningFailure(ctx, partition, "RDMAEndpointUnavailable", err)
 	}
 	if device.Status.ActiveBackend != "" && device.Status.ActiveBackend != resolved.targetBackendName {
@@ -700,7 +719,7 @@ func (p *PartitionManager) provisionPartition(
 		return ctrl.Result{}, err
 	}
 
-	portalIP, err := p.rdmaEndpoint(ctx)
+	portalIP, err := p.targetEndpoint(ctx, resolved.targetBackendName, partition.Spec.TargetOptions)
 	if err != nil {
 		return p.retryableProvisioningFailure(ctx, partition, "RDMAEndpointUnavailable", err)
 	}
@@ -712,9 +731,6 @@ func (p *PartitionManager) provisionPartition(
 		portalPort, err = storageoptions.BXIPort(partition.Spec.TargetOptions)
 		if err != nil {
 			return p.terminalProvisioningFailure(ctx, partition, "InvalidOptions", err)
-		}
-		if bxiAddress := partition.Spec.TargetOptions[storageoptions.BXINIDOption]; bxiAddress != "" {
-			portalIP = bxiAddress
 		}
 	}
 	nqn, err := resolved.targetBackend.ExportVolume(ctx, externalID, created.BackendVolumeID, portalIP, portalPort, partition.Spec.TargetOptions)

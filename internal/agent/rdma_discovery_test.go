@@ -185,3 +185,38 @@ func TestDiscoverRDMAEndpointSurfacesUnreadableSysfs(t *testing.T) {
 		t.Fatalf("unreadable RDMA sysfs error = %v", err)
 	}
 }
+
+func TestDiscoverBXINIDsReturnsSortedUniqueValues(t *testing.T) {
+	oldPattern := bxiNIDPathPattern
+	root := t.TempDir()
+	bxiNIDPathPattern = filepath.Join(root, "*", "nid")
+	t.Cleanup(func() { bxiNIDPathPattern = oldPattern })
+	writeDiscoveryFile(t, filepath.Join(root, "bxi2", "nid"), "4\n")
+	writeDiscoveryFile(t, filepath.Join(root, "bxi0", "nid"), "3\n")
+	writeDiscoveryFile(t, filepath.Join(root, "bxi1", "nid"), "4\n")
+
+	nids, err := DiscoverBXINIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nids) != 2 || nids[0] != 3 || nids[1] != 4 {
+		t.Fatalf("discovered BXI NIDs = %#v, want [3 4]", nids)
+	}
+}
+
+func TestDiscoverBXINIDsReportsInvalidEntriesWithoutDroppingValidNIDs(t *testing.T) {
+	oldPattern := bxiNIDPathPattern
+	root := t.TempDir()
+	bxiNIDPathPattern = filepath.Join(root, "*", "nid")
+	t.Cleanup(func() { bxiNIDPathPattern = oldPattern })
+	writeDiscoveryFile(t, filepath.Join(root, "bxi0", "nid"), "2\n")
+	writeDiscoveryFile(t, filepath.Join(root, "bxi1", "nid"), "not-a-nid\n")
+
+	nids, err := DiscoverBXINIDs()
+	if err == nil || !strings.Contains(err.Error(), "invalid NID") {
+		t.Fatalf("partial BXI discovery error = %v, want invalid NID", err)
+	}
+	if len(nids) != 1 || nids[0] != 2 {
+		t.Fatalf("valid BXI NIDs = %#v, want [2]", nids)
+	}
+}

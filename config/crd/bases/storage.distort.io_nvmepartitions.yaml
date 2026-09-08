@@ -303,8 +303,9 @@ spec:
                 pattern: ^[a-f0-9]{64}$
                 type: string
               portalIP:
-                description: PortalIP is the RDMA IP address for the CSI node side
-                  to connect to.
+                description: |-
+                  PortalIP is the transport address for the CSI node side to connect to.
+                  For BXI, its final octet is the provider NID selected during export.
                 type: string
               portalPort:
                 description: 'PortalPort is the RDMA port (default: 4420).'

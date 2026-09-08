@@ -80,6 +80,124 @@ esac`)
 	}
 }
 
+func TestBXIHostAccessRepairsDenyAllSubsystem(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "allow-any-host")
+	calls := filepath.Join(t.TempDir(), "rpc-calls")
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  nvmf_get_subsystems)
+    if [ -f %q ]; then
+      printf '[{"nqn":"nqn.test:bxi","allow_any_host":true}]\n'
+    else
+      printf '[{"nqn":"nqn.test:bxi","allow_any_host":false}]\n'
+    fi ;;
+  nvmf_subsystem_allow_any_host)
+    printf '%%s\n' "$*" >> %q
+    touch %q
+    printf 'true\n' ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, state, calls, state)
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	backend := &BXIBackend{}
+	for range 2 {
+		if err := backend.ReconcileHostAccess(context.Background(), "nqn.test:bxi", ""); err != nil {
+			t.Fatalf("reconciling BXI host access: %v", err)
+		}
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(data)), "nvmf_subsystem_allow_any_host nqn.test:bxi -e"; got != want {
+		t.Fatalf("host access mutation = %q, want %q", got, want)
+	}
+}
+
+func TestBXIAttachedVolumeUsesExactHostAccess(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "rpc-calls")
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  nvmf_get_subsystems)
+    printf '[{"nqn":"nqn.test:bxi","allow_any_host":true,"hosts":[]}]\n' ;;
+  nvmf_subsystem_allow_any_host|nvmf_subsystem_add_host)
+    printf '%%s\n' "$*" >> %q
+    printf 'true\n' ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, calls)
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	spdkRPCExecutable = rpc
+	t.Cleanup(func() { spdkRPCExecutable = oldExecutable })
+
+	hostNQN := "nqn.2026-01.io.distort:host-11111111111111111111111111111111"
+	if err := (&BXIBackend{}).ReconcileHostAccess(context.Background(), "nqn.test:bxi", hostNQN); err != nil {
+		t.Fatalf("reconciling attached BXI host access: %v", err)
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"nvmf_subsystem_allow_any_host nqn.test:bxi -d",
+		"nvmf_subsystem_add_host nqn.test:bxi " + hostNQN,
+	}
+	if got := strings.FieldsFunc(strings.TrimSpace(string(data)), func(r rune) bool { return r == '\n' }); !slices.Equal(got, want) {
+		t.Fatalf("attached BXI host access calls = %#v, want %#v", got, want)
+	}
+}
+
+func TestBXIExportCreatesSubsystemWithHostAccessEnabled(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "rpc-calls")
+	rpcBody := fmt.Sprintf(`
+case "$1" in
+  rpc_get_methods) printf '[]\n' ;;
+  nvmf_get_subsystems) printf '[]\n' ;;
+  nvmf_get_transports) printf '[{"trtype":"RDMA"}]\n' ;;
+  nvmf_create_subsystem|nvmf_subsystem_add_ns|nvmf_subsystem_add_listener)
+    printf '%%s\n' "$*" >> %q
+    printf 'true\n' ;;
+  *) printf 'unexpected method %%s\n' "$1" >&2; exit 8 ;;
+esac`, calls)
+	rpc := writeTestExecutable(t, t.TempDir(), "rpc.py", rpcBody)
+	oldExecutable := spdkRPCExecutable
+	oldInspectSPDK := inspectSPDKProcess
+	oldInspectPID := inspectBXIPortalPID
+	spdkRPCExecutable = rpc
+	inspectSPDKProcess = func() (spdkProcessState, error) {
+		return spdkProcessState{running: true, coreMask: "0x1"}, nil
+	}
+	inspectBXIPortalPID = func() (string, bool, error) { return "22", true, nil }
+	t.Cleanup(func() {
+		spdkRPCExecutable = oldExecutable
+		inspectSPDKProcess = oldInspectSPDK
+		inspectBXIPortalPID = oldInspectPID
+	})
+
+	volumeName := "bxi-access"
+	nqn := volumeidentity.NQN(volumeName)
+	got, err := (&BXIBackend{}).ExportVolume(context.Background(), volumeName, "lvs/volume",
+		"192.168.123.40", 22, map[string]string{"bxi-nid": "192.168.123.40", "portals-pid": "22"})
+	if err != nil || got != nqn {
+		t.Fatalf("BXI export returned nqn=%q err=%v", got, err)
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"nvmf_create_subsystem " + nqn + " -a -s distort",
+		"nvmf_subsystem_add_ns " + nqn + " lvs/volume",
+		"nvmf_subsystem_add_listener " + nqn + " -t RDMA -a 192.168.123.40 -s 22",
+	}
+	if gotCalls := strings.FieldsFunc(strings.TrimSpace(string(data)), func(r rune) bool { return r == '\n' }); !slices.Equal(gotCalls, want) {
+		t.Fatalf("BXI export calls = %#v, want %#v", gotCalls, want)
+	}
+}
+
 func TestKernelHostAccessRevokesOldHostBeforeAuthorizingReplacement(t *testing.T) {
 	oldNVMetPath := nvmetPath
 	nvmetPath = t.TempDir()
@@ -726,6 +844,12 @@ func TestSPDKInitializationFailuresTerminateAndPermitCleanRetry(t *testing.T) {
 exec sleep 30`)
 			rpc := writeTestExecutable(t, fakeBin, "rpc.py", `
 if [ "$1" = rpc_get_methods ]; then
+	attempt=0
+	while [ ! -s "$SPDK_TEST_PID" ] && [ "$attempt" -lt 100 ]; do
+		sleep 0.01
+		attempt=$((attempt + 1))
+	done
+	[ -s "$SPDK_TEST_PID" ] || exit 1
   printf '[]\n'
 elif [ "$1" = "${FAIL_METHOD:-}" ]; then
   printf 'injected failure for %s\n' "$1" >&2
@@ -765,6 +889,9 @@ fi`)
 			}
 			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 				t.Fatalf("failed initialization left process %d alive: %v", pid, err)
+			}
+			if err := os.Remove(pidPath); err != nil {
+				t.Fatal(err)
 			}
 
 			t.Setenv("FAIL_METHOD", "")

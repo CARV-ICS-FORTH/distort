@@ -541,6 +541,11 @@ func (in *RDMAStorageNodeStatus) DeepCopyInto(out *RDMAStorageNodeStatus) {
 	in.LastHeartbeatTime.DeepCopyInto(&out.LastHeartbeatTime)
 	out.TotalCapacity = in.TotalCapacity.DeepCopy()
 	out.FreeCapacity = in.FreeCapacity.DeepCopy()
+	if in.BXINIDs != nil {
+		in, out := &in.BXINIDs, &out.BXINIDs
+		*out = make([]int32, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

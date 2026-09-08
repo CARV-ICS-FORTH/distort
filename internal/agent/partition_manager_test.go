@@ -208,6 +208,37 @@ func newPartitionManagerClient(t *testing.T, objects ...client.Object) client.Cl
 		WithObjects(objects...).Build()
 }
 
+func TestPartitionManagerSelectsProviderBXINID(t *testing.T) {
+	node := &storagev1alpha1.RDMAStorageNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Spec: storagev1alpha1.RDMAStorageNodeSpec{
+			NodeName: "node-a", RDMAIP: "192.0.2.10", Transport: storagev1alpha1.RDMATransportRoCEv2,
+		},
+		Status: storagev1alpha1.RDMAStorageNodeStatus{
+			LastHeartbeatTime: metav1.NewTime(time.Now()), BXINIDs: []int32{4, 3},
+		},
+	}
+	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+		Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue,
+		Reason: "TestReady", Message: "Test endpoint is ready",
+	})
+	manager := &PartitionManager{Client: newPartitionManagerClient(t, node), NodeName: "node-a"}
+
+	endpoint, err := manager.targetEndpoint(context.Background(), bxiTargetBackend, nil)
+	if err != nil || endpoint != "192.168.123.3" {
+		t.Fatalf("BXI endpoint = %q, err=%v; want provider NID 3", endpoint, err)
+	}
+	explicit, err := manager.targetEndpoint(context.Background(), bxiTargetBackend,
+		map[string]string{"bxi-nid": "192.168.123.9"})
+	if err != nil || explicit != "192.168.123.9" {
+		t.Fatalf("explicit BXI endpoint = %q, err=%v", explicit, err)
+	}
+	rdma, err := manager.targetEndpoint(context.Background(), spdkTargetBackend, nil)
+	if err != nil || rdma != "192.0.2.10" {
+		t.Fatalf("SPDK endpoint = %q, err=%v; want RDMA IP", rdma, err)
+	}
+}
+
 func authorizeTestPlacement(partition *storagev1alpha1.NVMePartition) {
 	if partition.UID == "" {
 		partition.UID = types.UID("test-" + partition.Name + "-uid")

@@ -163,7 +163,8 @@ type NVMePartitionStatus struct {
 	// +optional
 	NQN string `json:"nqn,omitempty"`
 
-	// PortalIP is the RDMA IP address for the CSI node side to connect to.
+	// PortalIP is the transport address for the CSI node side to connect to.
+	// For BXI, its final octet is the provider NID selected during export.
 	// +optional
 	PortalIP string `json:"portalIP,omitempty"`
 

@@ -224,7 +224,11 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName, blockPath, po
 	if err := ensureBXITransport(ctx); err != nil {
 		return "", err
 	}
-	if err := CallSPDKRPCContext(ctx, "nvmf_create_subsystem", nil, nqn, "-s", "distort"); err != nil {
+	// Portals/BXI routes connections by NID and its established initiator flow
+	// uses the host identity supplied by the local NVMe stack. Keep BXI exports
+	// open at the SPDK host-ACL layer as they were before the backend merge;
+	// Kubernetes/CSI still controls which node receives and stages the volume.
+	if err := CallSPDKRPCContext(ctx, "nvmf_create_subsystem", nil, nqn, "-a", "-s", "distort"); err != nil {
 		return "", fmt.Errorf("failed to create BXI SPDK subsystem %s: %w", nqn, err)
 	}
 	if err := CallSPDKRPCContext(ctx, "nvmf_subsystem_add_ns", nil, nqn, blockPath); err != nil {
@@ -239,7 +243,36 @@ func (b *BXIBackend) ExportVolume(ctx context.Context, volumeName, blockPath, po
 }
 
 func (b *BXIBackend) ReconcileHostAccess(ctx context.Context, nqn, hostNQN string) error {
-	return (&SPDKBackend{}).ReconcileHostAccess(ctx, nqn, hostNQN)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Preserve exact host fencing once CSI has attached the volume. An
+	// unattached BXI export remains available to the Portals data-path tooling,
+	// which uses the initiator's local NVMe host identity.
+	if hostNQN != "" {
+		return (&SPDKBackend{}).ReconcileHostAccess(ctx, nqn, hostNQN)
+	}
+	type subsystemRecord struct {
+		NQN          string `json:"nqn"`
+		AllowAnyHost bool   `json:"allow_any_host"`
+	}
+	var subsystems []subsystemRecord
+	if err := CallSPDKRPCContext(ctx, "nvmf_get_subsystems", &subsystems); err != nil {
+		return fmt.Errorf("list BXI SPDK subsystems before reconciling host access: %w", err)
+	}
+	for _, subsystem := range subsystems {
+		if subsystem.NQN != nqn {
+			continue
+		}
+		if subsystem.AllowAnyHost {
+			return nil
+		}
+		if err := CallSPDKRPCContext(ctx, "nvmf_subsystem_allow_any_host", nil, nqn, "-e"); err != nil {
+			return fmt.Errorf("enable BXI host access for %s: %w", nqn, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("BXI SPDK subsystem %s does not exist", nqn)
 }
 
 func (b *BXIBackend) UnexportVolume(ctx context.Context, nqn string) error {

@@ -284,5 +284,9 @@ ENV PYTHONPATH=/opt/spdk/python
 
 ENV LD_LIBRARY_PATH=/opt/spdk/lib/rdma_provider:/opt/spdk/lib:/lib64
 
+# BXI/Portals uses the Kubernetes node InternalIP as its advertised endpoint,
+# matching the discovery behavior of the original BXI image.
+ENV DISTORT_RDMA_DISCOVERY_MODE=node-internal-ip
+
 
 ENTRYPOINT ["/usr/local/bin/distort-manager"]

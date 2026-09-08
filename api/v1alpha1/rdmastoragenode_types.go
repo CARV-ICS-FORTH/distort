@@ -33,6 +33,9 @@ const (
 	// NVMeInventoryReadyCondition reports whether every NVMe discovery source
 	// completed successfully during the latest reporter observation.
 	NVMeInventoryReadyCondition = "NVMeInventoryReady"
+	// BXINIDDiscoveryReadyCondition reports whether the node's Portals/BXI NIDs
+	// were read successfully during the latest reporter observation.
+	BXINIDDiscoveryReadyCondition = "BXINIDDiscoveryReady"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -45,7 +48,8 @@ type RDMAStorageNodeSpec struct {
 	NodeName string `json:"nodeName"`
 
 	// RDMAIP is the IP address bound to the RDMA-capable NIC interface.
-	// This is the IP that the CSI nodes will connect to.
+	// Conventional RDMA targets advertise this address directly. BXI targets
+	// derive their transport endpoint from the NIDs reported in status.
 	// +kubebuilder:validation:Required
 	RDMAIP string `json:"rdmaIP"`
 
@@ -74,6 +78,14 @@ type RDMAStorageNodeStatus struct {
 
 	// ActiveExports is the number of active NVMe-oF subsystems currently exported by this node.
 	ActiveExports int `json:"activeExports,omitempty"`
+
+	// BXINIDs lists the Portals/BXI network identifiers discovered on this node.
+	// The provider agent uses these values when publishing BXI target endpoints.
+	// +listType=set
+	// +kubebuilder:validation:items:Minimum=0
+	// +kubebuilder:validation:items:Maximum=255
+	// +optional
+	BXINIDs []int32 `json:"bxiNIDs,omitempty"`
 
 	// Conditions represent the current state of the RDMAStorageNode resource.
 	// +listType=map

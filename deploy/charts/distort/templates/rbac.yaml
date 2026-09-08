@@ -76,6 +76,9 @@ metadata:
   labels:
     {{- include "distort.labels" . | nindent 4 }}
 rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["storage.distort.io"]
   resources: ["nvmedeviceclaims"]
   verbs: ["get", "list", "watch"]

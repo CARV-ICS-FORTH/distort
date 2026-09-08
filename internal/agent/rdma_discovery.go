@@ -16,6 +16,7 @@ import (
 
 var sysClassInfiniBand = "/sys/class/infiniband"
 var sysClassNet = "/sys/class/net"
+var bxiNIDPathPattern = "/sys/devices/*/*/*/bxi3/bxi*/nid"
 var lookupInterfaceAddress = interfaceAddress
 
 type RDMAEndpoint struct {
@@ -23,6 +24,40 @@ type RDMAEndpoint struct {
 	IP        string
 	Transport storagev1alpha1.RDMATransportType
 	LinkSpeed string
+}
+
+// DiscoverBXINIDs returns every unique Portals/BXI NID exposed by the node.
+// Results are sorted so target endpoint selection remains stable across
+// reconciliations and sysfs enumeration order changes.
+func DiscoverBXINIDs() ([]int32, error) {
+	matches, err := filepath.Glob(bxiNIDPathPattern)
+	if err != nil {
+		return nil, fmt.Errorf("find BXI NID files: %w", err)
+	}
+	seen := make(map[int32]struct{}, len(matches))
+	var failures []string
+	for _, match := range matches {
+		data, err := os.ReadFile(match)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", match, err))
+			continue
+		}
+		nid, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 8)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: invalid NID %q", match, strings.TrimSpace(string(data))))
+			continue
+		}
+		seen[int32(nid)] = struct{}{}
+	}
+	nids := make([]int32, 0, len(seen))
+	for nid := range seen {
+		nids = append(nids, nid)
+	}
+	slices.Sort(nids)
+	if len(failures) > 0 {
+		return nids, fmt.Errorf("BXI NID discovery was incomplete: %s", strings.Join(failures, "; "))
+	}
+	return nids, nil
 }
 
 func DiscoverRDMAEndpoint() (RDMAEndpoint, error) {

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +21,8 @@ import (
 	"distort/internal/rdmahealth"
 )
 
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+
 // Reporter handles hardware discovery and submitting RDMAStorageNode + NVMeDevice CRs.
 type Reporter struct {
 	client.Client
@@ -26,12 +30,15 @@ type Reporter struct {
 	Interval        time.Duration
 	discoverDevices func() ([]HardwareNVMe, error)
 	discoverRDMA    func() (RDMAEndpoint, error)
+	discoverBXI     func() ([]int32, error)
 }
 
 const (
 	hardwareAvailableCondition    = "HardwareAvailable"
 	kernelDiscoveryReadyCondition = "KernelNVMeDiscoveryReady"
 	spdkDiscoveryReadyCondition   = "SPDKNVMeDiscoveryReady"
+	rdmaDiscoveryModeEnvironment  = "DISTORT_RDMA_DISCOVERY_MODE"
+	rdmaDiscoveryModeNodeIP       = "node-internal-ip"
 )
 
 func deviceObjectName(nodeName, serialNumber string) (string, error) {
@@ -71,11 +78,41 @@ func (r *Reporter) discoverNVMe() ([]HardwareNVMe, error) {
 	return DiscoverNVMe()
 }
 
-func (r *Reporter) discoverRDMAEndpoint() (RDMAEndpoint, error) {
+func (r *Reporter) discoverRDMAEndpoint(ctx context.Context) (RDMAEndpoint, error) {
 	if r.discoverRDMA != nil {
 		return r.discoverRDMA()
 	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(rdmaDiscoveryModeEnvironment)), rdmaDiscoveryModeNodeIP) {
+		return r.discoverNodeInternalIPEndpoint(ctx)
+	}
 	return DiscoverRDMAEndpoint()
+}
+
+func (r *Reporter) discoverBXINIDValues() ([]int32, error) {
+	if r.discoverBXI != nil {
+		return r.discoverBXI()
+	}
+	return DiscoverBXINIDs()
+}
+
+func (r *Reporter) discoverNodeInternalIPEndpoint(ctx context.Context) (RDMAEndpoint, error) {
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, &node); err != nil {
+		return RDMAEndpoint{}, fmt.Errorf("get Kubernetes Node %s for BXI endpoint discovery: %w", r.NodeName, err)
+	}
+	for _, address := range node.Status.Addresses {
+		if address.Type != corev1.NodeInternalIP {
+			continue
+		}
+		if _, err := rdmahealth.ParseUsableIP(address.Address); err != nil {
+			continue
+		}
+		return RDMAEndpoint{
+			IP:        address.Address,
+			Transport: storagev1alpha1.RDMATransportRoCEv2,
+		}, nil
+	}
+	return RDMAEndpoint{}, fmt.Errorf("kubernetes node %s has no usable InternalIP for BXI endpoint discovery", r.NodeName)
 }
 
 // Start runs the periodic discovery reporting loop.
@@ -106,7 +143,11 @@ func (r *Reporter) report(ctx context.Context) {
 
 func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity int64, inventoryErr error) {
 	logger := log.FromContext(ctx)
-	endpoint, discoveryErr := r.discoverRDMAEndpoint()
+	endpoint, discoveryErr := r.discoverRDMAEndpoint(ctx)
+	bxiNIDs, bxiDiscoveryErr := r.discoverBXINIDValues()
+	if bxiDiscoveryErr != nil {
+		logger.Error(bxiDiscoveryErr, "BXI NID discovery was incomplete", "node", r.NodeName)
+	}
 
 	nodeCR := &storagev1alpha1.RDMAStorageNode{}
 	err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, nodeCR)
@@ -147,6 +188,7 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 	base := nodeCR.DeepCopy()
 	nodeCR.Status.TotalCapacity = *resource.NewQuantity(totalCapacity, resource.BinarySI)
 	nodeCR.Status.FreeCapacity = *resource.NewQuantity(freeCapacity, resource.BinarySI)
+	nodeCR.Status.BXINIDs = append([]int32(nil), bxiNIDs...)
 	var partitions storagev1alpha1.NVMePartitionList
 	if err := r.List(ctx, &partitions); err != nil {
 		logger.Error(err, "Failed to count active NVMe exports")
@@ -161,9 +203,13 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 		}
 	}
 	nodeCR.Status.LastHeartbeatTime = metav1.Now()
+	readyMessage := "An active RDMA interface has a usable non-loopback IP address"
+	if endpoint.Interface == "" && discoveryErr == nil {
+		readyMessage = "The Kubernetes node InternalIP is available for the BXI Portals endpoint"
+	}
 	condition := metav1.Condition{
 		Type: rdmahealth.ReadyCondition, Status: metav1.ConditionTrue, ObservedGeneration: nodeCR.Generation,
-		Reason: "RDMAEndpointReady", Message: "An active RDMA interface has a usable non-loopback IP address",
+		Reason: "RDMAEndpointReady", Message: readyMessage,
 	}
 	if discoveryErr != nil {
 		condition.Status = metav1.ConditionFalse
@@ -171,6 +217,17 @@ func (r *Reporter) reportNode(ctx context.Context, totalCapacity, freeCapacity i
 		condition.Message = discoveryErr.Error()
 	}
 	meta.SetStatusCondition(&nodeCR.Status.Conditions, condition)
+	bxiCondition := metav1.Condition{
+		Type: storagev1alpha1.BXINIDDiscoveryReadyCondition, Status: metav1.ConditionTrue,
+		ObservedGeneration: nodeCR.Generation, Reason: "BXINIDDiscoverySucceeded",
+		Message: "Portals/BXI NID discovery completed successfully",
+	}
+	if bxiDiscoveryErr != nil {
+		bxiCondition.Status = metav1.ConditionFalse
+		bxiCondition.Reason = "BXINIDDiscoveryFailed"
+		bxiCondition.Message = bxiDiscoveryErr.Error()
+	}
+	meta.SetStatusCondition(&nodeCR.Status.Conditions, bxiCondition)
 	r.setInventoryConditions(nodeCR, inventoryErr)
 	err = r.Status().Patch(ctx, nodeCR, client.MergeFrom(base))
 	if err != nil {
