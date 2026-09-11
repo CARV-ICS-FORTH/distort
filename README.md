@@ -67,7 +67,13 @@ make package-chart-repository
 ```
 
 Commit the resulting package and `index.yaml` under `docs/static/charts/`. The
-GitHub Pages workflow publishes them at `https://distort-csi.dev/charts`.
+GitHub Pages workflow publishes them at `https://distort-csi.dev/charts` when a
+matching release tag is pushed:
+
+```bash
+git tag distort-bxi-v0.5.0
+git push origin distort-bxi-v0.5.0
+```
 
 Hardware and full-stack changes are validated in the guarded, isolated
 three-node Vagrant environment described in the
