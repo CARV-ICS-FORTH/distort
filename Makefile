@@ -12,6 +12,8 @@ TEST_ENV_IMG = $(TEST_ENV_IMAGE_REPOSITORY):$(TEST_ENV_IMAGE_TAG)
 TEST_ENV_BUILD_JOBS ?= 1
 TEST_ENV_GO_BUILD_PROCS ?= 1
 TEST_ENV_SKIP_IMAGE_BUILD ?= 0
+CHART_REPO_DIR ?= docs/static/charts
+CHART_REPO_URL ?= https://distort-csi.dev/charts
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -85,8 +87,8 @@ test-suite: test test-static lint ## Run the complete green host-side suite and 
 test-static: ## Run repository contracts and validate Helm and Hugo artifacts.
 	go test ./test/contracts -count=1
 	diff -qr config/crd/bases deploy/charts/distort/crds
-	helm lint ./deploy/charts/distort --set-string image.repository=registry.example.com/distort
-	helm template distort ./deploy/charts/distort --namespace distort-system --set-string image.repository=registry.example.com/distort >/dev/null
+	helm lint ./deploy/charts/distort
+	helm template distort ./deploy/charts/distort --namespace distort-system >/dev/null
 	hugo --source docs --destination /tmp/distort-docs-test --minify
 
 .PHONY: verify-modules
@@ -254,6 +256,18 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 .PHONY: sync-chart-crds
 sync-chart-crds: manifests ## Synchronize generated CRDs into the Helm chart.
 	/bin/cp -f config/crd/bases/* deploy/charts/distort/crds/
+
+.PHONY: package-chart-repository
+package-chart-repository: sync-chart-crds ## Package the BXI chart and update the static Helm repository index.
+	mkdir -p "$(CHART_REPO_DIR)"
+	helm lint ./deploy/charts/distort
+	helm template distort ./deploy/charts/distort --namespace distort-system >/dev/null
+	helm package ./deploy/charts/distort --destination "$(CHART_REPO_DIR)"
+	@if [ -f "$(CHART_REPO_DIR)/index.yaml" ]; then \
+		helm repo index "$(CHART_REPO_DIR)" --url "$(CHART_REPO_URL)" --merge "$(CHART_REPO_DIR)/index.yaml"; \
+	else \
+		helm repo index "$(CHART_REPO_DIR)" --url "$(CHART_REPO_URL)"; \
+	fi
 
 ##@ Build
 

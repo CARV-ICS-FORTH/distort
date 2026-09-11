@@ -19,23 +19,19 @@ NVMe-over-Fabrics/RDMA and provisions it through CSI.
 
 ## Quick start
 
-DISTORT does not yet publish a public container image. Build and push version
-`0.5.0` to a registry reachable by every cluster node, then install the chart
-with that fully qualified repository:
+Add the DISTORT Helm repository and install the BXI chart:
 
 ```bash
-export DISTORT_IMAGE_REPOSITORY=registry.example.com/your-project/distort
-make docker-build docker-push IMG="${DISTORT_IMAGE_REPOSITORY}:0.5.0"
-helm install distort ./deploy/charts/distort \
+helm repo add distort https://distort-csi.dev/charts
+helm repo update
+helm install distort distort/distort-bxi \
   --namespace distort-system \
-  --create-namespace \
-  --set-string image.repository="${DISTORT_IMAGE_REPOSITORY}"
+  --create-namespace
 ```
 
-The tag defaults to the chart application version, `0.5.0`. Production users
-can instead set `image.digest=sha256:<digest>` to pin an immutable image. The
-chart rejects an omitted or unqualified repository and rejects the `latest`
-tag so a release install cannot silently select a local or mutable image.
+The chart deploys the public `docker.io/kampia99/distort:bxi-dev` image pinned
+to its published manifest digest. To use another image, set `image.repository`
+and `image.tag` and clear the default digest with `--set-string image.digest=`.
 
 DISTORT never claims physical storage automatically. After installation, an
 administrator must create an `NVMeDeviceClaim` for each device that DISTORT may
@@ -63,6 +59,15 @@ The published documentation is available at
 make test-suite
 make test-race
 ```
+
+Package or update the static Helm repository served by the documentation site:
+
+```bash
+make package-chart-repository
+```
+
+Commit the resulting package and `index.yaml` under `docs/static/charts/`. The
+GitHub Pages workflow publishes them at `https://distort-csi.dev/charts`.
 
 Hardware and full-stack changes are validated in the guarded, isolated
 three-node Vagrant environment described in the

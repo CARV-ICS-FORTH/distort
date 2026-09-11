@@ -1,15 +1,16 @@
 image:
-  # A fully qualified repository is required because DISTORT does not yet
-  # publish a default image. Example: ghcr.io/example/distort
-  repository: ""
+  # The public BXI image. The digest pins this chart release to the exact image
+  # published under the readable bxi-dev tag.
+  repository: docker.io/kampia99/distort
   pullPolicy: IfNotPresent
-  # Defaults to the chart appVersion (0.5.0).
-  tag: ""
-  # Optional immutable sha256 digest. When set, digest takes precedence over tag.
-  digest: ""
+  tag: bxi-dev
+  # Digest takes precedence over tag. Clear it explicitly when overriding tag.
+  digest: sha256:f017873a3fa4c0c5559814ca11753eae02a7d483ca845e39c9ad9bd545fe1bf3
 
 imagePullSecrets: []
-nameOverride: ""
+# Keep Kubernetes object names stable even though this distribution's chart
+# package is named distort-bxi.
+nameOverride: "distort"
 fullnameOverride: ""
 
 manager:

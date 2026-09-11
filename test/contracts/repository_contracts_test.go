@@ -110,16 +110,23 @@ func TestChartWiresWorkloadHealthChecks(t *testing.T) {
 	}
 }
 
-func TestChartRequiresQualifiedVersionedImage(t *testing.T) {
+func TestBXIChartUsesPublishedPinnedImage(t *testing.T) {
 	chart := readRepositoryFile(t, "deploy/charts/distort/Chart.yaml")
-	if !regexp.MustCompile(`(?m)^version:\s*0\.5\.0\s*$`).MatchString(chart) ||
-		!regexp.MustCompile(`(?m)^appVersion:\s*"0\.5\.0"\s*$`).MatchString(chart) {
-		t.Fatal("chart version and appVersion must both be 0.5.0")
+	if !regexp.MustCompile(`(?m)^name:\s*distort-bxi\s*$`).MatchString(chart) ||
+		!regexp.MustCompile(`(?m)^version:\s*0\.5\.0\s*$`).MatchString(chart) ||
+		!regexp.MustCompile(`(?m)^appVersion:\s*"bxi-dev"\s*$`).MatchString(chart) {
+		t.Fatal("BXI chart metadata does not identify distort-bxi 0.5.0 / bxi-dev")
 	}
 
 	values := readRepositoryFile(t, "deploy/charts/distort/values.yaml")
-	if !regexp.MustCompile(`(?m)^\s*repository:\s*""\s*$`).MatchString(values) {
-		t.Fatal("chart must not default to an unpublished or unqualified image repository")
+	for _, requiredText := range []string{
+		"repository: docker.io/kampia99/distort",
+		"tag: bxi-dev",
+		"digest: sha256:f017873a3fa4c0c5559814ca11753eae02a7d483ca845e39c9ad9bd545fe1bf3",
+	} {
+		if !strings.Contains(values, requiredText) {
+			t.Errorf("BXI chart values are missing %q", requiredText)
+		}
 	}
 	if regexp.MustCompile(`(?m)^\s*tag:\s*["']?latest["']?\s*$`).MatchString(values) {
 		t.Fatal("chart must not default to the mutable latest tag")

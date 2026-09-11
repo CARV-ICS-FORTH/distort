@@ -8,6 +8,29 @@ Once DISTORT is deployed, it seamlessly integrates with standard Kubernetes stor
 
 ---
 
+## Install the BXI release
+
+Add the DISTORT chart repository and install the latest stable version of the
+BXI chart:
+
+```bash
+helm repo add distort https://distort-csi.dev/charts
+helm repo update
+helm install distort distort/distort-bxi \
+  --namespace distort-system \
+  --create-namespace
+```
+
+The chart deploys `docker.io/kampia99/distort:bxi-dev` pinned to the immutable
+manifest digest published with this chart release. Check the workloads after
+installation:
+
+```bash
+kubectl -n distort-system get pods
+```
+
+---
+
 ## Schedule storage providers and consumers
 
 Storage providers and workload consumers do not need to be the same nodes. Use
