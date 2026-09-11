@@ -1,0 +1,26 @@
+apiVersion: v1
+entries:
+  distort-bxi:
+  - apiVersion: v2
+    appVersion: bxi-dev
+    created: "2026-09-11T13:18:08.34190603+03:00"
+    description: The DISTORT BXI Kubernetes storage engine for NVMe-over-Fabrics using
+      RDMA
+    digest: 018a4e515c935addb1a6c002771349accc28df8bb48a3e0960770b85777575bb
+    home: https://distort-csi.dev/
+    keywords:
+    - storage
+    - csi
+    - nvme
+    - rdma
+    maintainers:
+    - email: chazapis@ics.forth.gr
+      name: chazapis
+    name: distort-bxi
+    sources:
+    - https://github.com/CARV-ICS-FORTH/distort
+    type: application
+    urls:
+    - https://distort-csi.dev/charts/distort-bxi-0.5.0.tgz
+    version: 0.5.0
+generated: "2026-09-11T13:18:08.341242926+03:00"
