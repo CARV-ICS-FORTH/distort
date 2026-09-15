@@ -70,18 +70,21 @@ make test-race
 
 ## Publishing a release
 
-The `Publish release` GitHub Actions workflow takes a release flavor and a
-version. It builds `standard` releases from `dev` and `bxi` releases from `bxi`,
+The `Publish release` GitHub Actions workflow runs when a GitHub Release is
+published. It builds standard releases from `dev` and BXI releases from `bxi`,
 using the Makefile's `docker-build` and `docker-push` targets. Configure these
-repository secrets before the first run:
+repository secrets before the first release:
 
 - `DOCKERHUB_USERNAME`: Docker Hub account name
 - `DOCKERHUB_TOKEN`: Docker Hub access token with write permission
 
-Run the workflow from the Actions tab and enter `0.5` or `0.5.0`. The workflow
-normalizes both to Helm version `0.5.0`. A standard release creates Git tag
-`v0.5.0` and Docker tags `0.5.0`, `0.5`, and `latest`. A BXI release creates
-Git tag `bxi-v0.5.0` and Docker tags `bxi-0.5.0`, `bxi-0.5`, and `bxi`.
+For a standard release, publish tag `v0.5.0` from the current tip of `dev`. For
+a BXI release, publish tag `bxi-v0.5.0` from the current tip of `bxi`. Publishing
+the release automatically builds and pushes the image, packages and indexes the
+Helm chart, attaches it to the release, and deploys the chart repository. The
+standard release publishes Docker tags `0.5.0`, `0.5`, and `latest`; the BXI
+release publishes `bxi-0.5.0`, `bxi-0.5`, and `bxi`. The Actions tab retains a
+manual trigger for retrying or recovering a publication.
 
 Hardware and full-stack changes are validated in the guarded, isolated
 three-node Vagrant environment described in the

@@ -1,6 +1,9 @@
 name: Publish release
 
 on:
+  release:
+    types:
+      - published
   workflow_dispatch:
     inputs:
       flavor:
@@ -29,7 +32,7 @@ env:
 
 jobs:
   release:
-    name: Publish ${{ inputs.flavor }} ${{ inputs.version }}
+    name: Publish release artifacts
     runs-on: ubuntu-latest
 
     steps:
@@ -37,9 +40,28 @@ jobs:
         id: release
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
           FLAVOR: ${{ inputs.flavor }}
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            case "${EVENT_RELEASE_TAG}" in
+              bxi-v*)
+                FLAVOR=bxi
+                REQUESTED_VERSION="${EVENT_RELEASE_TAG#bxi-v}"
+                ;;
+              v*)
+                FLAVOR=standard
+                REQUESTED_VERSION="${EVENT_RELEASE_TAG#v}"
+                ;;
+              *)
+                echo "Release tag must have the form v0.5.0 or bxi-v0.5.0" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
           version="${REQUESTED_VERSION#v}"
           if [[ "${version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
             version="${version}.0"
@@ -75,6 +97,11 @@ jobs:
               exit 1
               ;;
           esac
+
+          if [[ "${EVENT_NAME}" == "release" && "${EVENT_RELEASE_TAG}" != "${release_tag}" ]]; then
+            echo "Release tag must use the normalized version ${release_tag}" >&2
+            exit 1
+          fi
 
           {
             echo "version=${version}"
@@ -115,6 +142,29 @@ jobs:
             exit 1
           fi
           diff -qr config/crd/bases deploy/charts/distort/crds
+
+      - name: Verify or create release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          SOURCE_BRANCH: ${{ steps.release.outputs.source_branch }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            tagged_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
+            source_commit="$(git rev-parse HEAD)"
+            if [[ "${tagged_commit}" != "${source_commit}" ]]; then
+              echo "${RELEASE_TAG} already points to ${tagged_commit}, not ${source_commit}" >&2
+              exit 1
+            fi
+          else
+            git tag -a "${RELEASE_TAG}" -m "DISTORT ${SOURCE_BRANCH} ${VERSION}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
 
       - name: Set up Helm
         uses: azure/setup-helm@v5
@@ -178,29 +228,6 @@ jobs:
           make docker-push IMG="${IMAGE_REPOSITORY}:${IMAGE_MINOR_TAG}"
           docker tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" "${IMAGE_REPOSITORY}:${IMAGE_CHANNEL_TAG}"
           make docker-push IMG="${IMAGE_REPOSITORY}:${IMAGE_CHANNEL_TAG}"
-
-      - name: Create release tag
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          SOURCE_BRANCH: ${{ steps.release.outputs.source_branch }}
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-
-          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tagged_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
-            source_commit="$(git rev-parse HEAD)"
-            if [[ "${tagged_commit}" != "${source_commit}" ]]; then
-              echo "${RELEASE_TAG} already points to ${tagged_commit}, not ${source_commit}" >&2
-              exit 1
-            fi
-          else
-            git tag -a "${RELEASE_TAG}" -m "DISTORT ${SOURCE_BRANCH} ${VERSION}"
-            git push origin "refs/tags/${RELEASE_TAG}"
-          fi
 
       - name: Create GitHub release
         shell: bash
