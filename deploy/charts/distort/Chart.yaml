@@ -4,6 +4,9 @@ description: A Kubernetes-native storage engine for NVMe-over-Fabrics using RDMA
 type: application
 version: 0.5.0
 appVersion: "0.5.0"
+home: https://distort-csi.dev/
+sources:
+  - https://github.com/Kampadais/distort
 keywords:
   - storage
   - csi

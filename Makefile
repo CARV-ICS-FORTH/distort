@@ -85,8 +85,8 @@ test-suite: test test-static lint ## Run the complete green host-side suite and 
 test-static: ## Run repository contracts and validate Helm and Hugo artifacts.
 	go test ./test/contracts -count=1
 	diff -qr config/crd/bases deploy/charts/distort/crds
-	helm lint ./deploy/charts/distort --set-string image.repository=registry.example.com/distort
-	helm template distort ./deploy/charts/distort --namespace distort-system --set-string image.repository=registry.example.com/distort >/dev/null
+	helm lint ./deploy/charts/distort
+	helm template distort ./deploy/charts/distort --namespace distort-system >/dev/null
 	hugo --source docs --destination /tmp/distort-docs-test --minify
 
 .PHONY: verify-modules

@@ -1,7 +1,6 @@
 image:
-  # A fully qualified repository is required because DISTORT does not yet
-  # publish a default image. Example: ghcr.io/example/distort
-  repository: ""
+  # Release automation replaces the tag with the selected release version.
+  repository: docker.io/kampia99/distort
   pullPolicy: IfNotPresent
   # Defaults to the chart appVersion (0.5.0).
   tag: ""

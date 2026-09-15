@@ -8,6 +8,37 @@ Once DISTORT is deployed, it seamlessly integrates with standard Kubernetes stor
 
 ---
 
+## Install DISTORT
+
+Add the chart repository and update its local index:
+
+```bash
+helm repo add distort https://distort-csi.dev/charts
+helm repo update
+```
+
+Install the standard release, built from the `dev` branch:
+
+```bash
+helm install distort distort/distort \
+  --namespace distort-system \
+  --create-namespace
+```
+
+Install the BXI variant when the nodes require BXI support:
+
+```bash
+helm install distort distort/distort-bxi \
+  --namespace distort-system \
+  --create-namespace
+```
+
+Omitting `--version` selects the newest stable version of that chart. Add, for
+example, `--version 0.5.0` to select a specific release. The two variants share
+semantic versions but use separate charts and image tags.
+
+---
+
 ## Schedule storage providers and consumers
 
 Storage providers and workload consumers do not need to be the same nodes. Use

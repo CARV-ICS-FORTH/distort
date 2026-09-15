@@ -110,7 +110,7 @@ func TestChartWiresWorkloadHealthChecks(t *testing.T) {
 	}
 }
 
-func TestChartRequiresQualifiedVersionedImage(t *testing.T) {
+func TestChartUsesPublishedVersionedImage(t *testing.T) {
 	chart := readRepositoryFile(t, "deploy/charts/distort/Chart.yaml")
 	if !regexp.MustCompile(`(?m)^version:\s*0\.5\.0\s*$`).MatchString(chart) ||
 		!regexp.MustCompile(`(?m)^appVersion:\s*"0\.5\.0"\s*$`).MatchString(chart) {
@@ -118,8 +118,8 @@ func TestChartRequiresQualifiedVersionedImage(t *testing.T) {
 	}
 
 	values := readRepositoryFile(t, "deploy/charts/distort/values.yaml")
-	if !regexp.MustCompile(`(?m)^\s*repository:\s*""\s*$`).MatchString(values) {
-		t.Fatal("chart must not default to an unpublished or unqualified image repository")
+	if !regexp.MustCompile(`(?m)^\s*repository:\s*docker\.io/kampia99/distort\s*$`).MatchString(values) {
+		t.Fatal("chart must default to the published Docker Hub repository")
 	}
 	if regexp.MustCompile(`(?m)^\s*tag:\s*["']?latest["']?\s*$`).MatchString(values) {
 		t.Fatal("chart must not default to the mutable latest tag")
@@ -142,6 +142,22 @@ func TestChartRequiresQualifiedVersionedImage(t *testing.T) {
 	} {
 		if !strings.Contains(readRepositoryFile(t, workload), `include "distort.image"`) {
 			t.Errorf("%s does not use the validated image helper", workload)
+		}
+	}
+}
+
+func TestReleaseWorkflowPublishesBothVariants(t *testing.T) {
+	workflow := readRepositoryFile(t, ".github/workflows/release.yml")
+	for _, requiredText := range []string{
+		"workflow_dispatch:", "DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN",
+		"source_branch=dev", "source_branch=bxi",
+		"chart_name=distort", "chart_name=distort-bxi",
+		"make docker-build", "make docker-push",
+		"docker.io/kampia99/distort", "https://distort-csi.dev/charts",
+		"gh workflow run hugo.yml", "git -C site push origin HEAD:main",
+	} {
+		if !strings.Contains(workflow, requiredText) {
+			t.Errorf("release workflow is missing %q", requiredText)
 		}
 	}
 }

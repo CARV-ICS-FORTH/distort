@@ -1,0 +1,279 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: Release variant
+        required: true
+        type: choice
+        options:
+          - standard
+          - bxi
+      version:
+        description: Semantic version (for example, 0.5 or 0.5.0)
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: distort-release-publishing
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPOSITORY: docker.io/kampia99/distort
+  CHART_REPOSITORY_URL: https://distort-csi.dev/charts
+
+jobs:
+  release:
+    name: Publish ${{ inputs.flavor }} ${{ inputs.version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release metadata
+        id: release
+        shell: bash
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          version="${REQUESTED_VERSION#v}"
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            version="${version}.0"
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must have the form 0.5 or 0.5.0" >&2
+            exit 1
+          fi
+
+          major="${version%%.*}"
+          remainder="${version#*.}"
+          minor="${remainder%%.*}"
+
+          case "${FLAVOR}" in
+            standard)
+              source_branch=dev
+              chart_name=distort
+              release_tag="v${version}"
+              image_tag="${version}"
+              image_minor_tag="${major}.${minor}"
+              image_channel_tag=latest
+              ;;
+            bxi)
+              source_branch=bxi
+              chart_name=distort-bxi
+              release_tag="bxi-v${version}"
+              image_tag="bxi-${version}"
+              image_minor_tag="bxi-${major}.${minor}"
+              image_channel_tag=bxi
+              ;;
+            *)
+              echo "Unsupported release flavor: ${FLAVOR}" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "version=${version}"
+            echo "source_branch=${source_branch}"
+            echo "chart_name=${chart_name}"
+            echo "release_tag=${release_tag}"
+            echo "image_tag=${image_tag}"
+            echo "image_minor_tag=${image_minor_tag}"
+            echo "image_channel_tag=${image_channel_tag}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.source_branch }}
+          fetch-depth: 0
+
+      - name: Verify source and credentials
+        shell: bash
+        env:
+          CHART_NAME: ${{ steps.release.outputs.chart_name }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SOURCE_BRANCH: ${{ steps.release.outputs.source_branch }}
+        run: |
+          git fetch origin "${SOURCE_BRANCH}"
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${SOURCE_BRANCH}")" ]]; then
+            echo "Release checkout is not at the tip of ${SOURCE_BRANCH}" >&2
+            exit 1
+          fi
+          actual_chart_name="$(awk '$1 == "name:" {print $2; exit}' deploy/charts/distort/Chart.yaml)"
+          if [[ "${actual_chart_name}" != "${CHART_NAME}" ]]; then
+            echo "Expected chart ${CHART_NAME}, found ${actual_chart_name}" >&2
+            exit 1
+          fi
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "Configure DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets" >&2
+            exit 1
+          fi
+          diff -qr config/crd/bases deploy/charts/distort/crds
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.18.4
+
+      - name: Prepare Helm chart
+        id: chart
+        shell: bash
+        env:
+          CHART_NAME: ${{ steps.release.outputs.chart_name }}
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          chart_dir="${RUNNER_TEMP}/chart"
+          release_dir="${RUNNER_TEMP}/release"
+          mkdir -p "${release_dir}"
+          cp -R deploy/charts/distort "${chart_dir}"
+
+          sed -i -E \
+            -e "s|^  repository:.*$|  repository: ${IMAGE_REPOSITORY}|" \
+            -e "s|^  tag:.*$|  tag: ${IMAGE_TAG}|" \
+            -e 's|^  digest:.*$|  digest: ""|' \
+            "${chart_dir}/values.yaml"
+          sed -i \
+            's|https://github.com/CARV-ICS-FORTH/distort|https://github.com/Kampadais/distort|g' \
+            "${chart_dir}/Chart.yaml"
+
+          helm lint "${chart_dir}"
+          helm template distort "${chart_dir}" --namespace distort-system >/dev/null
+          helm package "${chart_dir}" \
+            --version "${VERSION}" \
+            --app-version "${IMAGE_TAG}" \
+            --destination "${release_dir}"
+
+          package_file="${release_dir}/${CHART_NAME}-${VERSION}.tgz"
+          test -f "${package_file}"
+          echo "package_file=${package_file}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image with the Makefile
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: make docker-build IMG="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+      - name: Publish image tags with the Makefile
+        shell: bash
+        env:
+          IMAGE_CHANNEL_TAG: ${{ steps.release.outputs.image_channel_tag }}
+          IMAGE_MINOR_TAG: ${{ steps.release.outputs.image_minor_tag }}
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          make docker-push IMG="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+          docker tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" "${IMAGE_REPOSITORY}:${IMAGE_MINOR_TAG}"
+          make docker-push IMG="${IMAGE_REPOSITORY}:${IMAGE_MINOR_TAG}"
+          docker tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" "${IMAGE_REPOSITORY}:${IMAGE_CHANNEL_TAG}"
+          make docker-push IMG="${IMAGE_REPOSITORY}:${IMAGE_CHANNEL_TAG}"
+
+      - name: Create release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          SOURCE_BRANCH: ${{ steps.release.outputs.source_branch }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            tagged_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
+            source_commit="$(git rev-parse HEAD)"
+            if [[ "${tagged_commit}" != "${source_commit}" ]]; then
+              echo "${RELEASE_TAG} already points to ${tagged_commit}, not ${source_commit}" >&2
+              exit 1
+            fi
+          else
+            git tag -a "${RELEASE_TAG}" -m "DISTORT ${SOURCE_BRANCH} ${VERSION}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_FILE: ${{ steps.chart.outputs.package_file }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${PACKAGE_FILE}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${PACKAGE_FILE}" \
+              --verify-tag \
+              --generate-notes \
+              --title "DISTORT ${RELEASE_TAG}"
+          fi
+
+      - name: Check out chart repository branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: site
+          fetch-depth: 0
+
+      - name: Publish chart repository files
+        shell: bash
+        env:
+          PACKAGE_FILE: ${{ steps.chart.outputs.package_file }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          chart_repo_dir="site/docs/static/charts"
+          mkdir -p "${chart_repo_dir}"
+          cp "${PACKAGE_FILE}" "${chart_repo_dir}/"
+
+          if [[ -f "${chart_repo_dir}/index.yaml" ]]; then
+            helm repo index "${chart_repo_dir}" \
+              --url "${CHART_REPOSITORY_URL}" \
+              --merge "${chart_repo_dir}/index.yaml"
+          else
+            helm repo index "${chart_repo_dir}" --url "${CHART_REPOSITORY_URL}"
+          fi
+
+          git -C site config user.name github-actions[bot]
+          git -C site config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C site add docs/static/charts
+          if ! git -C site diff --cached --quiet; then
+            git -C site commit -m "docs(helm): publish ${RELEASE_TAG}"
+            git -C site push origin HEAD:main
+          fi
+
+      - name: Deploy documentation and chart repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run hugo.yml --repo "${GITHUB_REPOSITORY}" --ref main
+
+      - name: Write release summary
+        shell: bash
+        env:
+          CHART_NAME: ${{ steps.release.outputs.chart_name }}
+          IMAGE_CHANNEL_TAG: ${{ steps.release.outputs.image_channel_tag }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          {
+            echo "## Published ${RELEASE_TAG}"
+            echo
+            echo "- Image: \`${IMAGE_REPOSITORY}:${IMAGE_CHANNEL_TAG}\`"
+            echo "- Chart: \`distort/${CHART_NAME}\` version \`${VERSION}\`"
+            echo
+            echo '```bash'
+            echo 'helm repo add distort https://distort-csi.dev/charts'
+            echo 'helm repo update'
+            echo "helm install distort distort/${CHART_NAME} --namespace distort-system --create-namespace --version ${VERSION}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -19,23 +19,27 @@ NVMe-over-Fabrics/RDMA and provisions it through CSI.
 
 ## Quick start
 
-DISTORT does not yet publish a public container image. Build and push version
-`0.5.0` to a registry reachable by every cluster node, then install the chart
-with that fully qualified repository:
+Add the DISTORT Helm repository, then choose the standard or BXI chart. Omitting
+`--version` installs the newest stable release of the selected chart:
 
 ```bash
-export DISTORT_IMAGE_REPOSITORY=registry.example.com/your-project/distort
-make docker-build docker-push IMG="${DISTORT_IMAGE_REPOSITORY}:0.5.0"
-helm install distort ./deploy/charts/distort \
+helm repo add distort https://distort-csi.dev/charts
+helm repo update
+
+# Standard release, built from dev
+helm install distort distort/distort \
   --namespace distort-system \
-  --create-namespace \
-  --set-string image.repository="${DISTORT_IMAGE_REPOSITORY}"
+  --create-namespace
+
+# BXI release, built from bxi
+helm install distort distort/distort-bxi \
+  --namespace distort-system \
+  --create-namespace
 ```
 
-The tag defaults to the chart application version, `0.5.0`. Production users
-can instead set `image.digest=sha256:<digest>` to pin an immutable image. The
-chart rejects an omitted or unqualified repository and rejects the `latest`
-tag so a release install cannot silently select a local or mutable image.
+Add `--version 0.5.0` to install that exact chart version. Standard and BXI
+charts use the same semantic version because their features match; their chart
+names and Docker image tags remain distinct.
 
 DISTORT never claims physical storage automatically. After installation, an
 administrator must create an `NVMeDeviceClaim` for each device that DISTORT may
@@ -63,6 +67,21 @@ The published documentation is available at
 make test-suite
 make test-race
 ```
+
+## Publishing a release
+
+The `Publish release` GitHub Actions workflow takes a release flavor and a
+version. It builds `standard` releases from `dev` and `bxi` releases from `bxi`,
+using the Makefile's `docker-build` and `docker-push` targets. Configure these
+repository secrets before the first run:
+
+- `DOCKERHUB_USERNAME`: Docker Hub account name
+- `DOCKERHUB_TOKEN`: Docker Hub access token with write permission
+
+Run the workflow from the Actions tab and enter `0.5` or `0.5.0`. The workflow
+normalizes both to Helm version `0.5.0`. A standard release creates Git tag
+`v0.5.0` and Docker tags `0.5.0`, `0.5`, and `latest`. A BXI release creates
+Git tag `bxi-v0.5.0` and Docker tags `bxi-0.5.0`, `bxi-0.5`, and `bxi`.
 
 Hardware and full-stack changes are validated in the guarded, isolated
 three-node Vagrant environment described in the
