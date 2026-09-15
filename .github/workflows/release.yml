@@ -188,10 +188,6 @@ jobs:
             -e "s|^  tag:.*$|  tag: ${IMAGE_TAG}|" \
             -e 's|^  digest:.*$|  digest: ""|' \
             "${chart_dir}/values.yaml"
-          sed -i \
-            's|https://github.com/CARV-ICS-FORTH/distort|https://github.com/Kampadais/distort|g' \
-            "${chart_dir}/Chart.yaml"
-
           helm lint "${chart_dir}"
           helm template distort "${chart_dir}" --namespace distort-system >/dev/null
           helm package "${chart_dir}" \
