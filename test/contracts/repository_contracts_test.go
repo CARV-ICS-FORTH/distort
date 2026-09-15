@@ -150,7 +150,8 @@ func TestReleaseWorkflowPublishesBothVariants(t *testing.T) {
 	workflow := readRepositoryFile(t, ".github/workflows/release.yml")
 	for _, requiredText := range []string{
 		"release:\n    types:\n      - published", "workflow_dispatch:",
-		"EVENT_RELEASE_TAG", "bxi-v*", "DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN",
+		"EVENT_RELEASE_TAG", "bxi-v*", "release_tag=\"${EVENT_RELEASE_TAG}\"",
+		"DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN",
 		"source_branch=dev", "source_branch=bxi",
 		"chart_name=distort", "chart_name=distort-bxi",
 		"make docker-build", "make docker-push",

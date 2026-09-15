@@ -78,9 +78,10 @@ repository secrets before the first release:
 - `DOCKERHUB_USERNAME`: Docker Hub account name
 - `DOCKERHUB_TOKEN`: Docker Hub access token with write permission
 
-For a standard release, publish tag `v0.5.0` from the current tip of `dev`. For
-a BXI release, publish tag `bxi-v0.5.0` from the current tip of `bxi`. Publishing
-the release automatically builds and pushes the image, packages and indexes the
+For a standard release, publish tag `v0.5` or `v0.5.0` from the current tip of
+`dev`. For a BXI release, publish tag `bxi-v0.5` or `bxi-v0.5.0` from the current
+tip of `bxi`. Both tag forms normalize to Helm version `0.5.0`. Publishing the
+release automatically builds and pushes the image, packages and indexes the
 Helm chart, attaches it to the release, and deploys the chart repository. The
 standard release publishes Docker tags `0.5.0`, `0.5`, and `latest`; the BXI
 release publishes `bxi-0.5.0`, `bxi-0.5`, and `bxi`. The Actions tab retains a
