@@ -3,7 +3,7 @@ entries:
   distort:
   - apiVersion: v2
     appVersion: 0.5.0
-    created: "2026-09-15T12:07:03.20559795Z"
+    created: "2026-09-17T10:05:19.675028353Z"
     description: A Kubernetes-native storage engine for NVMe-over-Fabrics using RDMA
     digest: c887968c68cb9bc0f50e9448ffc736c80672288df46d9ebb247ca9e1d423bab2
     home: https://distort-csi.dev/
@@ -24,11 +24,11 @@ entries:
     version: 0.5.0
   distort-bxi:
   - apiVersion: v2
-    appVersion: bxi-dev
-    created: "2026-09-15T12:07:03.206202552Z"
+    appVersion: bxi-0.5.0
+    created: "2026-09-17T10:05:19.67567482Z"
     description: The DISTORT BXI Kubernetes storage engine for NVMe-over-Fabrics using
       RDMA
-    digest: 018a4e515c935addb1a6c002771349accc28df8bb48a3e0960770b85777575bb
+    digest: bf8660805503a4ee654b064277f49a3331720f3a4a14e07a0125e25ae9fb5881
     home: https://distort-csi.dev/
     keywords:
     - storage
@@ -45,4 +45,4 @@ entries:
     urls:
     - https://distort-csi.dev/charts/distort-bxi-0.5.0.tgz
     version: 0.5.0
-generated: "2026-09-15T12:07:03.204791639Z"
+generated: "2026-09-17T10:05:19.674242455Z"
