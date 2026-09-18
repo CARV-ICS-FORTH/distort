@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -15,7 +16,7 @@ import (
 	"distort/test/utils"
 )
 
-var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, func() {
+var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, Label("green"), func() {
 	SetDefaultEventuallyTimeout(180 * time.Second)
 	SetDefaultEventuallyPollingInterval(5 * time.Second)
 
@@ -26,18 +27,47 @@ var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, func() {
 				cmd := exec.Command("kubectl", "get", "nvmedevices", "-o", "jsonpath={.items[*].metadata.name}")
 				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				// Should find at least 2 NVMe devices (from master and worker)
+				// The default lab provides at least one controller on every node.
 				devices := strings.Fields(out)
-				g.Expect(len(devices)).To(BeNumerically(">=", 2))
+				g.Expect(len(devices)).To(BeNumerically(">=", 3))
 			}).Should(Succeed())
 
-			By("waiting for RDMAStorageNode CRDs to be populated")
+			By("waiting for fresh RDMAStorageNode CRDs with usable endpoints")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "rdmastoragenodes", "-o", "jsonpath={.items[*].metadata.name}")
+				cmd := exec.Command("kubectl", "get", "rdmastoragenodes", "-o",
+					`jsonpath={range .items[*]}{.metadata.name}{"|"}{.spec.nodeName}{"|"}{.spec.rdmaIP}{"|"}{.spec.transport}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.status.conditions[?(@.type=="NVMeInventoryReady")].status}{"|"}{.status.lastHeartbeatTime}{"\n"}{end}`)
 				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				nodes := strings.Fields(out)
-				g.Expect(len(nodes)).To(BeNumerically(">=", 1))
+				expected := map[string]bool{"distort-master": false, "distort-worker-1": false, "distort-worker-2": false}
+				for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+					fields := strings.Split(line, "|")
+					g.Expect(fields).To(HaveLen(7), "invalid RDMAStorageNode row %q", line)
+					if len(fields) != 7 {
+						continue
+					}
+					if _, ok := expected[fields[0]]; !ok {
+						continue
+					}
+					g.Expect(fields[1]).To(Equal(fields[0]))
+					ip := net.ParseIP(fields[2])
+					g.Expect(ip).NotTo(BeNil())
+					if ip == nil {
+						continue
+					}
+					g.Expect(ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast()).To(BeFalse())
+					g.Expect(fields[3]).To(Or(Equal("RoCEv2"), Equal("InfiniBand")))
+					g.Expect(fields[4]).To(Equal("True"))
+					g.Expect(fields[5]).To(Equal("True"))
+					heartbeat, parseErr := time.Parse(time.RFC3339, fields[6])
+					g.Expect(parseErr).NotTo(HaveOccurred())
+					age := time.Since(heartbeat)
+					g.Expect(age).To(BeNumerically(">=", -5*time.Second))
+					g.Expect(age).To(BeNumerically("<=", 45*time.Second))
+					expected[fields[0]] = true
+				}
+				for node, ready := range expected {
+					g.Expect(ready).To(BeTrue(), "RDMAStorageNode %s is missing or unusable", node)
+				}
 			}).Should(Succeed())
 
 			By("verifying RDMAStorageNode CRDs report 0 capacity initially")
@@ -54,7 +84,24 @@ var _ = Describe("DISTORT Unified E2E Test Suite", Ordered, func() {
 		})
 
 		It("Partitioning Engine & NVMe-oF Exporting: Should slice a drive and export it", func() {
-			By("Creating a raw NVMePartition CRD specifically for distort-worker-1")
+			serialNum := serialForNode("distort-master")
+			By("Claiming a device before exercising direct partition provisioning")
+			_, err := applyManifest(fmt.Sprintf(`
+apiVersion: storage.distort.io/v1alpha1
+kind: NVMeDeviceClaim
+metadata:
+  name: e2e-layer1-claim
+spec:
+  serialNumber: %s
+`, serialNum))
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				out, getErr := kubectl("get", "nvmedeviceclaim", "e2e-layer1-claim", "-o", "jsonpath={.status.active}")
+				g.Expect(getErr).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("true"))
+			}).Should(Succeed())
+
+			By("Creating a direct NVMePartition on the claimed master device")
 			partitionYaml := `
 apiVersion: storage.distort.io/v1alpha1
 kind: NVMePartition
@@ -62,11 +109,10 @@ metadata:
   name: e2e-test-partition
 spec:
   size: 500Mi
-  nodeName: distort-worker-1
-  parentDeviceSerialNumber: SN-distort-worker-1
+  targetBackend: spdk
+  volumeManager: partition
 `
-			cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", partitionYaml))
-			_, err := utils.Run(cmd)
+			_, err = applyManifest(partitionYaml)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Waiting for the NVMePartition to reach Exported state")
@@ -76,35 +122,44 @@ spec:
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(out).To(Equal("Exported"))
 			}).Should(Succeed())
+			out, err := kubectl("get", "nvmepartition", "e2e-test-partition", "-o", "jsonpath={.spec.nodeName}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal("distort-master"))
+			backendVolumeID, err := kubectl("get", "nvmepartition", "e2e-test-partition", "-o", "jsonpath={.status.backendVolumeID}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backendVolumeID).NotTo(BeEmpty())
+			nqn, err := kubectl("get", "nvmepartition", "e2e-test-partition", "-o", "jsonpath={.status.nqn}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(nqn).NotTo(BeEmpty())
 
 			By("Using SPDK RPC to verify Logical Volume creation")
-			cmd = exec.Command("sh", "-c", "POD=$(kubectl get pod -n distort-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=distort-worker-1 -o jsonpath='{.items[0].metadata.name}') && kubectl exec -n distort-system $POD -- /opt/spdk/scripts/rpc.py bdev_get_bdevs")
-			out, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			// Must find e2e-test-partition LVol running inside SPDK
-			Expect(out).To(ContainSubstring("e2e-test-partition"))
-
-			By("Using SPDK RPC to verify NVMe-oF subsystem export")
-			cmd = exec.Command("sh", "-c", "POD=$(kubectl get pod -n distort-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=distort-worker-1 -o jsonpath='{.items[0].metadata.name}') && kubectl exec -n distort-system $POD -- /opt/spdk/scripts/rpc.py nvmf_get_subsystems")
+			cmd := exec.Command("sh", "-c", "POD=$(kubectl get pod -n distort-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=distort-master -o jsonpath='{.items[0].metadata.name}') && kubectl exec -n distort-system $POD -- /opt/spdk/scripts/rpc.py bdev_get_bdevs")
 			out, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(out).To(ContainSubstring("nqn.2026-02.io.distort:volume-e2e-test-partition"))
+			Expect(out).To(ContainSubstring(backendVolumeID))
+
+			By("Using SPDK RPC to verify NVMe-oF subsystem export")
+			cmd = exec.Command("sh", "-c", "POD=$(kubectl get pod -n distort-system -l app.kubernetes.io/component=agent --field-selector spec.nodeName=distort-master -o jsonpath='{.items[0].metadata.name}') && kubectl exec -n distort-system $POD -- /opt/spdk/scripts/rpc.py nvmf_get_subsystems")
+			out, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring(nqn))
 
 			By("Cleaning up the test partition")
 			cmd = exec.Command("kubectl", "delete", "nvmepartition", "e2e-test-partition")
 			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				_, getErr := kubectl("get", "nvmepartition", "e2e-test-partition")
+				g.Expect(getErr).To(HaveOccurred())
+			}).Should(Succeed())
+			_, err = kubectl("delete", "nvmedeviceclaim", "e2e-layer1-claim", "--wait=true", "--timeout=120s")
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
 	Context("Layer 2: Management Controllers", func() {
 		It("Claim Binding: Should bind an NVMeDeviceClaim to a device by serial number", func() {
-			// Get a valid serial number from the discovered devices
-			cmd := exec.Command("kubectl", "get", "nvmedevices", "-o", "jsonpath={.items[0].spec.serialNumber}")
-			out, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(out).NotTo(BeEmpty())
-			serialNum := out
+			serialNum := serialForNode("distort-master")
 
 			By("Creating an NVMeDeviceClaim for serial: " + serialNum)
 			claimYaml := fmt.Sprintf(`
@@ -115,8 +170,7 @@ metadata:
 spec:
   serialNumber: %s
 `, serialNum)
-			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", claimYaml))
-			_, err = utils.Run(cmd)
+			_, err := applyManifest(claimYaml)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the claim is set to Active")
@@ -202,22 +256,19 @@ spec:
 
 	Context("Layer 3: CSI & Full Stack", func() {
 		testConfigs := []struct {
-			backend string
-			manager string
+			backend      string
+			manager      string
+			targetNode   string
+			consumerNode string
 		}{
-			{backend: "spdk", manager: "partition"},
-			{backend: "kernel", manager: "partition"},
+			{backend: "spdk", manager: "partition", targetNode: "distort-worker-1", consumerNode: "distort-worker-2"},
+			{backend: "kernel", manager: "partition", targetNode: "distort-worker-2", consumerNode: "distort-worker-1"},
 		}
 
 		for _, cfg := range testConfigs {
 			cfg := cfg // pin variable
 			It(fmt.Sprintf("CSI Provisioning, Client Mounting & Persistence (backend=%s, manager=%s)", cfg.backend, cfg.manager), func() {
-				// Get a valid serial number from the discovered devices
-				cmd := exec.Command("kubectl", "get", "nvmedevices", "-o", "jsonpath={.items[0].spec.serialNumber}")
-				out, err := utils.Run(cmd)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(out).NotTo(BeEmpty())
-				serialNum := out
+				serialNum := serialForNode(cfg.targetNode)
 
 				By("Creating an NVMeDeviceClaim for serial: " + serialNum)
 				claimYaml := fmt.Sprintf(`
@@ -228,8 +279,7 @@ metadata:
 spec:
   serialNumber: %s
 `, serialNum)
-				cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", claimYaml))
-				_, err = utils.Run(cmd)
+				_, err := applyManifest(claimYaml)
 				Expect(err).NotTo(HaveOccurred())
 
 				By("Verifying the claim is set to Active")
@@ -252,7 +302,7 @@ parameters:
   target-backend: %q
   volume-manager: %q
 `, cfg.backend, cfg.manager)
-				cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", scYaml))
+				cmd := exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", scYaml))
 				_, err = utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred())
 
@@ -275,15 +325,17 @@ spec:
 				Expect(err).NotTo(HaveOccurred())
 
 				By("Creating a consumer Pod to trigger provisioning")
-				podYaml := `
+				podYaml := fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
 metadata:
   name: e2e-distort-pod
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: %s
   containers:
   - name: e2e-container
-    image: busybox
+    image: busybox:1.36
     command: ["sleep", "3600"]
     volumeMounts:
     - name: distort-vol
@@ -292,7 +344,7 @@ spec:
   - name: distort-vol
     persistentVolumeClaim:
       claimName: e2e-distort-pvc
-`
+`, cfg.consumerNode)
 				cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", podYaml))
 				_, err = utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred())
@@ -319,8 +371,9 @@ spec:
 				Expect(err).NotTo(HaveOccurred())
 
 				By("Recreating the consumer Pod")
-				cmd = exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--force", "--grace-period=0")
-				_, _ = utils.Run(cmd)
+				cmd = exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--wait=true", "--timeout=120s")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
 
 				cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", podYaml))
 				_, err = utils.Run(cmd)
@@ -335,12 +388,12 @@ spec:
 
 				By("Reading data from the persistent volume to verify persistence")
 				cmd = exec.Command("kubectl", "exec", "e2e-distort-pod", "--", "sh", "-c", "cat /data/test.txt")
-				out, err = utils.Run(cmd)
+				out, err := utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(out).To(ContainSubstring("distort-rocks"))
 
 				By("Cleaning up")
-				exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--force", "--grace-period=0").Run()
+				exec.Command("kubectl", "delete", "pod", "e2e-distort-pod", "--wait=true", "--timeout=120s").Run()
 				exec.Command("kubectl", "delete", "pvc", "e2e-distort-pvc").Run()
 				Eventually(func(g Gomega) {
 					cmd := exec.Command("kubectl", "get", "nvmepartition", "-o", "jsonpath={.items}")

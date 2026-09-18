@@ -34,4 +34,3 @@ resources:
 - nvmedevice_admin_role.yaml
 - nvmedevice_editor_role.yaml
 - nvmedevice_viewer_role.yaml
-

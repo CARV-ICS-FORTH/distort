@@ -52,9 +52,9 @@ Do not move files around. The CLI expects files in specific locations.
 ### Always Use CLI Commands
 Always use `kubebuilder create api` and `kubebuilder create webhook` to scaffold. Do NOT create files manually.
 
-### E2E Tests Require an Isolated Kind Cluster
-The e2e tests are designed to validate the solution in an isolated environment (similar to GitHub Actions CI).
-Ensure you run them against a dedicated [Kind](https://kind.sigs.k8s.io/) cluster (not your “real” dev/prod cluster).
+### E2E Tests Require the Isolated Vagrant/K3s Lab
+The hardware E2E tests are designed for the repository's guarded three-node Vagrant/K3s environment.
+Do not run them against a real development or production cluster. See `docs/content/local-testing.md`.
 
 ## After Making Changes
 

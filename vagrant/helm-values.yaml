@@ -1,0 +1,18 @@
+# Functional-lab sizing for the guarded Vagrant/K3s environment. These values
+# preserve the production chart defaults while fitting the documented two-vCPU,
+# 256 MiB hugepage nodes. The agent has no CPU limit, so SPDK can still use idle
+# lab CPU without CFS quota throttling.
+agent:
+  spdk:
+    iobufSmallPoolCount: "4096"
+    iobufLargePoolCount: "256"
+    maxSrqDepth: "128"
+    skipHugepageSetup: true
+  resources:
+    limits:
+      memory: 512Mi
+      hugepages-2Mi: 256Mi
+    requests:
+      cpu: "1"
+      memory: 256Mi
+      hugepages-2Mi: 256Mi

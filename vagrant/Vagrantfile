@@ -4,10 +4,15 @@
 VAGRANTFILE_API_VERSION = "2"
 
 # Cluster Configuration
-NUM_WORKERS = 1
+NUM_WORKERS = 2
 MASTER_IP = "192.168.56.10"
 WORKER_IP_BASE = "192.168.56.1"
 UBUNTU_BOX = "bento/ubuntu-24.04"
+K3S_VERSION = ENV.fetch("DISTORT_K3S_VERSION", "v1.35.4+k3s1")
+MASTER_MEMORY_MB = ENV.fetch("DISTORT_MASTER_MEMORY_MB", "3072")
+WORKER_MEMORY_MB = ENV.fetch("DISTORT_WORKER_MEMORY_MB", "1280")
+VM_CPUS = ENV.fetch("DISTORT_VM_CPUS", "2")
+HUGEPAGES_2MI = ENV.fetch("DISTORT_HUGEPAGES_2MI", "128")
 
 # NVMe disk definitions (2 disks per VM, 1GB each)
 NVME_DISKS = [
@@ -18,10 +23,19 @@ NVME_DISKS = [
 # Common setup script for both Master and Worker
 $common_script = <<-SCRIPT
   export DEBIAN_FRONTEND=noninteractive
-  
+
+  # Some Bento releases default to a regional Ubuntu mirror that is not
+  # reachable from every network. Use the globally mirrored kernel.org
+  # endpoint and bound retries so provisioning fails quickly and can resume.
+  sed -i \
+    -e 's|http://us.archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' \
+    /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+
   # Install necessary packages for NVMe management and RDMA
-  apt-get update
-  apt-get install -y nvme-cli parted curl rdma-core linux-modules-extra-$(uname -r)
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y nvme-cli parted curl rdma-core linux-modules-extra-$(uname -r)
 
   # SPDK Requirements: vfio-pci, uio_pci_generic and Hugepages
   modprobe vfio-pci
@@ -29,9 +43,10 @@ $common_script = <<-SCRIPT
   echo "vfio-pci" >> /etc/modules-load.d/spdk.conf
   echo "uio_pci_generic" >> /etc/modules-load.d/spdk.conf
   
-  # Allocate 1024 hugepages of 2MB (2GB total) for SPDK DMA
-  sysctl -w vm.nr_hugepages=1024
-  echo "vm.nr_hugepages=1024" > /etc/sysctl.d/99-spdk-hugepages.conf
+  # The local lab only needs enough DMA memory for functional SPDK tests.
+  # Keep this configurable because reserving 2 GiB per VM can OOM small hosts.
+  sysctl -w vm.nr_hugepages=#{HUGEPAGES_2MI}
+  echo "vm.nr_hugepages=#{HUGEPAGES_2MI}" > /etc/sysctl.d/99-spdk-hugepages.conf
 
   # Load SoftRoCE (RXE) kernel module
   modprobe rdma_rxe
@@ -57,6 +72,20 @@ EOF
   systemctl start rdma-link.service
 SCRIPT
 
+# Resource settings must also converge on persistent VMs. Normal provisioners
+# run only when a VM is first created, so keep this small idempotent profile as
+# an always-run provisioner instead of silently retaining an older reservation.
+$runtime_resource_script = <<-SCRIPT
+  set -eu
+  sysctl -w vm.nr_hugepages=#{HUGEPAGES_2MI}
+  echo "vm.nr_hugepages=#{HUGEPAGES_2MI}" > /etc/sysctl.d/99-spdk-hugepages.conf
+  actual_hugepages=$(sysctl -n vm.nr_hugepages)
+  if [ "$actual_hugepages" != "#{HUGEPAGES_2MI}" ]; then
+    echo "Expected #{HUGEPAGES_2MI} hugepages, but the guest retained $actual_hugepages" >&2
+    exit 1
+  fi
+SCRIPT
+
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.vm.box = UBUNTU_BOX
 
@@ -64,7 +93,9 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.trigger.before [:up, :reload] do |trigger|
     trigger.ruby do |env, machine|
       vm_id = machine.id
-      if vm_id
+      # A plain `vagrant up` also fires this trigger for an already-running VM.
+      # VirtualBox cannot mutate storage controllers while the VM is locked.
+      if vm_id && machine.state.id != :running
         # Check if the controller exists
         check = `VBoxManage showvminfo #{vm_id} --machinereadable`
         if check.include?('"NVMe Controller"')
@@ -81,8 +112,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     master.vm.network "private_network", ip: MASTER_IP
 
     master.vm.provider "virtualbox" do |vb|
-      vb.memory = "4096"
-      vb.cpus = 2
+      vb.memory = MASTER_MEMORY_MB
+      vb.cpus = VM_CPUS
 
       # Add an NVMe controller to the VM
       vb.customize ["storagectl", :id, "--name", "NVMe Controller", "--add", "pcie", "--controller", "NVMe"]
@@ -103,11 +134,16 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     end
 
     master.vm.provision "shell", inline: $common_script
+    master.vm.provision "shell", name: "runtime resource profile", run: "always", inline: $runtime_resource_script
     master.vm.provision "shell", inline: <<-SCRIPT
-      curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --node-ip #{MASTER_IP} --bind-address #{MASTER_IP} --tls-san #{MASTER_IP} --flannel-iface eth1 --disable traefik" sh -
+      # Remove any token left on the host from a previously destroyed lab.
+      mkdir -p /vagrant/cluster_info
+      rm -f /vagrant/cluster_info/node-token
+
+      curl --fail --show-error --location --retry 5 https://get.k3s.io --output /tmp/install-k3s.sh
+      INSTALL_K3S_VERSION="#{K3S_VERSION}" INSTALL_K3S_EXEC="server --node-ip #{MASTER_IP} --bind-address #{MASTER_IP} --tls-san #{MASTER_IP} --flannel-iface eth1 --disable traefik" sh /tmp/install-k3s.sh
       
       # Save the token to a shared folder so workers can join
-      mkdir -p /vagrant/cluster_info
       cp /var/lib/rancher/k3s/server/node-token /vagrant/cluster_info/node-token
       chmod 644 /vagrant/cluster_info/node-token
     SCRIPT
@@ -123,8 +159,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       worker.vm.network "private_network", ip: worker_ip
 
       worker.vm.provider "virtualbox" do |vb|
-        vb.memory = "4096"
-        vb.cpus = 2
+        vb.memory = WORKER_MEMORY_MB
+        vb.cpus = VM_CPUS
         
         # Add an NVMe controller to the worker VM
         vb.customize ["storagectl", :id, "--name", "NVMe Controller", "--add", "pcie", "--controller", "NVMe"]
@@ -145,12 +181,21 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       end
 
       worker.vm.provision "shell", inline: $common_script
+      worker.vm.provision "shell", name: "runtime resource profile", run: "always", inline: $runtime_resource_script
       worker.vm.provision "shell", inline: <<-SCRIPT
-        # Wait for master to write the token
-        while [ ! -f /vagrant/cluster_info/node-token ]; do sleep 2; done
+        # Wait up to six minutes for the master to publish a non-empty token.
+        for attempt in $(seq 1 180); do
+          [ -s /vagrant/cluster_info/node-token ] && break
+          sleep 2
+        done
+        if [ ! -s /vagrant/cluster_info/node-token ]; then
+          echo "Timed out waiting for the K3s join token" >&2
+          exit 1
+        fi
         
         TOKEN=$(cat /vagrant/cluster_info/node-token)
-        curl -sfL https://get.k3s.io | K3S_URL=https://#{MASTER_IP}:6443 K3S_TOKEN=$TOKEN INSTALL_K3S_EXEC="agent --node-ip #{worker_ip} --flannel-iface eth1" sh -
+        curl --fail --show-error --location --retry 5 https://get.k3s.io --output /tmp/install-k3s.sh
+        K3S_URL="https://#{MASTER_IP}:6443" K3S_TOKEN="$TOKEN" INSTALL_K3S_VERSION="#{K3S_VERSION}" INSTALL_K3S_EXEC="agent --node-ip #{worker_ip} --flannel-iface eth1" sh /tmp/install-k3s.sh
       SCRIPT
     end
   end
