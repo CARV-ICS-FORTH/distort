@@ -9,9 +9,26 @@ DISTORT is a Go/Kubebuilder project with hardware-facing agent code and a CSI da
 ## Prerequisites
 
 - Go 1.25.3 or newer, matching `go.mod`.
-- GNU Make, Git, Docker, Helm 3, and `kubectl`.
+- GNU Make and Git; Helm 3 and Hugo for chart and documentation checks.
+- Docker and `kubectl` for image builds and cluster work.
 - Kubebuilder/controller-generation tools installed through the Makefile when needed.
 - Vagrant 2.3+ and VirtualBox 7+ only when running the local hardware lab.
+
+## Issues and pull requests
+
+Use [GitHub Issues](https://github.com/CARV-ICS-FORTH/distort/issues) for
+questions, bug reports, and feature proposals. A useful bug report includes the
+DISTORT version or commit, Kubernetes version, backend, reproduction steps,
+expected and actual behavior, and relevant logs with credentials removed.
+Discuss substantial design changes in an issue first.
+
+Fork the repository, create a branch, and open a pull request describing the
+problem, change, and validation performed. Link related issues and identify
+checks you could not run. Documentation contributions can use the static checks
+below; hardware changes need the appropriate isolated-lab coverage. Follow the
+[Code of Conduct](https://github.com/CARV-ICS-FORTH/distort/blob/main/CODE_OF_CONDUCT.md).
+Report vulnerabilities privately through the
+[security policy](https://github.com/CARV-ICS-FORTH/distort/blob/main/SECURITY.md).
 
 ## Normal development workflow
 
@@ -19,8 +36,8 @@ From the repository root:
 
 ```bash
 make build
-make test
 make lint-fix
+make test
 ```
 
 Use `make run` only when you intentionally want the manager to use the current kubeconfig context. It does not reproduce node-local CSI, SPDK, or RDMA behavior.
@@ -30,16 +47,21 @@ After changing API types or Kubebuilder markers, regenerate the checked-in artif
 ```bash
 make manifests
 make generate
+make sync-chart-crds
 ```
 
 Do not edit generated CRDs, RBAC, or `zz_generated.*.go` files by hand. Preserve all Kubebuilder scaffold markers.
 
-For the complete host validation and the separate race suite:
+For the complete host validation, module consistency check, and race suite:
 
 ```bash
-make test-suite
-make test-race
+make test-ci
 ```
+
+For documentation and chart changes, run `make test-static`. It checks repository
+contracts, CRD copies, Helm rendering, and the Hugo build. Preview the site with
+`hugo server --source docs`; verify examples and links as well as the rendered
+pages. A successful site build does not validate every command in a guide.
 
 For storage-path work, reuse the persistent lab instead of installing components manually:
 
@@ -69,8 +91,12 @@ Do not advertise an unfinished plugin in the CRD or Helm defaults. The repositor
 - Keep generated files in sync with their source markers and API types.
 - Use structured Kubernetes-style log messages.
 - Add or promote the relevant regression test into the green suite.
-- Update [Using DISTORT](/using/) for operator-visible behavior and [Review Findings](/review-findings/) for resolved or newly discovered risks.
+- Update [Using DISTORT](/using/), the architecture guide, and the testing guide
+  when operator-visible behavior, limitations, or validation changes.
 - Keep destructive storage tests inside the guarded Vagrant lab.
 - Do not commit local artifacts such as `kubeconfig.yaml`, binaries, VM state, or generated report PDFs.
 
-Project governance is kept in the conventional root files: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and `MAINTAINERS.md`.
+Maintainer contacts are listed in
+[MAINTAINERS.md](https://github.com/CARV-ICS-FORTH/distort/blob/main/MAINTAINERS.md).
+The [governance policy](https://github.com/CARV-ICS-FORTH/distort/blob/main/GOVERNANCE.md)
+describes decision-making and maintainer membership.

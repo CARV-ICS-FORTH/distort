@@ -4,7 +4,31 @@ description: "Understand how to manage physical drives, allocate devices via NVM
 type: "page"
 ---
 
-Once DISTORT is deployed, it seamlessly integrates with standard Kubernetes storage workflows. This guide covers how administrators manage physical hardware and how developers request high-performance RDMA storage volumes.
+This guide walks through installation, an explicit physical-device claim, and a
+filesystem volume mounted by a Pod. DISTORT is an alpha-stage project moving
+toward beta; `0.5.0` is a development release, not recommended for production.
+
+## Prepare the cluster
+
+Use a Linux Kubernetes cluster with Helm 3 and `kubectl`, and permissions to
+install CRDs, cluster RBAC, and privileged workloads. Tested configurations are
+three-node K3s 1.35.4 and kubeadm Kubernetes 1.35.5 clusters. The kubeadm test
+covered both SPDK and kernel backends over InfiniBand/RDMA; see the
+[release test record](/testing/#kubeadm-release-test). This is not a wider
+compatibility guarantee.
+
+Storage providers need unused NVMe devices and an active RDMA interface reachable
+from every consumer node. The chart's default agent requests two CPUs, 1 GiB of
+memory, and 1 GiB of 2 MiB hugepages. Prepare host hugepages and the required
+kernel/VFIO and RDMA support before installing. Consumer nodes need the kernel
+NVMe/RDMA initiator and support for the selected filesystem. The chart grants
+host device, network, kernel-module, and kubelet access to its privileged
+components; install it only on nodes intended for these roles.
+
+Before installation, select the provider and consumer nodes using the
+[scheduling values below](#schedule-storage-providers-and-consumers). For a
+reproducible disposable environment, use the [local lab](/local-testing/), which
+builds the image and prepares virtual NVMe devices and SoftRoCE.
 
 ---
 
@@ -17,25 +41,38 @@ helm repo add distort https://distort-csi.dev/charts
 helm repo update
 ```
 
-Install the standard release, built from the `dev` branch:
+Install the standard `0.5.0` development release. If you saved the scheduling
+example below, add `--values distort-values.yaml` to the command:
 
 ```bash
 helm install distort distort/distort \
   --namespace distort-system \
-  --create-namespace
+  --create-namespace \
+  --version 0.5.0
 ```
 
-Install the BXI variant when the nodes require BXI support:
+Alternatively, install the separate BXI development chart on nodes using BullSequana eXascale
+Interconnect V3 (BXI V3):
 
 ```bash
 helm install distort distort/distort-bxi \
   --namespace distort-system \
-  --create-namespace
+  --create-namespace \
+  --version 0.5.0
 ```
 
-Omitting `--version` selects the newest stable version of that chart. Add, for
-example, `--version 0.5.0` to select a specific release. The two variants share
-semantic versions but use separate charts and image tags.
+Choose one chart for this release, not both. Both are development releases.
+They share semantic versions but use separate source branches, charts, and
+image tags. The workflow below describes the standard RDMA chart; consult the
+[BXI branch](https://github.com/CARV-ICS-FORTH/distort/tree/bxi) for variant-specific setup.
+
+Check the installed workloads and hardware discovery before creating claims:
+
+```bash
+kubectl -n distort-system get pods
+kubectl get nvmedevices
+kubectl get rdmastoragenodes
+```
 
 ---
 
@@ -45,6 +82,16 @@ Storage providers and workload consumers do not need to be the same nodes. Use
 the component scheduling values to keep the privileged agent on NVMe/RDMA nodes
 while installing the CSI node service wherever application Pods may consume a
 DISTORT volume:
+
+Label the selected nodes, replacing the placeholder names with actual node names:
+
+```bash
+kubectl label node <provider-node> distort.io/storage-provider=true
+kubectl label node <consumer-node> distort.io/storage-consumer=true
+```
+
+A node can have both roles. Save the following as `distort-values.yaml` and pass
+it to `helm install` with `--values distort-values.yaml`:
 
 ```yaml
 agent:
@@ -152,18 +199,33 @@ address.
 
 To make a discovered physical device available for partitioning and pod allocation, an administrator must **claim** it. 
 
-Claims are declared using the **`NVMeDeviceClaim`** resource, targeting the exact hardware **`serialNumber`** of the discovered device. This guarantees that if a drive is moved to a different PCIe slot or worker node, the system preserves the allocation mapping.
+Claims target the exact **`serialNumber`** reported by discovery, rather than a
+PCIe slot. This identifies a device independently of its location; it does not
+provide live volume migration when hardware moves.
 
-Create an `nvme-claim.yaml` file:
+Use an empty device dedicated to this example. Claiming authorizes DISTORT to
+rebind the device and allocate storage on it; do not claim a boot disk or a disk
+containing data you need. Claims are not per-namespace tenant isolation: see
+[the architecture's capability boundary](/architecture/#current-capability-boundary).
+
+Create a namespace for the example:
+
+```bash
+kubectl create namespace distort-example
+```
+
+Create `nvme-claim.yaml`, replacing `REPLACE_WITH_UNUSED_DEVICE_SERIAL` with the
+serial of your selected device from `kubectl get nvmedevices -o yaml`:
 
 ```yaml
 apiVersion: storage.distort.io/v1alpha1
 kind: NVMeDeviceClaim
 metadata:
-  name: claim-samsung-evo-1
+  name: example-device
+  namespace: distort-example
 spec:
   # The serial number uniquely identifying the physical disk
-  serialNumber: "SN-distort-worker-1"
+  serialNumber: "REPLACE_WITH_UNUSED_DEVICE_SERIAL"
 ```
 
 Apply the claim:
@@ -172,10 +234,13 @@ Apply the claim:
 kubectl apply -f nvme-claim.yaml
 ```
 
-The `distort-manager` matches the claim with the physical `NVMeDevice`. Once bound, the claim's status transitions to `Active: true`. You can verify this by running:
+The manager matches the claim to the device and sets `status.active` to `true`.
+Wait for binding before requesting a volume:
 
 ```bash
-kubectl get nvmedeviceclaims
+kubectl -n distort-example wait nvmedeviceclaim/example-device \
+  --for=jsonpath='{.status.active}'=true --timeout=120s
+kubectl -n distort-example get nvmedeviceclaims
 ```
 
 ---
@@ -184,10 +249,10 @@ kubectl get nvmedeviceclaims
 
 Once hardware claims are active, developers can request volume allocations using standard Kubernetes StorageClasses and PVCs.
 
-DISTORT rounds each requested volume upward to a 1 MiB allocation unit shared by
+DISTORT rounds each requested volume upward to a 4 MiB allocation unit shared by
 the kernel and SPDK backends. Device capacity already excludes a conservative
-metadata reserve, so capacity accepted before a backend transition remains
-allocatable afterward. A CSI request with `limitBytes` is rejected if this
+metadata reserve for backend bookkeeping. This accounting does not provide
+data migration between backends. A CSI request with `limitBytes` is rejected if this
 rounding would exceed its limit.
 
 ### 1. Define a StorageClass
@@ -206,21 +271,30 @@ DISTORT supports multiple backends and volume carving configurations. These are 
 
 Use only one filesystem parameter in a StorageClass. DISTORT accepts both spellings for compatibility; if both are set, their values must agree. Filesystem values are case-insensitive.
 
+The user-facing `partition` manager selects SPDK logical volumes for the `spdk`
+backend and on-disk partitions managed by `parted` for the `kernel` backend.
+
 > [!WARNING]
 > **Data Destruction on Backend Swap:**
 > Physical NVMe devices are locked to the target backend driver (SPDK's user-space vfio-pci vs Kernel's nvme driver) of their first provisioned volume.
-> If you allocate volumes from different StorageClasses with conflicting backends on the same node, they must target separate disks. Reconfiguring a disk to shift between SPDK and kernel backends requires wiping all partition tables and is highly destructive.
+> If you allocate volumes from StorageClasses with different backends on the same node, they must use separate disks. Do not switch the backend of a disk with allocated volumes; backend migration is not implemented, and reinitializing storage can destroy existing data.
 > Because of this, DISTORT does not register a default StorageClass upon installation.
 
 #### Example StorageClass Configurations
 
-**Option A: SPDK User-Space Target with Logical Volumes (Sane Default)**
+Save **one** of the following as `storageclass.yaml`. The PVC example uses
+Option A; if you choose another option, change its `storageClassName` to match.
+These examples use `reclaimPolicy: Delete`: deleting the PVC after its Pod is
+removed also deletes the provisioned volume and its data.
+
+**Option A: SPDK User-Space Target with Logical Volumes**
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: distort-spdk-partition
 provisioner: storage.distort.io
+reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 parameters:
   target-backend: "spdk"
@@ -235,6 +309,7 @@ kind: StorageClass
 metadata:
   name: distort-kernel-partition
 provisioner: storage.distort.io
+reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 parameters:
   target-backend: "kernel"
@@ -248,6 +323,7 @@ kind: StorageClass
 metadata:
   name: distort-spdk-xfs
 provisioner: storage.distort.io
+reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 parameters:
   target-backend: "spdk"
@@ -261,7 +337,13 @@ Custom formatting options and StorageClass `mountOptions` are not currently supp
 
 DISTORT implements controller-side single-writer fencing through `ControllerPublishVolume` and `ControllerUnpublishVolume`. A durable `NVMeVolumeAttachment` authorizes one node and host NQN at a time, while the target backend defaults to closed host access. A competing node is rejected until the current owner unpublishes.
 
-Forced takeover is deliberately an administrator operation. First fence or confirm the old node is unreachable, then annotate the current attachment with `storage.distort.io/force-detach-node=<current-node>`. DISTORT revokes and disconnects the old host before granting the replacement. Never apply this annotation while the old node can still access the volume. Final two-node hardware re-verification of this path remains tracked under F25 in the [review findings](/review-findings/).
+Forced takeover is an administrator operation. First fence the old consumer so
+it can no longer access storage; inability to reach its Kubernetes API or node
+address is not proof of fencing. Only then annotate the current attachment with
+`storage.distort.io/force-detach-node=<current-node>`. The implementation revokes
+the old host's access before authorizing the replacement. Final two-node hardware
+verification of the corrected takeover path remains pending; do not treat it as
+verified automatic failover.
 
 Apply the chosen StorageClass:
 
@@ -296,17 +378,18 @@ process instead of silently applying first-request-wins behavior.
 
 ### 2. Request a Volume via PVC
 
-Developers can now create a `PersistentVolumeClaim` (PVC) referencing the DISTORT StorageClass:
+Save this as `pvc.yaml`, referencing the StorageClass created above:
 
 ```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: rdma-pvc
+  namespace: distort-example
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: distort-rdma
+  storageClassName: distort-spdk-partition
   resources:
     requests:
       storage: 500Mi
@@ -318,9 +401,99 @@ Apply the PVC:
 kubectl apply -f pvc.yaml
 ```
 
-### 3. Under the Hood Lifecycle
-1. The **CSI-Provisioner** intercepts the PVC request.
-2. Rather than creating a block loop file on a local filesystem, it creates a new **`NVMePartition`** CRD requesting `500Mi` of capacity.
-3. The centralized **`distort-manager`** reconciles the partition, finding an active `NVMeDeviceClaim` on a healthy node with sufficient free space.
-4. The local **`distort-agent`** DaemonSet on that node watches the partition, dynamically carves out an SPDK user-space Logical Volume (Lvol) in memory, and exposes it over the network as an NVMe-oF target.
-5. The **CSI-Node-Server** on the compute node executing the application Pod connects to the remote target over the SoftRoCE/RDMA network, formats a blank block device with the StorageClass filesystem (`ext4` by default or `xfs`), and bind-mounts it directly into the container!
+The PVC can remain `Pending` until a consumer Pod is scheduled because the
+StorageClass uses `WaitForFirstConsumer`.
+
+### 3. Mount and check the volume
+
+Save this as `pod.yaml`. The node selector matches the consumer label used
+earlier; ensure that node runs the CSI node service and can reach the RDMA target.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-consumer
+  namespace: distort-example
+spec:
+  nodeSelector:
+    distort.io/storage-consumer: "true"
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: rdma-pvc
+```
+
+```bash
+kubectl apply -f pod.yaml
+kubectl -n distort-example wait pod/rdma-consumer --for=condition=Ready --timeout=300s
+kubectl -n distort-example get pvc rdma-pvc
+kubectl -n distort-example exec rdma-consumer -- sh -c 'echo hello-distort > /data/check.txt && cat /data/check.txt'
+```
+
+The PVC should be `Bound` and the read should return `hello-distort`. This is a
+basic functional check, not a performance or failover test.
+
+### 4. Clean up the example
+
+The example's `Delete` reclaim policy removes the volume and its data. Delete
+the Pod first so kubelet can unmount it, then delete its PVC:
+
+```bash
+kubectl -n distort-example delete pod rdma-consumer
+kubectl -n distort-example delete pvc rdma-pvc
+kubectl -n distort-example get nvmepartitions,nvmevolumeattachments
+```
+
+Wait for the example's partition and attachment to disappear before releasing
+the device claim. If cleanup stalls, inspect events and logs; do not remove
+finalizers to bypass storage cleanup. Do not release a claim still used by
+other volumes. For this dedicated example, finish with:
+
+```bash
+kubectl -n distort-example delete nvmedeviceclaim example-device
+kubectl delete storageclass distort-spdk-partition
+kubectl delete namespace distort-example
+```
+
+Use the corresponding StorageClass name if you chose Option B or C. Removing
+the Helm release does not substitute for volume cleanup.
+
+## Troubleshooting
+
+```bash
+kubectl -n distort-system get pods -o wide
+kubectl -n distort-example describe pvc rdma-pvc
+kubectl -n distort-example describe pod rdma-consumer
+kubectl -n distort-example get events --sort-by=.metadata.creationTimestamp
+kubectl get nvmedevices,rdmastoragenodes
+kubectl get nvmedeviceclaims,nvmepartitions,nvmevolumeattachments -A
+kubectl -n distort-system logs -l app.kubernetes.io/name=distort --all-containers=true --prefix=true --tail=100
+```
+
+- **Agent Pending:** check node labels, taints, CPU/memory requests, and available hugepages.
+- **Claim inactive:** check that its serial matches an unused discovered device and that another claim does not own it.
+- **PVC Pending:** create its consumer Pod, then check claimed capacity, backend compatibility, RDMA `Ready` status, and recent heartbeats.
+- **Pod waiting to mount:** inspect attachment ownership, CSI logs, consumer kernel support, and reachability of the published RDMA endpoint.
+- **Resources stuck deleting:** inspect agent and CSI logs and restore the affected node/backend so finalizer cleanup can complete.
+
+For help, open a [GitHub issue](https://github.com/CARV-ICS-FORTH/distort/issues)
+with versions, backend, reproduction steps, and sanitized diagnostics. Use the
+[security policy](https://github.com/CARV-ICS-FORTH/distort/blob/main/SECURITY.md)
+for vulnerabilities.
+
+## Under the hood
+
+1. The external-provisioner calls DISTORT's CSI `CreateVolume` after consumer scheduling allows provisioning.
+2. CSI creates an `NVMePartition` resource requesting the volume capacity.
+3. The manager selects a claimed device on a ready storage node with sufficient capacity.
+4. The agent allocates persistent storage and publishes an NVMe-oF endpoint.
+5. The external-attacher calls `ControllerPublishVolume`; DISTORT records consumer ownership and authorizes its host NQN.
+6. CSI on the consumer connects the kernel initiator, formats a blank volume with ext4 or XFS, and stages and publishes the filesystem for the Pod.

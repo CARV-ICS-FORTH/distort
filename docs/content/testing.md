@@ -7,7 +7,10 @@ type: "page"
 DISTORT uses two deliberately separate test tracks:
 
 - The **green suite** must pass on every change and contains all behavior that is currently expected to work.
-- The **known-failure suite** contains executable acceptance tests for confirmed items in the [review findings](/review-findings/). These tests are quarantined until their corresponding fixes are implemented, so known defects remain reproducible without making every normal test run fail.
+- The **known-failure suite** contains executable acceptance tests for confirmed
+  defects. These tests are quarantined until their corresponding fixes are
+  implemented, so known defects remain reproducible without making every normal
+  test run fail.
 
 Do not weaken a regression assertion to match broken behavior. When a fix is complete, remove its `knownfailure.Require`, `requireFinding`, or `requireKnownE2E` guard so the test becomes part of the permanent green suite.
 
@@ -31,25 +34,29 @@ Run concurrency instrumentation separately because it is slower:
 make test-race
 ```
 
-The default GitHub test workflow runs `make test`, `make test-race`, checks that
-`go mod tidy` produces no module-file drift, and compiles the tagged E2E suite.
+The default GitHub test workflow runs `make test-ci`: module consistency, the
+host test suite (including static checks, lint, and E2E compilation), and the
+race suite.
 Hardware E2E remains a guarded local Vagrant gate because hosted CI runners do
 not expose the required nested VirtualBox NVMe/RDMA topology.
 
 The controller tests use `envtest`, which launches a real Kubernetes API server and etcd. CSI, agent, and plugin tests use in-memory Kubernetes clients, fake command executables, temporary sysfs layouts, and pure parsers. They never require root privileges or access to host storage devices.
 
-## Reproducing a known finding
+## Reproducing a guarded regression
 
-Run all host-side known-failure tests:
+The regression target enables guards for host-side known-failure tests:
 
 ```bash
 make test-regression
 ```
 
-This command is expected to fail until the backlog is complete. During a fix, select only its finding ID:
+It also runs the ordinary host tests. As guards are removed after fixes, it need
+not fail. `FINDING` enables matching guards; it does not filter the whole Go test
+suite. The remaining guarded hardware acceptance scenario is F25 (two-node
+attachment takeover), which can be run in the isolated lab with:
 
 ```bash
-make test-regression FINDING=F7
+make test-e2e-regression FINDING=F25
 ```
 
 A correct workflow for a bug fix is:
@@ -100,43 +107,68 @@ make test-e2e E2E_ARGS="-ginkgo.label-filter='F18 || F20'"
 
 The E2E suite refuses to run unless the active kubeconfig server is `https://192.168.56.10:6443` and all three expected Vagrant node names are present. A failed spec automatically captures nodes, workloads, DISTORT resources, events, and recent component logs.
 
-## Review finding coverage
+## Regression coverage
+
+The IDs below are labels used by the test suite. Coverage describes the intended
+assertions, not proof that every failure mode is resolved or that the current
+checkout has passed a hardware run.
 
 | Finding | Automated coverage | Layer |
 |---|---|---|
-| F1 (resolved) | Available devices and mismatched claim UIDs cannot reach plugins; valid live ownership provisions; ownerless client placement is rejected | Agent unit + envtest + E2E admission/full stack |
-| F2 (resolved) | Shell metacharacters in `spdk-core-mask` cannot execute; validation and the direct command vector are captured | Plugin, CSI, admission + Vagrant SPDK E2E |
-| F3 (resolved) | Multiple kernel volumes receive distinct reusable partition numbers; deletion preserves surviving mappings | Plugin unit + Vagrant kernel E2E |
-| F4 (resolved) | Same names in different namespaces receive distinct CSI IDs/NQNs/lvols; exact deletion is verified in both orders | CSI/agent unit + Vagrant SPDK E2E |
-| F5 (resolved) | Exact SPDK base-bdev/lvstore/lvol identities are persisted and verified absent across partial cleanup and retry | Plugin/agent unit + Vagrant SPDK E2E |
-| F6 (resolved) | Concurrent reservations, stale status/cache reads, update conflicts, and terminating-volume capacity retention | Envtest concurrency and conflict injection |
-| F7 (resolved) | Capacity-range validation, negative legacy objects, upward rounding for kernel/SPDK, and persisted actual allocation | CSI, plugin, envtest, CRD contract + E2E admission/SPDK |
-| F8 (resolved) | Command/udev failures, cancellation, insufficient space, and incorrect partition boundaries fail creation | Plugin unit |
-| F9 (resolved) | CreateVolume retries compare a persisted fingerprint of capacity bounds, manager, filesystem, capability, and options | CSI unit + generated CRD schema |
-| F10 (resolved) | Unsupported capabilities and mount flags are rejected; read-only publish uses bind-remount semantics | CSI controller/node unit |
-| F11 (resolved) | Validation precedes connection and failed staging disconnects the target | CSI node failure-injection unit |
-| F12 (resolved) | Existing stage/publish mounts must match the expected source | CSI node unit |
-| F13 (resolved) | Missing hardware requeues and active claims follow device movement | Envtest |
-| F14 (resolved) | Deleting an old claim cannot release a replacement claim's device | Envtest |
-| F15 (resolved) | Exact allow/exclude semantics, mounted devices, failed mount inspection, and the explicit unsafe override | Agent fake-sysfs unit |
-| F16 (resolved) | Live RDMA interface/IP/transport discovery, fresh readiness, no loopback fallback, and active export count | Agent/controller unit + Vagrant smoke |
-| F17 (resolved) | Bounded RPC and exact export health checks; SPDK process crash restores the exported target | Plugin/agent unit + Vagrant recovery E2E |
-| F18 (resolved) | Separate chart identities plus required/forbidden permission matrix | Repository contract + E2E RBAC |
-| F19 (resolved) | Permanent plugin errors become terminal rather than hot-looping | Agent unit |
-| F20 (resolved) | Unimplemented LVM is rejected by CSI, CRD, and admission | CSI + repository contract + E2E admission |
-| F21 (resolved) | Every sample is concrete, schema-valid, and server-side dry-run tested; agent-owned examples are not applied by default | Envtest + repository contract |
-| F22 (resolved) | Behavior-focused controller, CSI, agent, plugin, contract, and E2E suites | Entire suite |
-| F23 (resolved) | Structured logging and bounded reconciler helpers remain lint-clean | `make lint`, required by `make test-suite` |
-| F24 (resolved) | Documentation version matches the `go.mod` directive | Repository contract |
+| F1 | Available devices and mismatched claim UIDs cannot reach plugins; valid live ownership provisions; ownerless client placement is rejected | Agent unit + envtest + E2E admission/full stack |
+| F2 | Shell metacharacters in `spdk-core-mask` cannot execute; validation and the direct command vector are captured | Plugin, CSI, admission + Vagrant SPDK E2E |
+| F3 | Multiple kernel volumes receive distinct reusable partition numbers; deletion preserves surviving mappings | Plugin unit + Vagrant kernel E2E |
+| F4 | Same names in different namespaces receive distinct CSI IDs/NQNs/lvols; exact deletion is verified in both orders | CSI/agent unit + Vagrant SPDK E2E |
+| F5 | Exact SPDK base-bdev/lvstore/lvol identities are persisted and verified absent across partial cleanup and retry | Plugin/agent unit + Vagrant SPDK E2E |
+| F6 | Concurrent reservations, stale status/cache reads, update conflicts, and terminating-volume capacity retention | Envtest concurrency and conflict injection |
+| F7 | Capacity-range validation, negative legacy objects, upward rounding for kernel/SPDK, and persisted actual allocation | CSI, plugin, envtest, CRD contract + E2E admission/SPDK |
+| F8 | Command/udev failures, cancellation, insufficient space, and incorrect partition boundaries fail creation | Plugin unit |
+| F9 | CreateVolume retries compare a persisted fingerprint of capacity bounds, manager, filesystem, capability, and options | CSI unit + generated CRD schema |
+| F10 | Unsupported capabilities and mount flags are rejected; read-only publish uses bind-remount semantics | CSI controller/node unit |
+| F11 | Validation precedes connection and failed staging disconnects the target | CSI node failure-injection unit |
+| F12 | Existing stage/publish mounts must match the expected source | CSI node unit |
+| F13 | Missing hardware requeues and active claims follow device movement | Envtest |
+| F14 | Deleting an old claim cannot release a replacement claim's device | Envtest |
+| F15 | Exact allow/exclude semantics, mounted devices, failed mount inspection, and the explicit unsafe override | Agent fake-sysfs unit |
+| F16 | Live RDMA interface/IP/transport discovery, fresh readiness, no loopback fallback, and active export count | Agent/controller unit + Vagrant smoke |
+| F17 | Bounded RPC and exact export health checks; SPDK process crash restores the exported target | Plugin/agent unit + Vagrant recovery E2E |
+| F18 | Separate chart identities plus required/forbidden permission matrix | Repository contract + E2E RBAC |
+| F19 | Permanent plugin errors become terminal rather than hot-looping | Agent unit |
+| F20 | Unimplemented LVM is rejected by CSI, CRD, and admission | CSI + repository contract + E2E admission |
+| F21 | Every sample is concrete, schema-valid, and server-side dry-run tested; agent-owned examples are not applied by default | Envtest + repository contract |
+| F22 | Behavior-focused controller, CSI, agent, plugin, contract, and E2E suites | Entire suite |
+| F23 | Structured logging and bounded reconciler helpers remain lint-clean | `make lint`, required by `make test-suite` |
+| F24 | Documentation version matches the `go.mod` directive | Repository contract |
 | F25 (fix implemented; hardware rerun pending) | A single-writer volume cannot be concurrently attached read-write on two nodes; publish/unpublish and stale-owner recovery are idempotent | CSI controller + two-node E2E |
 
-## Last verified lab run
+## Kubeadm release test
+
+Maintainers report testing the `0.5.0` development release (tag `v0.5`, commit
+[`c0e007aa4b51`](https://github.com/CARV-ICS-FORTH/distort/commit/c0e007aa4b51c480758d427ce5e0ebe8e5895805))
+in the following configuration:
+
+| Component | Tested configuration |
+|---|---|
+| Cluster | Three nodes, set up with kubeadm |
+| Kubernetes | 1.35.5 |
+| Target backends | SPDK and Linux kernel |
+| Storage network | RDMA over InfiniBand |
+
+Host OS/kernel versions, individual test results, and logs are not recorded.
+This report does not replace the pending two-node takeover validation described
+above.
+
+## Historical validation records
+
+These records predate this documentation review. They are retained as historical
+test reports, not current release certification. New results should include the
+commit, configuration, commands, and a link to logs so they can be reproduced.
 
 On 2026-08-19, a clean reset followed by the complete hardware suite produced 11 passing green specs, zero failures, and three explicitly quarantined skips. SPDK and kernel targets both passed cross-node provisioning, mounting, graceful same-node Pod recreation, persistence, and cleanup. The suite also covered concurrency-safe capacity scheduling, same-device kernel partition-number reuse, exact SPDK lvol teardown after the subsystem had already been removed, API capacity rejection, and upward-rounded allocation reporting.
 
 On 2026-08-25, the consolidated host `make test-suite` gate passed 143 behavior tests, repository contracts, Helm lint/render, Hugo, E2E compilation, and lint with zero issues. Package coverage was 59.8% for the agent, 58.7% for agent plugins, 71.4% for controllers, and 67.6% for CSI. The focused F25 lab run proved initial SPDK attachment and competing-node rejection; its corrected takeover rerun remains pending because worker-1's virtual root disk developed ext4 corruption and raw read errors, making container-image extraction fail digest validation.
 
-## Additional coverage beyond the review
+## Additional coverage
 
 The green suite also verifies:
 

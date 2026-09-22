@@ -6,50 +6,43 @@ type: "home"
 
 ## Welcome to DISTORT
 
-**DISTORT (DISaggregated STorage Over Rdma Transport)** is a high-performance, Kubernetes-native storage engine that bridges the gap between physical disaggregated storage fabrics and dynamic container environments.
+**DISTORT (DISaggregated STorage Over RDMA Transport)** manages physical NVMe
+storage for Kubernetes workloads over NVMe-over-Fabrics/RDMA. Administrators
+explicitly claim unused devices; applications request filesystem volumes using
+StorageClasses and PersistentVolumeClaims.
 
-As cloud-native architectures become the standard for deploying scalable applications, the demand for high-performance, low-latency storage has surged. Disaggregated storage, particularly NVMe-over-Fabrics (NVMe-oF) using Remote Direct Memory Access (RDMA), offers a promising solution by decoupling storage capacity from compute nodes, maintaining near-local access speeds. 
-
-However, integrating physical RDMA targets with the dynamic, containerized environments of Kubernetes presents significant orchestration challenges. 
-
-DISTORT is a Kubernetes-native storage engine designed to bridge this gap. It leverages a Custom Resource Definition (CRD)-driven state machine to manage the lifecycle of physical NVMe devices, partition them asynchronously, and expose them as NVMe-oF RDMA targets directly to Kubernetes Pods via a Container Storage Interface (CSI) driver. By offloading the control plane to Kubernetes while maintaining a lightweight data path, DISTORT achieves high-performance, dynamic storage provisioning suitable for data-intensive cloud applications.
+Kubernetes custom resources coordinate discovery, allocation, exports, and
+consumer ownership. Node agents configure SPDK or Linux kernel targets, while
+the CSI driver connects and mounts volumes on consumer nodes. After setup,
+application I/O travels directly over RDMA without passing through the manager.
 
 ---
 
-### Core Pillars
+### Project Status
+
+DISTORT is an alpha-stage project moving toward beta. Version `0.5.0` is a
+development release and is not recommended for production use. The project has
+been tested with K3s 1.35.4 in its three-node Vagrant lab and with Kubernetes
+1.35.5 in a three-node kubeadm cluster.
+
+These are tested configurations, not a compatibility certification. The current
+driver supports ext4/XFS mounted single-node-writer volumes. Raw block, multi-node
+access, snapshots, cloning, expansion, replication, multipath failover, and an
+NVMe/TCP fallback are not implemented. See the
+[roadmap](https://github.com/CARV-ICS-FORTH/distort/blob/main/ROADMAP.md) for proposed work.
+
+---
+
+### Control and data paths
 
 ```mermaid
-graph TD
-    classDef k8s fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef engine fill:#1f2937,stroke:#3b82f6,stroke-width:2px,color:#fff;
-    classDef hardware fill:#059669,stroke:#fff,stroke-width:2px,color:#fff;
-
-    subgraph Orchestration [Kubernetes Control Plane]
-        PVC["Persistent Volume Claim"]
-        CRD["Declarative CRDs<br/>(NVMePartition, NVMeDevice)"]
-        MGMT["Management Controller"]
-        PVC -.-> CRD
-        MGMT --> CRD
-    end
-    
-    subgraph DataPath [DISTORT High Performance Data Path]
-        SPDK["SPDK User-space Polling<br/>(VFIO-PCI / Lvol)"]
-        RDMA["SoftRoCE / Physical RDMA"]
-        CSI["DISTORT CSI Driver<br/>(Staging & Mounting)"]
-    end
-
-    subgraph Media [Physical Hardware Layer]
-        NVMe["Physical NVMe Disks"]
-    end
-
-    CRD --> CSI
-    CSI --> SPDK
-    SPDK --> RDMA
-    RDMA --> NVMe
-
-    class PVC,CRD,MGMT k8s;
-    class SPDK,RDMA,CSI engine;
-    class NVMe hardware;
+flowchart LR
+    Kubernetes["Kubernetes PVC and Pod"] --> CSI["CSI lifecycle operations"]
+    CSI --> Resources["DISTORT resources"]
+    Resources --> Controllers["Manager and node agents"]
+    Controllers -.->|Configure| Target["SPDK or kernel target"]
+    App["Application / consumer NVMe initiator"] <-->|NVMe-oF / RDMA| Target
+    Target <--> Disk["Physical NVMe"]
 ```
 
 ---
@@ -58,10 +51,19 @@ graph TD
 
 Explore the different sections of the documentation to understand and consume DISTORT:
 
-- **[Architecture](/architecture/)**: Read our high-level design, component roles, interactive control sequence, and implementation layout.
+- **[Architecture](/architecture/)**: Read the design, component roles, control and data paths, and implementation layout.
 - **[Project Internals](/internals/)**: Follow the controller, agent, CSI, and storage data paths in detail, including recovery boundaries.
 - **[Using DISTORT](/using/)**: Learn how to discover underlying storage controllers, claim hardware drives using `NVMeDeviceClaim` specs, and request StorageClasses.
 - **[Local Testing Lab](/local-testing/)**: Keep a three-node Vagrant/K3s cluster running for fast redeploys, manual storage checks, and automated E2E tests.
-- **[Testing Strategy](/testing/)**: Run the green suite and the finding-keyed regression tests used to drive each review fix.
-- **[Review Findings](/review-findings/)**: Track confirmed defects, resolved regressions, acceptance criteria, and production-readiness gates.
+- **[Testing Strategy](/testing/)**: Run the host-side, regression, and hardware test suites.
 - **[Contributing](/contributing/)**: Build, generate, validate, and submit changes using the repository's supported workflows.
+
+### Community
+
+Ask questions and propose changes through
+[GitHub Issues](https://github.com/CARV-ICS-FORTH/distort/issues), or contact the
+[maintainers](https://github.com/CARV-ICS-FORTH/distort/blob/main/MAINTAINERS.md).
+Follow the [Code of Conduct](https://github.com/CARV-ICS-FORTH/distort/blob/main/CODE_OF_CONDUCT.md)
+and use the [private security reporting process](https://github.com/CARV-ICS-FORTH/distort/blob/main/SECURITY.md)
+for vulnerabilities. The [governance policy](https://github.com/CARV-ICS-FORTH/distort/blob/main/GOVERNANCE.md)
+describes how maintainers make decisions.

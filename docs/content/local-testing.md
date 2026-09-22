@@ -22,7 +22,7 @@ There is no need to uninstall the Helm release or rebuild the VMs for each chang
 
 The two namespaces per controller deliberately exercise multi-namespace
 discovery. DISTORT currently manages only namespace ID 1 under both kernel and
-SPDK backends. After its one-percent backend-metadata reserve and 1 MiB
+SPDK backends. After its one-percent backend-metadata reserve and 4 MiB
 allocation alignment, each lab `NVMeDevice` advertises 1012 MiB. Namespace ID 2
 remains untouched and is not available to placement.
 
@@ -31,11 +31,11 @@ The default low-resource profile gives the master 3 GiB RAM, each worker
 first-time target builds the image while the VMs are stopped and caps SPDK and
 Go build parallelism to avoid competing with the IDE. The lab deployment also
 uses smaller SPDK iobuf pools and a bounded RDMA shared receive queue that fit
-its 256 MiB hugepage reservation; production Helm defaults are unchanged. The
+its 256 MiB hugepage reservation; the standard Helm defaults are unchanged. The
 lab values in `vagrant/helm-values.yaml` request one CPU for the agent, leaving
 headroom for CSI and system Pods on each two-vCPU VM. The agent has no CPU limit,
 so SPDK can still use otherwise-idle lab CPU without CFS quota throttling. The
-same controls are available to production installations that prefer predictable
+same controls are available to other installations that prefer predictable
 DMA-memory use over maximum queue capacity. Because Vagrant provisions the host
 hugepages, the lab also tells SPDK setup not to replace that reservation with
 its own default. Plan for at least 12 GiB of host memory,
@@ -83,7 +83,9 @@ make test-env-prereqs
 
 ### macOS support
 
-The same workflow should work on an Intel Mac supported by the installed VirtualBox and Bento Ubuntu box versions. Approve the VirtualBox system software when macOS asks, then reboot if required.
+The documented lab has been exercised on Linux. Intel macOS compatibility has
+not been verified here; check VirtualBox and guest-image compatibility before
+attempting to adapt the workflow.
 
 Apple Silicon is not currently a supported lab host. This Vagrantfile depends on VirtualBox PCIe NVMe emulation and an amd64 Ubuntu guest/image path; changing only the Vagrant box is not enough to prove SPDK/VFIO behavior. On Apple Silicon, use an amd64 Linux development machine or a remote Linux host for this hardware-oriented suite. Unit and envtest tests can still run locally when the Go dependencies support the host.
 
@@ -230,7 +232,10 @@ kubectl get nvmedevices \
   -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,SERIAL:.spec.serialNumber,STATE:.status.state,CAPACITY:.spec.totalCapacity
 ```
 
-Copy the serial number of one `Available` device into the following manifest:
+Use an `Available` device on `distort-worker-1` and copy its serial into the
+following manifest. The example pins the consumer to `distort-worker-2` to
+exercise a remote connection and a graceful restart on the same consumer node.
+Run it with no other active device claims so placement uses the selected device.
 
 ```bash
 DEVICE_SERIAL='SN-distort-worker-1'
@@ -258,11 +263,12 @@ kind: StorageClass
 metadata:
   name: distort-manual-kernel
 provisioner: storage.distort.io
+reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 parameters:
   target-backend: kernel
   volume-manager: partition
-  filesystem: ext4
+  fsType: ext4
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -283,6 +289,8 @@ metadata:
   name: manual-consumer
   namespace: distort-test
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: distort-worker-2
   containers:
     - name: shell
       image: busybox:1.36
@@ -325,6 +333,8 @@ metadata:
   name: manual-consumer
   namespace: distort-test
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: distort-worker-2
   containers:
     - name: shell
       image: busybox:1.36
@@ -420,9 +430,9 @@ make test-env-destroy
 
 The destroy target permanently removes the three lab VMs and their virtual NVMe contents. The next `make test-env-up` performs full provisioning again.
 
-## Test strategy for the review backlog
+## Regression test strategy
 
-Use three levels while implementing items from the [review findings](/review-findings/):
+Use three levels while implementing confirmed regressions:
 
 - Unit/envtest: validation, reconciliation, idempotency, conflicts, malformed objects, and injected command failures. Run with `make test`.
 - Focused Vagrant E2E: one backend or recovery sequence using `E2E_ARGS` while preserving the cluster.
@@ -430,6 +440,10 @@ Use three levels while implementing items from the [review findings](/review-fin
 
 Keep destructive media, VFIO, SPDK, and NVMe-oF assertions in the isolated Vagrant suite. Envtest provides a real API server and etcd but does not provide kubelets, CSI mounting, host devices, RDMA, or SPDK.
 
-## Last verified state
+## Historical lab result
+
+This records an earlier run, not validation of the current checkout. See the
+[testing guide](/testing/#historical-validation-records) for later records and
+the commands to capture current results.
 
 On 2026-08-17, the measured profile was 3072 MiB RAM for the master, 1280 MiB for each worker, two CPUs per VM, and 128 × 2 MiB hugepages per node. Helm revision 6 was healthy on three Ready nodes. A clean reset and full run passed eight green specs, failed none, and skipped four quarantined findings. The lab used iobuf pools `4096`/`256`, RDMA SRQ depth `128`, and host-managed hugepages; these are constrained functional-lab settings, not production sizing recommendations.

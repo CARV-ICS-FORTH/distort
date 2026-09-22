@@ -78,8 +78,8 @@ The manager and agent use `controller-runtime`, the standard Go framework used b
 
 The same `distort-csi` binary registers the CSI Identity, Controller, and Node services. The Helm chart runs it in two different contexts:
 
-- in the CSI controller Deployment, next to `csi-provisioner`;
-- on every consumer node in the CSI node DaemonSet, next to `csi-node-driver-registrar`.
+- in the CSI controller Deployment, next to the external provisioner, external attacher, and liveness probe;
+- on every selected consumer node in the CSI node DaemonSet, next to the node-driver registrar and liveness probe.
 
 ## 2. Core Kubernetes concepts used by the project
 
@@ -357,7 +357,7 @@ The Controller service runs in the CSI controller Deployment. DISTORT implements
 1. validates the CSI request;
 2. reads capacity and StorageClass parameters, accepting either a required
    capacity or a limit-only range, and rounds the allocation to the shared
-   1 MiB kernel/SPDK allocation unit;
+   4 MiB kernel/SPDK allocation unit;
 3. creates an `NVMePartition`;
 4. waits for its status to become `Exported`;
 5. returns a CSI volume containing the NQN, portal IP, and portal port in `VolumeContext`.
@@ -414,7 +414,7 @@ Staging prepares the volume once at a node-level staging path:
 3. find the Linux NVMe controller and namespace corresponding to the NQN;
 4. wait for the device node to appear;
 5. detect whether the block device already has a filesystem;
-6. format it as ext4 when no filesystem is detected;
+6. format it with the requested ext4 or XFS filesystem when the device is blank, or reject an existing filesystem that does not match;
 7. mount it at kubelet's staging path.
 
 #### NodePublishVolume
@@ -624,9 +624,15 @@ This is a “most free bytes” scheduler. It does not currently account for:
 
 - consumer Pod topology;
 - NUMA preferences;
-- reservations made concurrently by multiple scheduling reconciliations;
 - access modes;
 - anti-affinity or failure domains.
+
+Concurrent placement within one manager process is serialized by a per-device
+mutex. The reconciler re-reads device, claim, and persisted partition state
+through the API reader before recording an assignment, including capacity held
+by terminating partitions. This is not a distributed reservation transaction;
+capacity safety across overlapping manager leadership still needs validation.
+Eligible claims and assigned partitions are considered across namespaces.
 
 ### 5.3 Device capacity reconciler
 
@@ -697,7 +703,7 @@ volume manager cannot address. A controller without namespace ID 1 is degraded
 rather than guessed.
 
 Discovery reserves one percent of namespace ID 1 and rounds the remainder down
-to the 1 MiB allocation unit before publishing capacity. This conservative
+to the 4 MiB allocation unit before publishing capacity. This conservative
 control-plane calculation covers GPT boundaries and SPDK blobstore metadata
 without an extra command or RPC, ensuring that a request accepted before driver
 rebinding remains allocatable afterward.
@@ -832,8 +838,13 @@ DISTORT uses deterministic names:
 
 ```text
 lvstore: lvs_<device-name>
-lvol alias: <lvstore>/<partition-name>
+lvol alias: <lvstore>/<external-id>
 ```
+
+For new volumes, `external-id` is `vol-` followed by a hash derived from the
+partition's immutable UID, rather than from its namespace and name. A deleted
+and recreated resource receives a new identity. The agent also persists backend
+identifiers needed for exact cleanup.
 
 The code queries existing lvstores and bdev aliases before creation. This is what allows reconciliation after a status update failure or agent restart without deliberately creating a second lvol with the same logical identity.
 
@@ -844,7 +855,7 @@ The lvol's allocation metadata is associated with storage managed by SPDK, while
 An **NQN**, or NVMe Qualified Name, identifies an NVMe subsystem. DISTORT generates:
 
 ```text
-nqn.2026-02.io.distort:volume-<volume-name>
+nqn.2026-02.io.distort:volume-<external-id>
 ```
 
 An **NVMe subsystem** is the target-side logical entity presented to initiators.
@@ -877,7 +888,7 @@ The following is the current end-to-end sequence for dynamic provisioning.
 
 ```text
 1. User creates PVC
-2. Kubernetes external-provisioner observes it
+2. External-provisioner observes it (WaitForFirstConsumer waits for Pod node selection)
 3. external-provisioner calls DISTORT CreateVolume over gRPC
 4. CSI ControllerServer creates NVMePartition
 5. manager partition reconciler assigns claimed NVMeDevice and node
@@ -889,12 +900,14 @@ The following is the current end-to-end sequence for dynamic provisioning.
 11. CSI CreateVolume returns volume metadata
 12. external-provisioner creates/binds PersistentVolume
 13. scheduler places a Pod using the PVC
-14. kubelet calls NodeStageVolume
-15. node CSI service runs nvme connect
-16. node CSI service formats and mounts the device at staging path
-17. kubelet calls NodePublishVolume
-18. node CSI service bind-mounts staging path into Pod target path
-19. application performs I/O
+14. external-attacher calls ControllerPublishVolume
+15. DISTORT persists NVMeVolumeAttachment and waits for target host authorization
+16. kubelet calls NodeStageVolume
+17. node CSI service runs nvme connect
+18. node CSI service detects/formats and mounts the filesystem at staging path
+19. kubelet calls NodePublishVolume
+20. node CSI service bind-mounts staging path into Pod target path
+21. application performs I/O
 ```
 
 The API-server portion and the CSI call can overlap in time: `CreateVolume` remains open while polling the `NVMePartition`. The manager and agent progress asynchronously.
@@ -909,14 +922,16 @@ The intended reverse sequence is:
 3. DISTORT unmounts Pod target path
 4. kubelet calls NodeUnstageVolume
 5. DISTORT unmounts staging path and runs nvme disconnect
-6. external-provisioner calls DeleteVolume according to PV reclaim policy
-7. CSI requests NVMePartition deletion
-8. API server sets deletionTimestamp because finalizer exists
-9. storage-node agent removes target export
-10. agent deletes lvol or partition
-11. agent removes finalizer
-12. API server deletes NVMePartition
-13. device capacity reconciler recalculates free capacity
+6. external-attacher calls ControllerUnpublishVolume
+7. DISTORT revokes target host authorization and completes attachment cleanup
+8. external-provisioner calls DeleteVolume according to PV reclaim policy
+9. CSI requests NVMePartition deletion (an existing attachment blocks deletion)
+10. API server sets deletionTimestamp because finalizer exists
+11. storage-node agent removes target export
+12. agent deletes lvol or partition
+13. agent removes finalizer
+14. API server deletes NVMePartition
+15. device capacity reconciler recalculates free capacity
 ```
 
 The exact PVC/PV deletion behavior also depends on the PersistentVolume reclaim policy managed by Kubernetes.
@@ -1034,23 +1049,26 @@ The agent uses this value to:
 
 - name reported device resources;
 - process only partitions assigned to its node;
-- locate the Kubernetes Node's internal IP.
+- associate live RDMA interface discovery and readiness with the correct node.
 
 ### 12.3 CSI controller Deployment
 
 This Pod contains:
 
 - the upstream `csi-provisioner`;
+- the upstream `csi-attacher` and liveness probe;
 - the DISTORT CSI driver;
 - a shared `emptyDir` containing the Unix socket.
 
-The provisioner calls the DISTORT Controller service through that socket.
+The provisioner and attacher call the DISTORT Controller service through that
+socket. The chart's `CSIDriver` declares `attachRequired: true`.
 
 ### 12.4 CSI node DaemonSet
 
 This Pod contains:
 
 - the upstream node-driver registrar;
+- the upstream liveness probe;
 - the privileged DISTORT CSI driver;
 - host `/dev`;
 - kubelet plugin and registration directories;

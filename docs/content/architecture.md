@@ -1,12 +1,16 @@
 ---
 title: "Architecture"
-description: "In-depth review of the DISTORT layout, Custom Resource Definitions (CRDs), implementation codebase, SPDK engine, and microbenchmarks."
+description: "DISTORT components, custom resources, CSI lifecycle, and SPDK and kernel storage paths."
 type: "page"
 ---
 
-DISTORT is a Kubernetes-native storage engine specifically designed to manage dynamic, high-performance physical disk allocation. Utilizing NVMe-over-Fabrics (NVMe-oF) via RDMA target exports, it orchestrates direct block storage attachments directly between worker nodes at near-local speeds. 
+DISTORT allocates physical NVMe capacity through Kubernetes custom resources
+and exposes volumes through CSI. Consumer nodes connect directly to storage
+targets over NVMe-over-Fabrics/RDMA after provisioning and attachment complete.
 
-DISTORT distinguishes itself by integrating high-performance user-space polling architectures (via SPDK) natively into Kubernetes Custom Resources. The project has evolved from an initial kernel-based configfs approach to a fully containerized SPDK engine, maintaining a zero-overhead data path without requiring heavyweight software-defined storage (SDS) middleware.
+Both SPDK user-space targets and Linux kernel configfs targets are implemented.
+Management controllers coordinate storage lifecycle but do not carry application
+I/O. This describes the architecture, not a measured performance guarantee.
 
 DISTORT's architecture is bifurcated into two logical layers: the **NVMe Management Layer** (the "Hardware Control Plane") and the **CSI Layer** (the "Kubernetes Bridge"). This separation of concerns allows the system to decouple physical hardware management from the Kubernetes volume lifecycle using a state-machine-via-CRD approach.
 
@@ -14,53 +18,31 @@ DISTORT's architecture is bifurcated into two logical layers: the **NVMe Managem
 
 DISTORT consists of three main components:
 1. **Manager (`distort-manager`)**: The centralized control plane component housing controllers for assigning claims to physical drives and scheduling NVMe partitions onto healthy nodes.
-2. **Agent (`distort-agent`)**: A DaemonSet running on storage-providing nodes. It discovers physical NVMe controllers (`NVMeDevice`), manages user-space partitions using SPDK Logical Volumes (`lvol`), and exports NVMe-oF RDMA targets.
-3. **CSI Driver (`distort-csi`)**: A standard Container Storage Interface implementation. It translates PersistentVolumeClaims into `NVMePartition` CRDs, maintains durable single-writer attachments, and coordinates client connections (`nvme connect`) and filesystem mounting on application nodes.
+2. **Agent (`distort-agent`)**: A DaemonSet running on storage-providing nodes. It discovers physical NVMe controllers (`NVMeDevice`), creates SPDK logical volumes or kernel-backed disk partitions, and exports NVMe-oF/RDMA targets.
+3. **CSI Driver (`distort-csi`)**: A Container Storage Interface implementation. It translates provisioning requests into `NVMePartition` resources, maintains durable single-writer attachments, and coordinates client connections (`nvme connect`) and filesystem mounting on application nodes.
 
 ---
 
 ## Architectural Interaction & Flow
 
-The following interactive sequence shows how the control plane and data path layers interact when provisioning disaggregated storage over RDMA:
+The diagram separates lifecycle coordination from application I/O:
 
 ```mermaid
-graph TD
-    %% Define Styles
-    classDef csiLayer fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#fff;
-    classDef mgmtLayer fill:#312e81,stroke:#6366f1,stroke-width:2px,color:#fff;
-    classDef crdClass fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#67e8f9;
-    classDef hardwareClass fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#fff;
-
-    %% Subgraphs for Logical Layers
-    subgraph CSILayer ["CSI Layer (Kubernetes Bridge)"]
-        csiprov["CSI Provisioner<br/>(PVC Watcher)"]
-        csiattach["CSI Attacher<br/>(Single-Writer Ownership)"]
-        csinode["CSI-Node Server<br/>(Volume Mounting)"]
+flowchart TD
+    subgraph Control["Control plane"]
+        Sidecars["External provisioner and attacher"] -->|CSI RPCs| CSI["DISTORT CSI controller"]
+        CSI --> Resources["NVMePartition and NVMeVolumeAttachment"]
+        Manager["Manager: claims and placement"] --> Resources
+        Resources --> Agent["Storage-node agent"]
+        Kubelet -->|Stage and publish| Node["DISTORT CSI node"]
     end
-
-    subgraph MgmtLayer ["Management Layer (Hardware Control Plane)"]
-        mgmt["Management Controller<br/>(Claims & Placement Schedulers)"]
-        crd1[("NVMePartition<br/>CRD State")]
-        agent["NVMe-Node Agent<br/>(DaemonSet on Storage Nodes)"]
+    Agent -.->|Configure allocation and export| Target
+    Node -.->|Connect and mount| Initiator
+    subgraph Data["Application I/O"]
+        Pod["Application filesystem"] --> Initiator["Consumer kernel NVMe initiator"]
+        Initiator <-->|NVMe-oF / RDMA| Target["SPDK or kernel target"]
+        Target <--> Disk["Physical NVMe storage"]
     end
-
-    subgraph HW ["Physical Layer"]
-        hw["Physical NVMe & RDMA NIC<br/>(SoftRoCE or Physical Fabric)"]
-    end
-
-    %% Interactions
-    csiprov -->|"1. Creates Partition CRD"| crd1
-    csiattach -->|"Authorizes Consumer Node"| crd1
-    mgmt -->|"2. Reconciles & Schedules Node"| crd1
-    crd1 -->|"3. Triggers Watch"| agent
-    agent -->|"4. Slices & Exports Fabric Target"| hw
-    hw -->|"5. Establishes RDMA Connection"| csinode
-
-    %% Assign styles
-    class csiprov,csiattach,csinode csiLayer;
-    class mgmt,agent mgmtLayer;
-    class crd1 crdClass;
-    class hw hardwareClass;
 ```
 
 ---
@@ -70,7 +52,7 @@ graph TD
 At the core of DISTORT's declarative model are five Custom Resource Definitions that mirror the physical, logical, and attachment state of the storage fabric:
 
 1. **`NVMeDevice`:** Represents a discovered physical NVMe storage controller on a worker node, including attributes like serial number, NUMA alignment, and the allocatable capacity of the explicitly managed namespace ID 1 after a small backend-metadata reserve. Additional namespaces remain untouched and are not advertised for placement.
-2. **`NVMeDeviceClaim`:** Allows administrators or automated provisioners to reserve specific `NVMeDevice` instances for dedicated workloads.
+2. **`NVMeDeviceClaim`:** Authorizes DISTORT to use a specific physical device, identified by serial number. It records ownership for allocation and cleanup; it is not a per-workload placement selector.
 3. **`NVMePartition`:** Represents a logical slice of an `NVMeDevice`. It dictates the required capacity and, once scheduled, tracks the NVMe-oF network endpoint details (NQN, Portal IP, Port) required for client connections.
 4. **`RDMAStorageNode`:** Represents a worker node's capability to participate in the storage fabric, providing health status and available network interfaces for RDMA traffic.
 5. **`NVMeVolumeAttachment`:** Records the one authorized consumer node, host NQN, and attachment lifetime for a partition so target ACL changes and CSI retries remain durable and observable.
@@ -88,9 +70,9 @@ This layer is responsible for physical device discovery, disk partitioning, and 
 ### 2. CSI Layer (Kubernetes Bridge)
 
 This layer translates standard PersistentVolumeClaims (PVCs) into concrete storage allocations and subsequently mounts the volumes to application Pods.
-* **CSI-Provisioner:** A controller that watches for new PVCs. Instead of communicating with a traditional centralized storage backend API, it creates an `NVMePartition` CRD specifying the required capacity and access mode. It then blocks until the management layer updates the partition's status with an RDMA endpoint (NQN and Portal IP), at which point it binds the resulting PersistentVolume (PV).
+* **CSI-Provisioner:** The external-provisioner watches PVCs and calls DISTORT's `CreateVolume` RPC. The DISTORT CSI controller creates an `NVMePartition` resource and waits for the agent to publish its export endpoint after manager placement. The provisioner then creates the PersistentVolume (PV) for binding.
 * **CSI-Attacher:** Calls `ControllerPublishVolume` and `ControllerUnpublishVolume`. DISTORT persists one `NVMeVolumeAttachment` per immutable partition UID and updates the target host ACL before reporting the attachment ready.
-* **CSI-Node-Server:** A DaemonSet located on the compute nodes consuming the storage. During the volume staging phase, it executes `nvme connect` against the NVMe-oF cluster, connecting the Pod to the remote block device (e.g., `/dev/nvme1n1`). It then bind-mounts this device into the corresponding container's root filesystem.
+* **CSI-Node-Server:** A DaemonSet on consumer nodes. It connects to the authorized NVMe-oF target, detects or formats the requested filesystem, mounts it at the kubelet staging path, and bind-mounts that filesystem into the Pod's volume path.
 
 ---
 
@@ -108,16 +90,19 @@ Building the binaries relies on a standard `Makefile` utilizing `go build`. Kube
 
 ## Target Orchestration Engine
 
-DISTORT integrates the **Storage Performance Development Kit (SPDK)** to achieve high-performance I/O and reduce CPU overhead from kernel-space context switching. By leveraging SPDK, DISTORT completely bypasses the Linux kernel block layer:
+The SPDK backend uses the **Storage Performance Development Kit** for
+target-side user-space NVMe access. This bypass applies to the storage target;
+consumer nodes still use the Linux kernel NVMe initiator and filesystem stack.
+Polling consumes CPU even when application I/O is low.
 
 * **User-Space NVMe Driver:** Physical NVMe drives are unbound from the kernel and bound to the `vfio-pci` or `uio_pci_generic` drivers, granting SPDK exclusive user-space access.
 * **Discovery & RPC Control:** Hardware discovery and telemetry are orchestrated via SPDK's JSON-RPC interface, querying the `nvmf_tgt` process for controllers and serial numbers.
-* **Logical Volumes (Lvol):** Instead of traditional filesystem partitions, DISTORT dynamically carves out SPDK Logical Volumes (`bdev_lvol_create`) entirely in application memory.
+* **Logical Volumes (Lvol):** SPDK allocates logical volumes from a store on the physical NVMe block device. Volume data and allocation metadata reside on storage; the target's listeners and subsystems are runtime configuration.
 * **NVMe-oF Exporter:** Lightweight SPDK JSON-RPC commands dynamically create user-space NVMe-oF Subsystems and RDMA listeners on the fly.
 
 Volume teardown employs Kubernetes **Finalizers**, intercepting `NVMePartition` deletion events to cleanly un-export the Fabric pathway via RPC before destroying the logical volume.
 
-## Identity and ownership guarantees
+## Identity and ownership checks
 
 Device authorization and volume identity are persisted in Kubernetes rather than inferred from mutable names:
 
@@ -125,10 +110,24 @@ Device authorization and volume identity are persisted in Kubernetes rather than
 - Each new `NVMePartition` derives a backend-safe external identity from its immutable UID. CSI handles include namespace, name, and UID so same-named volumes in different namespaces cannot alias one another.
 - Legacy name-only volume handles remain readable only through a fail-safe compatibility path; ambiguous matches are never deleted.
 
-Consumer-side ownership is also explicit. The chart declares `attachRequired: true`, the CSI controller implements `ControllerPublishVolume` and `ControllerUnpublishVolume`, and a durable `NVMeVolumeAttachment` authorizes exactly one node and host NQN at a time. A competing node is rejected. Forced takeover requires an administrator to confirm fencing and annotate the current attachment before the agent revokes the old ACL and grants the replacement. Final corrected two-node hardware verification remains tracked as F25 in the [review findings](/review-findings/).
+Consumer-side ownership is also explicit. The chart declares `attachRequired: true`, the CSI controller implements `ControllerPublishVolume` and `ControllerUnpublishVolume`, and a durable `NVMeVolumeAttachment` authorizes exactly one node and host NQN at a time. A competing node is rejected. Forced takeover requires an administrator to confirm fencing and annotate the current attachment before the agent revokes the old ACL and grants the replacement. Final two-node hardware verification of the corrected takeover path remains pending.
 
 ## Current capability boundary
 
-DISTORT is under active development. The implemented path includes claimed-device authorization, namespace-safe volume identity, durable single-writer attachment ownership, transactional SPDK startup, exact SPDK and kernel target checks, ext4/XFS detection and formatting, fail-safe CSI request/path validation, and readiness-aware RDMA and NVMe inventory placement. Important remaining production work includes durable capacity reservation across leadership overlap, CSI conformance, and final hardware recovery and fencing evidence.
+Device claims authorize use of physical media; they are not a per-namespace
+tenant quota or a network isolation mechanism. Placement considers eligible
+claimed devices across namespaces. Administrators must control access to claims,
+storage resources, privileged workloads, and the RDMA fabric. Host-NQN access
+control does not by itself provide cryptographic authentication or encryption.
 
-For controller-by-controller behavior and recovery details, see [Project Internals](/internals/). For the prioritized defect ledger and release gates, see [Review Findings](/review-findings/).
+DISTORT is an alpha-stage project moving toward beta. Its development releases
+are not recommended for production use. The implemented path includes
+claimed-device authorization, namespace-safe volume identity, durable
+single-writer attachment ownership, transactional SPDK startup, exact SPDK and
+kernel target checks, ext4/XFS detection and formatting, fail-safe CSI
+request/path validation, and readiness-aware RDMA and NVMe inventory placement.
+Remaining work includes durable capacity reservation across leadership overlap,
+CSI conformance, and final hardware recovery and fencing evidence.
+
+For controller-by-controller behavior and recovery details, see
+[Project Internals](/internals/).

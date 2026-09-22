@@ -40,11 +40,6 @@ disableKinds = ["taxonomy", "term"]
   weight = 40
 
 [[menu.main]]
-  name = "Review Findings"
-  url = "/review-findings/"
-  weight = 45
-
-[[menu.main]]
   name = "Contributing"
   url = "/contributing/"
   weight = 50
